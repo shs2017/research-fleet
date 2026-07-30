@@ -1,4 +1,4 @@
-"""`fleet` — the command line entry point.
+"""`fleet`: the command line entry point.
 
 Also the interface agents use from inside their containers: `fleet submit`
 detects `$FLEET_SUBMIT_DIR` and writes a spool file instead of talking to the
@@ -89,7 +89,7 @@ def run(
     image: Optional[str] = typer.Option(None, "--image"),
     timeout: int = typer.Option(3600, "--timeout", help="Per-agent wall clock, seconds."),
     max_usd: Optional[float] = typer.Option(None, "--max-usd", help="Budget ceiling for the whole run."),
-    executor: Optional[str] = typer.Option(None, "--executor", help="ship | ray | dry-run"),
+    executor: Optional[str] = typer.Option(None, "--executor", help="ship | slurm | ray | dry-run"),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
@@ -144,6 +144,54 @@ def sweep(
         report = fleet.wait()
         console.print(report.summary())
         raise typer.Exit(0 if not report.failed else 1)
+    finally:
+        fleet.close()
+
+
+@app.command()
+def workflow(
+    file: str = typer.Argument(..., help="Workflow YAML."),
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+    max_usd: Optional[float] = typer.Option(None, "--max-usd"),
+    executor: Optional[str] = typer.Option(None, "--executor", help="ship | slurm | ray | dry-run"),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    plan: bool = typer.Option(False, "--plan", help="Validate and print the stages, run nothing."),
+):
+    """Run a multi-step pipeline, for example a coder and reviewer loop."""
+    from .workflow import Loop, Workflow
+
+    wf = Workflow.from_yaml(file)
+
+    if plan:
+        console.print(f"[bold]{wf.name}[/bold]  {wf.description}")
+        for stage in wf.stages:
+            if isinstance(stage, Loop):
+                until = f"until {stage.until.step} contains '{stage.until.output_contains}'" \
+                    if stage.until and stage.until.output_contains else "until done"
+                console.print(f"  loop {stage.name}  max {stage.max_iterations}x, {until}")
+                for inner in stage.steps:
+                    console.print(f"    - {inner.name} ({inner.kind.value})")
+            else:
+                fan = ""
+                if stage.for_each:
+                    fan = f" x{len(stage.for_each)}"
+                elif stage.copies > 1:
+                    fan = f" x{stage.copies}"
+                console.print(f"  {stage.name} ({stage.kind.value}){fan}")
+        return
+
+    fleet = _fleet(
+        config,
+        **_overrides(workspace, None, executor, max_usd),
+        on_event=_live_printer(verbose),
+    )
+    try:
+        console.print(f"[bold]run {fleet.run_id}[/bold]  workflow {wf.name}")
+        report = fleet.run_workflow(wf)
+        console.print()
+        console.print(report.summary())
+        raise typer.Exit(0 if not report.run.failed else 1)
     finally:
         fleet.close()
 
@@ -283,15 +331,15 @@ def trace(
 
 @audit_app.command("verify")
 def audit_verify(config: Optional[str] = typer.Option(None, "--config", "-c")):
-    """Verify the hash chain — proves the log has not been edited."""
+    """Verify the hash chain: proves the log has not been edited."""
     cfg = load_config(config)
     ledger = Ledger(cfg.root_path)
     ok, msg = ledger.verify()
     ledger.close()
     if ok:
-        console.print(f"[green]✓ audit chain intact[/green] — {msg}")
+        console.print(f"[green]✓ audit chain intact[/green]: {msg}")
         raise typer.Exit(0)
-    console.print(f"[red]✗ audit chain broken[/red] — {msg}")
+    console.print(f"[red]✗ audit chain broken[/red]: {msg}")
     raise typer.Exit(2)
 
 
@@ -330,7 +378,7 @@ def audit_reindex(config: Optional[str] = typer.Option(None, "--config", "-c")):
 def pending(config: Optional[str] = typer.Option(None, "--config", "-c")):
     """List jobs parked waiting for operator approval, and why.
 
-    Approval itself is in-process — a parked job belongs to a live scheduler, so
+    Approval itself is in-process: a parked job belongs to a live scheduler, so
     grant it with `fleet.approve(job_id)` from the session that submitted it (or
     via the MCP server). There is deliberately no cross-process approve command:
     a job whose scheduler has exited cannot be resumed, only resubmitted.

@@ -106,6 +106,8 @@ class JobRecord:
     result: JobResult | None = None
     decision: Decision | None = None
     usage: Usage = field(default_factory=Usage)
+    output: str = ""            # the agent's final message, or the command's last lines
+    tail: list[str] = field(default_factory=list)
     reserved_usd: float = 0.0
     reserved_tokens: int = 0
     budget_scope: str = ""
@@ -324,6 +326,7 @@ class Scheduler:
                 self._drain_spool(rec, self._spool_root / spec.id)
 
             result.usage = rec.usage.to_dict()
+            result.output = rec.output or "\n".join(rec.tail)
             rec.result = result
             self._settle_budget(rec)
             self._set_state(rec, result.state, {"result": result.model_dump(mode="json")})
@@ -453,7 +456,7 @@ class Scheduler:
                         "",
                         "Each sub-job is checked against the same policy and debits the budget "
                         "above before it starts. A launch that would overspend is rejected with a "
-                        "reason written back to `$FLEET_SUBMIT_DIR/<name>.rejected.json` — read it "
+                        "reason written back to `$FLEET_SUBMIT_DIR/<name>.rejected.json`: read it "
                         "and pick a cheaper model or lower effort rather than retrying blindly.",
                         "Write results to `$FLEET_RESULTS_DIR`; anything else is discarded when "
                         "the container exits.",
@@ -475,6 +478,10 @@ class Scheduler:
 
         def handle(stream: str, line: str) -> None:
             if backend is None:
+                if stream == "stdout" and line.strip():
+                    # A command job's output is its last few lines; enough for a
+                    # workflow to branch on without holding a whole training log.
+                    rec.tail = (rec.tail + [line])[-20:]
                 self.ledger.append(
                     "job.output", {"stream": stream, "line": line},
                     run_id=self.run_id, job_id=spec_id,
@@ -495,6 +502,10 @@ class Scheduler:
             if event.usage is not None:
                 with self._lock:
                     rec.usage = rec.usage.merge(event.usage)
+            # The harness's `result` event carries the agent's answer, which is what a
+            # later step wants to read.
+            if event.type == "result" and event.text:
+                rec.output = event.text
             self.ledger.append(
                 f"agent.{event.type}", event.to_ledger(),
                 run_id=self.run_id, job_id=spec_id,
@@ -527,7 +538,7 @@ class Scheduler:
                 payload.pop("id", None)
                 payload.pop("run_id", None)
                 payload.pop("parent_job_id", None)
-                # An agent cannot pick its own image — that would let it escape the
+                # An agent cannot pick its own image: that would let it escape the
                 # ship the operator configured for this project.
                 payload["image"] = self.config.image
                 child = JobSpec(**payload)
@@ -561,7 +572,7 @@ class Scheduler:
     # ---------------------------------------------------------------- budget
 
     def _maybe_close_scope(self, rec: JobRecord) -> None:
-        """Return an agent's unused grant to its parent — but only once every
+        """Return an agent's unused grant to its parent: but only once every
         descendant is terminal, so a still-running child stays bounded by the
         ceiling its parent was granted."""
         if not rec.state.terminal:

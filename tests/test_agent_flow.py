@@ -1,6 +1,6 @@
 """Agent-specific behaviour: budget briefing, spool intake, hierarchical grants.
 
-These use a stub executor that impersonates an agent — it emits Claude-CLI
+These use a stub executor that impersonates an agent: it emits Claude-CLI
 stream-json on stdout and writes child job specs into the mounted spool
 directory, exactly as a real agent would. That exercises the whole submit →
 policy → budget → ledger path for spawned work without spending money.
@@ -104,7 +104,7 @@ def test_agent_prompt_carries_budget_and_delegation_brief(tmp_path):
         env = stub.seen_env[0]
         assert env["FLEET_SUBMIT_DIR"] == "/spool"
         assert float(env["FLEET_BUDGET_USD"]) > 0
-        # Secrets are forwarded by name only — never a literal value.
+        # Secrets are forwarded by name only, never a literal value.
         assert env["ANTHROPIC_API_KEY"] == ""
     finally:
         fleet.close()

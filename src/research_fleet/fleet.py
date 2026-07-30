@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from .budget import Quote, cost_menu, quote
 from .config import FleetConfig, load_config
@@ -24,6 +24,9 @@ from .ledger import Ledger, Redactor
 from .scheduler import JobRecord, Scheduler
 from .spec import AgentConfig, JobKind, JobResult, JobSpec, Mount, Resources
 from .sweep import build_sweep
+
+if TYPE_CHECKING:
+    from .workflow import Workflow
 
 
 @dataclass
@@ -63,13 +66,31 @@ class RunReport:
         ]
         if self.awaiting_approval:
             lines.append(
-                f"blocked: {len(self.awaiting_approval)} job(s) need approval — "
+                f"blocked: {len(self.awaiting_approval)} job(s) need approval: "
                 f"call fleet.approve({self.awaiting_approval[0]!r}) then wait() again, "
                 "or run `fleet pending` to see why"
             )
         for jid, res in self.results.items():
             dur = f"{res.duration_s:.1f}s" if res.duration_s else "-"
             lines.append(f"  {jid}  {res.state.value:<10} {dur:>8}  {res.error or ''}".rstrip())
+        return "\n".join(lines)
+
+
+@dataclass
+class WorkflowReport:
+    workflow: str
+    outcomes: list[Any]
+    steps: dict[str, JobResult]
+    run: RunReport
+
+    def summary(self) -> str:
+        lines = [f"workflow {self.workflow}"]
+        for outcome in self.outcomes:
+            detail = f"{outcome.iterations} iteration(s)" if outcome.iterations > 1 else ""
+            if outcome.stopped_early:
+                detail += ", stopped early"
+            lines.append(f"  {outcome.stage:<24} {len(outcome.job_ids)} job(s) {detail}".rstrip())
+        lines.append(self.run.summary())
         return "\n".join(lines)
 
 
@@ -132,6 +153,7 @@ class Fleet:
         system_prompt: str | None = None,
         mounts: Sequence[Mount] | None = None,
         env: dict[str, str] | None = None,
+        isolate: bool | None = None,
         name_prefix: str = "agent",
     ) -> list[JobRecord]:
         """Launch `n` agents on the same task, each in its own container and GPU slot.
@@ -158,6 +180,7 @@ class Fleet:
                     timeout_s=timeout_s,
                     mounts=list(mounts or []),
                     env=dict(env or {}),
+                    isolate=self.config.isolate_agents if isolate is None else isolate,
                     labels={"effort": effort or self.config.budget.default_effort},
                 )
             )
@@ -194,6 +217,7 @@ class Fleet:
         image: str | None = None,
         timeout_s: int = 3600,
         env: dict[str, str] | None = None,
+        isolate: bool | None = None,
     ) -> JobRecord:
         return self.submit(
             JobSpec(
@@ -203,7 +227,45 @@ class Fleet:
                 resources=Resources(gpus=gpus),
                 timeout_s=timeout_s,
                 env=dict(env or {}),
+                isolate=bool(isolate),
             )
+        )
+
+    def run_workflow(
+        self,
+        workflow: "Workflow | dict | str | Path",
+        *,
+        predicates: dict[str, Any] | None = None,
+    ) -> "WorkflowReport":
+        """Run a multi-step pipeline defined in YAML, a dict, or Python.
+
+        `predicates` maps a loop name to a callable taking the results so far, for
+        stopping conditions that declarative YAML cannot express.
+        """
+        from .workflow import Workflow, WorkflowRunner
+
+        if isinstance(workflow, (str, Path)):
+            workflow = Workflow.from_yaml(workflow)
+        elif isinstance(workflow, dict):
+            workflow = Workflow.from_dict(workflow)
+
+        self.ledger.append(
+            "workflow.started",
+            {"name": workflow.name, "stages": [st.name for st in workflow.stages]},
+            run_id=self.run_id,
+        )
+        runner = WorkflowRunner(self, workflow, predicates=predicates)
+        outcomes = runner.run()
+        self.ledger.append(
+            "workflow.finished",
+            {"name": workflow.name, "outcomes": [o.model_dump() for o in outcomes]},
+            run_id=self.run_id,
+        )
+        return WorkflowReport(
+            workflow=workflow.name,
+            outcomes=outcomes,
+            steps=dict(runner.results),
+            run=self.wait(),
         )
 
     # ---------------------------------------------------------------- control

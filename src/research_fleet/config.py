@@ -46,8 +46,22 @@ class BudgetConfig(BaseModel):
     )
 
 
+class SlurmConfig(BaseModel):
+    """Slurm placement. Slurm picks the node and binds the GPUs, so the fleet does not."""
+
+    partition: str | None = None
+    account: str | None = None
+    qos: str | None = None
+    slots: int = Field(8, ge=1, description="How many srun processes to hold open; the rest queue.")
+    container_image: str | None = Field(
+        None, description="Path to an Apptainer .sif. Empty runs directly in the allocation."
+    )
+    container_binary: str = "apptainer"
+    extra_args: list[str] = Field(default_factory=list, description="Extra srun flags.")
+
+
 class ExecutorConfig(BaseModel):
-    kind: Literal["ship", "ray", "dry-run"] = "ship"
+    kind: Literal["ship", "ray", "slurm", "dry-run"] = "ship"
     ship_binary: str = Field("ship", description="The research-ship launcher, on PATH.")
     project_dir: str | None = Field(
         None,
@@ -55,6 +69,7 @@ class ExecutorConfig(BaseModel):
     )
     docker_binary: str = "docker"
     ray_address: str | None = Field(None, description="'auto' to attach to a running cluster.")
+    slurm: SlurmConfig = Field(default_factory=SlurmConfig)
 
 
 class AgentBackendConfig(BaseModel):
@@ -73,6 +88,11 @@ class FleetConfig(BaseModel):
         "", description="Override the image; empty means whatever research-ship resolves for the project."
     )
     workspace: str = Field(".", description="Host directory mounted at /workspace.")
+    isolate_agents: bool = Field(
+        False,
+        description="Give every agent job its own git worktree and branch. Strongly "
+                    "recommended for unattended runs; requires the workspace to be a git repo.",
+    )
     results_dir: str = Field("", description="Defaults to <root>/results.")
 
     executor: ExecutorConfig = Field(default_factory=ExecutorConfig)

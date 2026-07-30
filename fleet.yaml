@@ -5,15 +5,19 @@
 # Env override syntax: FLEET_EXECUTOR__KIND=ray
 #
 # Container configuration (base image, CUDA, torch, model cache, mounts) is NOT
-# here — it lives in this project's .ship.conf and is owned by research-ship.
+# here: it lives in this project's .ship.conf and is owned by research-ship.
 
 root: ~/.research-fleet
 workspace: .
+# Give every agent job its own git worktree and branch, so an agent's mistakes cost a
+# branch rather than your working tree. Needs the workspace to be a git repository.
+isolate_agents: false
 # Empty = use whatever image research-ship resolves for this project.
 image: ""
 
 executor:
   # ship:     single host; research-ship owns the container, fleet owns placement.
+  # slurm:    Slurm owns placement; containers are Apptainer, or none at all.
   # ray:      multi-node; Ray owns placement, research-ship still owns the container.
   # dry-run:  validate and record what would run, start nothing.
   kind: ship
@@ -21,6 +25,14 @@ executor:
   # Project whose .ship.conf and image to use. Defaults to `workspace`.
   project_dir: null
   ray_address: auto
+  slurm:
+    partition: null
+    account: null
+    qos: null
+    slots: 8                    # srun processes held open at once; the rest queue
+    container_image: null       # path to an Apptainer .sif, or null for none
+    container_binary: apptainer
+    extra_args: []              # extra srun flags
 
 agent:
   name: claude-cli          # claude-cli | codex-cli

@@ -1,4 +1,4 @@
-"""Executor protocol — where a job physically runs.
+"""Executor protocol: where a job physically runs.
 
 An executor receives a fully-validated `JobSpec` (policy has already run) plus
 the GPU slot it was scheduled onto, and is responsible for actually starting the

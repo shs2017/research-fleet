@@ -1,49 +1,71 @@
 <p align="center">
-  <img src="logo.svg" width="620" alt="research-fleet — auditable, budgeted agent swarms across your GPUs">
+  <img src="logo.svg" width="620" alt="research-fleet: orchestrate budgeted agent workflows on your GPUs">
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10%2B-06B6D4?style=flat-square" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/runtime-Docker%20%2B%20NVIDIA-8B5CF6?style=flat-square" alt="Docker + NVIDIA">
   <img src="https://img.shields.io/badge/built%20on-research--ship-64748B?style=flat-square" alt="built on research-ship">
+  <img src="https://img.shields.io/badge/status-work%20in%20progress-F59E0B?style=flat-square" alt="work in progress">
 </p>
 
 <p align="center">
-  Run fleets of coding agents across your GPUs — each in its own container,<br>
-  under a budget it cannot exceed and an audit trail it cannot edit.
+  Define a research workflow once, then orchestrate it across your GPUs:<br>
+  multi-step pipelines, priced before they run, under a budget they cannot exceed.
 </p>
+
+> [!WARNING]
+> **Work in progress. Use at your own risk.** This is a personal research tool under
+> active development. Interfaces will change without notice, and it has not been
+> audited. It runs AI agents autonomously against your code and your GPUs, and it
+> spends real money doing so. The budget ceilings and safeguards described below are
+> best-effort, not guarantees: set a low `--max-usd`, keep your work under version
+> control, and check your provider's billing dashboard yourself. Set
+> `isolate_agents: true` so agents work on their own branch rather than your tree.
 
 ---
 
 ## What it is
 
-One scheduler runs two kinds of job:
+A scheduler for scientific work on GPUs, from a hyperparameter sweep to an agent that
+designs its own ablations. It runs two kinds of job:
 
-- **`command`** — a training run, an eval, a sweep point. No LLM, no token cost.
-- **`agent`** — an LLM coding agent with a repo and a GPU.
+- **`command`**: a training run, an eval, a sweep point. No LLM, no token cost.
+- **`agent`**: a research agent with a repo, a GPU, and a question to answer.
 
-Both get the same container, the same policy checks, the same budget accounting, and
-the same tamper-evident ledger. Because an agent is just another job, **an agent can
-submit jobs of its own** — and its sub-agents are bounded by the budget and policy of
-the parent that spawned them.
+Both get the same environment, the same resource limits, the same budget accounting,
+and the same tamper-evident record of what happened. Because an agent is just another
+job, **an agent can submit jobs of its own**, proposing configs, launching the runs,
+reading the metrics, and iterating, bounded by the budget and policy of the parent that
+spawned it.
 
-Containers come from **[research-ship](https://github.com/shs2017/research-ship)**, which
-owns what a GPU container *is* and is useful on its own for interactive work. This
-project owns what a *fleet* is.
+There is one thing to set up and one place to look afterwards: declare the environment
+once in `.ship.conf`, the limits once in `fleet.yaml`, then `fleet run`. Environments
+come from **[research-ship](https://github.com/shs2017/research-ship)**, which is
+useful on its own for interactive work.
 
 ## Install
 
+Both tools install as commands. Neither needs its checkout afterwards.
+
 ```bash
-# 1. research-ship provides the container
-git clone https://github.com/shs2017/research-ship ~/Code/research-ship
-ln -s ~/Code/research-ship/ship ~/.local/bin/ship
+# 1. research-ship provides the GPU environment
+git clone https://github.com/shs2017/research-ship
+cd research-ship && ./ship install && cd ..
 
 # 2. research-fleet orchestrates it
-git clone https://github.com/shs2017/research-fleet ~/Code/research-fleet
-cd ~/Code/research-fleet && uv venv && uv pip install -e ".[ray,mcp]"
+uv tool install git+https://github.com/shs2017/research-fleet
 
-# 3. build the image for the project you want to research in
-cd ~/my-project && ship build
+# 3. declare and build the environment for the project you will research in
+cd ~/my-project && ship init && ship build
+```
+
+`uv tool install` puts `fleet` on your PATH in its own isolated environment, so it
+never collides with your project's dependencies. To remove either tool:
+
+```bash
+uv tool uninstall research-fleet
+ship uninstall
 ```
 
 Requires Docker with the NVIDIA container runtime:
@@ -52,16 +74,26 @@ Requires Docker with the NVIDIA container runtime:
 docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi -L
 ```
 
+For multi-node placement add the Ray extra:
+`uv tool install "research-fleet[ray] @ git+https://github.com/shs2017/research-fleet"`.
+
 ## Quick start
 
 ```bash
 fleet cost                       # what does this cost, before I run it?
 
-fleet run "Compare RMSNorm vs LayerNorm on a 20M-param model" --agents 4 --max-usd 20
-fleet run "..." --agents 4 --gpus 0.25          # pack four agents onto one card
-fleet run "..." --agents 16 --executor ray      # multi-node
+# four agents attack the same question independently, capped at $20 for the lot
+fleet run "Does RMSNorm beat LayerNorm at 20M params? Run the ablation." --agents 4 --max-usd 20
 
-fleet sweep python train.py --lr {lr} -g lr=1e-3,3e-4    # no LLM involved
+fleet run "..." --agents 4 --gpus 0.25          # pack four agents onto one card
+fleet run "..." --agents 16 --executor slurm    # submit to a Slurm cluster
+fleet run "..." --agents 16 --executor ray      # or a Ray cluster
+
+# a plain sweep, no LLM, no token cost
+fleet sweep python train.py --lr {lr} --depth {depth} -g lr=1e-3,3e-4 -g depth=6,12
+
+# a multi-step pipeline, for example a coder and reviewer loop
+fleet workflow examples/code-review-loop.yaml
 ```
 
 Then inspect what happened:
@@ -69,9 +101,95 @@ Then inspect what happened:
 ```bash
 fleet runs                # every run
 fleet ls <run_id>         # jobs in a run, including agent-spawned children
-fleet trace <job_id>      # full reasoning + tool trace for one agent
+fleet trace <job_id>      # full reasoning and tool trace for one agent
 fleet pending             # jobs parked waiting for approval
 fleet audit verify        # prove the log has not been edited
+```
+
+## Workflows
+
+Most research is a pipeline, not one prompt. A workflow declares the stages, and a
+`loop` repeats until a condition holds, which is how a coder and reviewer cycle works:
+
+```yaml
+# examples/code-review-loop.yaml
+name: code-review-loop
+model: claude-sonnet-5      # default for every step
+isolate: true               # each agent works on its own git branch
+
+stages:
+  - name: plan
+    task: Write an implementation plan for adding a --seed flag, into PLAN.md.
+
+  - name: implement-and-review
+    loop:
+      max_iterations: 3
+      until:
+        step: review
+        output_contains: APPROVED
+      steps:
+        - name: implement
+          task: |
+            Follow PLAN.md and implement the change.
+            {{ steps.review.output }}
+            If the text above contains feedback, address it.
+        - name: review
+          model: claude-opus-5        # review with the stronger model
+          task: |
+            Review the tree against PLAN.md. Reply with exactly APPROVED
+            on its own line if it is ready, otherwise list what must change.
+
+  - name: verify
+    kind: command
+    command: ["python", "-m", "pytest", "-q"]
+```
+
+```bash
+fleet workflow examples/code-review-loop.yaml --plan     # validate and show the stages
+fleet workflow examples/code-review-loop.yaml --max-usd 10
+```
+
+`{{ steps.<name>.output }}` carries a step's answer into a later prompt, which is what
+lets the reviewer's objection reach the next implementation round. `{{ iteration }}` and
+`{{ item }}` are also available. Templating is plain substitution rather than an
+expression language, and loop conditions are declarative
+(`output_contains`, `output_not_contains`, `succeeded`), so reading the YAML tells you
+when the loop stops.
+
+### Running work in parallel
+
+`copies` runs the same step several times; `for_each` runs it once per item:
+
+```yaml
+  - name: explore
+    task: Propose and test one way to cut memory use. Report the result.
+    copies: 4                    # four independent attempts, one per GPU slot
+
+  - name: ablate
+    task: Train with norm={{ item }} and report validation loss.
+    for_each: [rmsnorm, layernorm, none]
+```
+
+### The same thing in Python
+
+Identical model, so a workflow can be built or generated in code, and stopping
+conditions that YAML cannot express become a callable:
+
+```python
+from research_fleet import Condition, Fleet, Loop, Step
+
+tune = Loop(
+    name="tune",
+    max_iterations=5,
+    steps=[Step(name="try", task="Adjust the config and report val loss as a bare number.")],
+)
+
+with Fleet(max_usd=20) as fleet:
+    report = fleet.run_workflow(
+        {"name": "tune-lr", "stages": [tune.model_dump()]},
+        predicates={"tune": lambda steps: float(steps["try"].output or 1) < 0.35},
+    )
+    print(report.summary())
 ```
 
 ### Three entry points, one implementation
@@ -80,7 +198,7 @@ fleet audit verify        # prove the log has not been edited
 from research_fleet import Fleet
 
 with Fleet(max_usd=20) as fleet:
-    fleet.run_agents("Try 3 attention variants", n=4)
+    fleet.run_agents("Test 3 attention variants and report validation loss", n=4)
     print(fleet.wait().summary())
 ```
 
@@ -91,41 +209,41 @@ claude mcp add research-fleet -- fleet mcp    # drive it from Claude Code or Cod
 ## How it works
 
 ```
-                        ┌──────────────┐
-   CLI / Python / MCP ──▶│  Scheduler   │──▶ Policy ──▶ Budget ──▶ Ledger
-                        └──────┬───────┘     (deny)     (reserve)   (append)
-                               │
-                     ┌─────────▼─────────┐
-                     │     Executor      │   ship │ ray │ dry-run
-                     └─────────┬─────────┘
-                               │  `ship docker-args` + the fleet's limits
-                   ┌───────────┴───────────┐
-                   ▼                       ▼
-         research-ship container    research-ship container
-              (GPU 0)                   (GPU 1)
-          agent: claude -p          python train.py
+                          ┌───────────────┐
+  CLI / Python / MCP ────▶│   Scheduler   │──▶ Policy ─▶ Budget ─▶ Ledger
+                          └───────┬───────┘  (deny)   (reserve)  (append)
+                                  │
+                        ┌─────────▼─────────┐
+                        │     Executor      │  ship │ slurm │ ray │ dry-run
+                        └─────────┬─────────┘
+                                  │  `ship docker-args` + the fleet's limits
+                   ┌──────────────┴──────────────┐
+                   ▼                             ▼
+       research-ship env (GPU 0)     research-ship env (GPU 1)
+            research agent                python train.py
                    │
-                   └── writes JSON to $FLEET_SUBMIT_DIR ──▶ back to Scheduler
+                   └── writes a job spec to $FLEET_SUBMIT_DIR ──▶ Scheduler
 ```
 
 | Module | Responsibility |
 | --- | --- |
-| `spec.py` | `JobSpec` / `JobResult` — the data model, with content fingerprints |
+| `spec.py` | `JobSpec` / `JobResult`, the data model, with content fingerprints |
 | `scheduler.py` | Dependency graph, fractional GPU slots, spool intake, state machine |
 | `policy.py` | Every check that can say "no", as a pure function |
 | `budget.py` | Price table, cost estimation, hierarchical reserve/commit tree |
-| `ledger.py` | Hash-chained JSONL + SQLite index + secret redaction |
-| `executors/` | `ship`, `ray`, `dry-run` — where a container is placed |
-| `backends/` | `claude-cli`, `codex-cli` — how an agent is driven and parsed |
+| `ledger.py` | Hash-chained JSONL, SQLite index, secret redaction |
+| `executors/` | `ship`, `slurm`, `ray`, `dry-run`, where a job is placed |
+| `backends/` | `claude-cli`, `codex-cli`, how an agent is driven and parsed |
+| `workflow.py` | Stages, loops, fan-out, templating, stop conditions |
 
 ### Division of labour
 
 | Concern | Owner |
 | --- | --- |
-| Base image, CUDA, Python, torch, agent CLIs | research-ship — `.ship.conf` |
+| Base image, CUDA, Python, torch, agent CLIs | research-ship, `.ship.conf` |
 | `/workspace` mount, model cache, venv volume | research-ship |
-| Non-root user, egress firewall allowlist | research-ship |
-| Which GPU, how much CPU/RAM, timeout | research-fleet — `fleet.yaml` |
+| Non-root user, egress allowlist, credential scoping | research-ship |
+| Which GPU, how much CPU/RAM, timeout | research-fleet, `fleet.yaml` |
 | Recursion depth, fanout, budget, approval gates | research-fleet |
 | Audit ledger, reasoning traces, cost accounting | research-fleet |
 
@@ -133,7 +251,36 @@ claude mcp add research-fleet -- fleet mcp    # drive it from Claude Code or Cod
 > The fleet deliberately does **not** re-impose `--read-only`, `--user`, or
 > `--cap-drop ALL`. Those would break research-ship's writable venv, its non-root
 > user, and the `NET_ADMIN` its firewall needs. Isolation is research-ship's contract;
-> the fleet adds only the limits that are a *scheduling* concern.
+> the fleet adds only the limits that are a scheduling concern.
+
+Credentials follow the same split. The fleet asks research-ship for them only on
+`agent` jobs; a sweep point or a training run runs without any token at all.
+
+## Where jobs run
+
+| Executor | Placement | Container |
+| --- | --- | --- |
+| `ship` | This host; the fleet allocates GPUs by UUID and can pack fractions | research-ship, via Docker |
+| `slurm` | Slurm picks the node and binds the GPUs | Apptainer, or none |
+| `ray` | Ray places across the cluster | research-ship, via Docker |
+| `dry-run` | Nothing runs | none |
+
+On a cluster you usually cannot reach the Docker daemon, so the Slurm executor submits
+with `srun` and runs jobs either directly in the allocation or inside an Apptainer image:
+
+```yaml
+executor:
+  kind: slurm
+  slurm:
+    partition: gpu
+    account: my-lab
+    slots: 16                                 # srun processes held open; the rest queue
+    container_image: /images/research.sif      # omit to use the cluster environment
+```
+
+`slots` is the only knob that needs thought: Slurm does the real queueing, so this just
+caps how many submissions the fleet keeps in flight. Fractional GPUs round up, because
+`--gres` cannot express half a device.
 
 ## Auditability
 
@@ -142,15 +289,15 @@ Each record carries `prev_hash` and `hash`, chaining back to genesis.
 
 ```console
 $ fleet audit verify
-✓ audit chain intact — 1,284 events verified
+✓ audit chain intact, 1,284 events verified
 ```
 
 Editing a payload, deleting a record, or reordering the file all break the chain and
-are reported with the exact sequence number where it broke. The JSONL is the source
-of truth; the SQLite index is disposable (`fleet audit reindex`).
+are reported with the sequence number where it broke. The JSONL is the source of truth;
+the SQLite index is disposable (`fleet audit reindex`).
 
-**Reasoning is traced, not just stdout.** Agent output is parsed *as it streams*, so
-a job that crashes halfway still leaves a complete record up to the failure:
+Agent output is parsed as it streams, so a job that crashes halfway still leaves a
+complete record up to the failure:
 
 ```console
 $ fleet trace job_a1b2c3d4
@@ -161,15 +308,15 @@ $ fleet trace job_a1b2c3d4
 ```
 
 Secrets are scrubbed on the **write** path, by key name and by value shape
-(`sk-ant-…`, `ghp_…`, `AKIA…`, JWTs). An append-only log cannot be cleaned up after
-the fact, so redaction has to happen before the value is ever persisted. Secrets
+(`sk-ant-...`, `ghp_...`, `AKIA...`, JWTs). An append-only log cannot be cleaned up
+after the fact, so redaction has to happen before the value is ever persisted. Secrets
 reach containers as bare `--env KEY` names, so they never appear in a recorded argv.
 
 ## Token and cost awareness
 
 Costs are computed from reported `usage` against a price table, not guessed. Before a
-job runs, `quote()` estimates it from the model, the reasoning `effort`, and the
-*shape* of the work — an agent loop re-reads its growing context every turn, a single
+job runs, `quote()` estimates it from the model, the reasoning `effort`, and the shape
+of the work, since an agent loop re-reads its growing context every turn while a single
 call does not.
 
 ```console
@@ -185,32 +332,21 @@ $ fleet cost
 ```
 
 **Budgets are hierarchical.** A run opens a root scope; each agent gets a child scope
-carved from its parent's *remaining* balance; spend rolls up to every ancestor. A
+carved from its parent's remaining balance; spend rolls up to every ancestor. A
 sub-agent cannot spend money its parent does not have, so a runaway delegation tree is
-bounded by construction rather than by a global limit it might win a race against. A
-scope is released only once every descendant is terminal.
+bounded by construction. A scope is released only once every descendant is terminal.
 
-Reservation matters as much as accounting: without it, twenty agents each individually
-fit the budget while collectively blowing it. A job reserves its estimate at submit
-time and settles against real usage at exit.
+Jobs also *reserve* their estimate at submit time and settle against real usage at
+exit. Without that, twenty agents each individually fit the budget while collectively
+blowing it.
 
-## Agents launching agents
+## Agents that design their own experiments
 
-An agent receives a budget briefing in its prompt — remaining balance, the price of
-each model it may delegate to, and its current depth:
-
-> ## Budget
-> You have **$14.20** and **8,400,000 tokens** remaining for this task *including*
-> any sub-agents you launch.
->
-> | model | effort | est. cost |
-> |---|---|---|
-> | claude-haiku-4-5 | low | $0.309 |
-> | claude-sonnet-5 | high | $1.903 |
-> | claude-opus-5 | high | $3.172 |
->
-> Delegate broad, parallel, or low-stakes work to a cheaper model at lower effort;
-> reserve the expensive tier for the reasoning that actually needs it.
+An agent can propose configurations, launch the runs, read the metrics, and iterate.
+To spend responsibly it needs to know what things cost, so its prompt carries a budget
+briefing: remaining balance, the per-model prices from the table above, and how deep it
+already is. The guidance it gets is to delegate broad or low-stakes work to a cheaper
+model at lower effort, and reserve the expensive tier for reasoning that needs it.
 
 To launch work, the agent writes a JSON spec into `$FLEET_SUBMIT_DIR`:
 
@@ -228,12 +364,12 @@ through the same policy and budget path as any other job. This keeps
 `network.mode: none` viable for agent containers, gives every child a durable
 provenance record naming its parent, and means a compromised agent gets a queue slot
 rather than a control channel. An agent cannot choose its own image, so it cannot
-escape the ship the operator configured. Rejections come back as
+escape the environment the operator configured. Rejections come back as
 `<name>.rejected.json` with a readable reason.
 
 ## Safeguards
 
-Policy runs on the submit path and is a pure function of `(spec, context) → Decision`,
+Policy runs on the submit path and is a pure function of `(spec, context) -> Decision`,
 so `fleet policy` shows exactly what is enforced.
 
 | Layer | Default |
@@ -242,8 +378,10 @@ so `fleet policy` shows exactly what is enforced.
 | Budget | `$50` per run, `$25` per job; hierarchical, reserved up front |
 | Resources | Per-job GPU / memory / timeout ceilings; timeouts clamped, not denied |
 | Filesystem | Mounts must resolve inside an allowlist; `/`, `/etc`, `~/.ssh`, `~/.aws`, the Docker socket are refused |
+| Credentials | Withheld from `command` jobs entirely; scoped per project for `agent` jobs |
+| Working tree | `isolate_agents: true` gives every agent its own git worktree and branch |
 | Container | Non-root user and cache isolation from research-ship; `--pids-limit` from the fleet |
-| Network | `limited` by default — research-ship's default-deny egress allowlist |
+| Network | `limited` by default, using research-ship's default-deny egress allowlist |
 | Commands | Denylist for destructive patterns (`rm -rf /`, nested `docker run`, fork bombs) |
 | Approval | Unrestricted network or a writable mount outside the workspace parks the job |
 
@@ -252,16 +390,18 @@ so `fleet policy` shows exactly what is enforced.
 `fleet pending` shows what is blocked and why.
 
 Approval is **in-process**: a parked job belongs to a live scheduler, so grant it with
-`fleet.approve(job_id)` from the session that submitted it (or via MCP). A job whose
-scheduler has exited cannot be resumed, only resubmitted.
+`fleet.approve(job_id)` from the session that submitted it (or via MCP). There is no
+cross-process `fleet approve`, because a job whose scheduler has exited cannot be
+resumed, only resubmitted.
 
 > [!WARNING]
-> **Known limits.** The egress allowlist resolves domains to IPs at container start,
-> so CDN rotation can break a long run — and it restricts *where* traffic goes, not
-> *what* it carries. The price table is a snapshot (`budget.PRICES_AS_OF`),
-> overridable via `budget.model_costs`. `/workspace` is a read-write bind mount to
-> your real project directory, so an agent can corrupt your working tree — keep it
-> under version control.
+> **Known limits.** The egress allowlist resolves domains to IPs at container start, so
+> CDN rotation can break a long run, and it restricts where traffic goes rather than
+> what it carries. The price table is a snapshot (`budget.PRICES_AS_OF`), overridable
+> via `budget.model_costs`, so verify spend against your provider's billing rather than
+> trusting these numbers. `/workspace` is a read-write bind mount to your real project
+> directory unless you set `WORKTREE_DEFAULT=1` in `.ship.conf`, which is strongly
+> recommended for unattended runs.
 
 ## Configuration
 
@@ -271,19 +411,27 @@ Precedence, lowest to highest:
 defaults < ~/.config/research-fleet/config.yaml < ./fleet.yaml < FLEET_* env < CLI flags
 ```
 
-Env vars use `__` for nesting: `FLEET_EXECUTOR__KIND=ray`. See
+Env vars use `__` for nesting, for example `FLEET_EXECUTOR__KIND=ray`. See
 [`fleet.yaml`](fleet.yaml) for the fully commented surface.
 
-Container configuration is **not** here — it lives in the project's `.ship.conf`
-and belongs to research-ship.
+Container configuration is **not** here. It lives in the project's `.ship.conf` and
+belongs to research-ship.
 
 ## Development
 
 ```bash
-uv pip install -e ".[dev]"
+git clone https://github.com/shs2017/research-fleet && cd research-fleet
+uv venv && uv pip install -e ".[dev]"
 pytest -q
 ```
 
-The `dry-run` executor validates specs, exercises policy, and writes a complete ledger
-without starting containers, and the ship-executor tests use a fake `ship`
-script — so the whole suite runs on a machine with no GPU and no Docker.
+105 tests, 95% line coverage:
+
+```bash
+coverage run -m pytest && coverage report
+```
+
+Nothing needs a GPU or Docker. The `dry-run` executor exercises the scheduler, policy
+and ledger without starting containers, and the executor tests drive `ShipExecutor`
+against a fake `ship` and a fake `docker` on disk, which is how streaming, timeouts and
+cancellation get covered.

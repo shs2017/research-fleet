@@ -3,7 +3,7 @@
 `codex exec --json` emits JSONL. Its schema is less stable than Claude's, so
 this parser is deliberately tolerant: anything it doesn't recognise still lands
 in the ledger as a `raw` event rather than being dropped. Auditability beats
-tidiness — an unparsed line you can read later is better than a silent gap.
+tidiness: an unparsed line you can read later is better than a silent gap.
 
 Token accounting: Codex reports OpenAI-shaped usage keys. Costs for non-Claude
 models are only computed if a matching entry exists in the price table, so

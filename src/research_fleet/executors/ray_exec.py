@@ -1,4 +1,4 @@
-"""Ray executor — the same research-ship container, placed across a multi-node cluster.
+"""Ray executor: the same research-ship container, placed across a multi-node cluster.
 
 Ray owns placement and GPU accounting; research-ship still owns the container. The
 remote task asks Ray which GPUs it was given, resolves those indices to stable

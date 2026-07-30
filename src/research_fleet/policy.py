@@ -1,4 +1,4 @@
-"""Safeguards — everything that can say "no" before a container starts.
+"""Safeguards: everything that can say "no" before a container starts.
 
 The policy engine is a pure function of (spec, context) → Decision. It runs on
 the submit path, so a denial is recorded in the ledger and the job never
@@ -7,20 +7,20 @@ against a plan (`fleet plan --explain`) to see what would be blocked.
 
 Layers, roughly outermost to innermost:
 
-  * **Fanout & depth** — an agent that can spawn agents can recurse forever;
+  * **Fanout & depth**: an agent that can spawn agents can recurse forever;
     `max_agent_depth` and `max_children_per_agent` bound the tree.
-  * **Budget** — enforced in `budget.BudgetTracker`, invoked from here so a
+  * **Budget**: enforced in `budget.BudgetTracker`, invoked from here so a
     denial reads the same as any other.
-  * **Resources** — per-job ceilings, so one job can't request the whole cluster.
-  * **Filesystem** — mounts must resolve inside an allowlist; no host-root, no
+  * **Resources**: per-job ceilings, so one job can't request the whole cluster.
+  * **Filesystem**: mounts must resolve inside an allowlist; no host-root, no
     docker socket, no writable mounts outside declared workspaces.
-  * **Container hardening** — dropped capabilities, no-new-privileges, pid
+  * **Container hardening**: dropped capabilities, no-new-privileges, pid
     limits, non-root user, optional read-only rootfs.
-  * **Network** — default-deny egress with an allowlist, because an agent with
+  * **Network**: default-deny egress with an allowlist, because an agent with
     a shell and open internet is an exfiltration path.
-  * **Commands & tools** — pattern denylist for command jobs, tool allowlist
+  * **Commands & tools**: pattern denylist for command jobs, tool allowlist
     for agent jobs.
-  * **Approval gates** — anything matching `require_approval_for` parks in
+  * **Approval gates**: anything matching `require_approval_for` parks in
     AWAITING_APPROVAL instead of running.
 """
 
@@ -56,15 +56,15 @@ class Decision:
 class NetworkPolicy(BaseModel):
     """Egress control, implemented by the research-ship firewall.
 
-      * `none`         — no network at all (`--network none`)
-      * `limited`      — research-ship's default-deny iptables allowlist, plus
+      * `none`        : no network at all (`--network none`)
+      * `limited`     : research-ship's default-deny iptables allowlist, plus
                          `allowed_hosts` appended via FIREWALL_EXTRA_DOMAINS
-      * `unrestricted` — normal outbound access
+      * `unrestricted`: normal outbound access
 
     `limited` is a real allowlist resolved to IPs inside the container, not a
     label. Two caveats inherited from the ship: CDN addresses rotate, so a
     long run can start failing and needs the firewall re-applied; and an
-    allowlisted domain can still be used to move data out — this restricts
+    allowlisted domain can still be used to move data out: this restricts
     *where* traffic goes, not *what* it carries.
     """
 
@@ -78,7 +78,7 @@ class NetworkPolicy(BaseModel):
 class ContainerPolicy(BaseModel):
     """Per-job limits the fleet layers on top of the research-ship container.
 
-    Deliberately small. research-ship already supplies the isolation posture —
+    Deliberately small. research-ship already supplies the isolation posture:
     non-root `dev` user, a narrow sudo grant limited to the firewall script,
     volume-scoped caches, and only `/workspace` bind-mounted from the host.
     Re-imposing `--read-only`, `--cap-drop ALL` or `--user` here would break
@@ -225,7 +225,7 @@ class Policy(BaseModel):
             src = Path(m.source).expanduser()
             try:
                 resolved = src.resolve()
-            except OSError as exc:
+            except (OSError, ValueError, RuntimeError) as exc:
                 if self.fail_closed:
                     return Decision("deny", [f"cannot resolve mount source {m.source!r}: {exc}"])
                 continue

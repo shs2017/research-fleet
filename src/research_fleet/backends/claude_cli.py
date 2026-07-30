@@ -32,6 +32,11 @@ class ClaudeCLIBackend:
             "-p", prompt,
             "--output-format", "stream-json",
             "--verbose",
+            # Without this the agent cannot edit files, which makes it useless for
+            # research. It is safe here for the same reason it is safe in
+            # research-ship: the container, not the prompt, is the isolation boundary,
+            # and `policy` plus `--worktree` bound what that container can reach.
+            "--dangerously-skip-permissions",
         ]
         argv += ["--model", agent.model or self.default_model()]
         if agent.system_prompt:
@@ -50,17 +55,23 @@ class ClaudeCLIBackend:
 
     # ------------------------------------------------------------------ parse
 
-    @staticmethod
-    def _usage_from(obj: dict, model: str = "") -> Usage | None:
+    # The harness reports this for messages it generated locally, which are not billed.
+    SYNTHETIC_MODEL = "<synthetic>"
+
+    @classmethod
+    def _usage_from(cls, obj: dict, model: str = "") -> Usage | None:
         u = obj.get("usage")
         if not isinstance(u, dict):
             return None
+        name = model or obj.get("model") or ""
+        if name == cls.SYNTHETIC_MODEL:
+            name = ""
         return Usage(
             input_tokens=int(u.get("input_tokens") or 0),
             output_tokens=int(u.get("output_tokens") or 0),
             cache_read_tokens=int(u.get("cache_read_input_tokens") or 0),
             cache_write_tokens=int(u.get("cache_creation_input_tokens") or 0),
-            model=model or obj.get("model") or "",
+            model=name,
             requests=1,
         )
 

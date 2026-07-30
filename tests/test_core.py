@@ -382,3 +382,119 @@ def test_denied_job_never_runs_and_is_recorded(tmp_path):
         assert ok
     finally:
         fleet.close()
+
+
+# ------------------------------------------------------- config layering
+
+
+def test_env_vars_override_config_with_double_underscore_nesting(tmp_path, monkeypatch):
+    """FLEET_EXECUTOR__KIND=ray must reach executor.kind."""
+    monkeypatch.setenv("FLEET_EXECUTOR__KIND", "dry-run")
+    monkeypatch.setenv("FLEET_BUDGET__MAX_USD", "7.5")
+    monkeypatch.setenv("FLEET_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("FLEET_CONFIG", str(tmp_path / "absent.yaml"))
+
+    from research_fleet.config import load_config
+
+    cfg = load_config()
+    assert cfg.executor.kind == "dry-run"
+    assert cfg.budget.max_usd == 7.5          # JSON-decoded to a float, not left a string
+    assert cfg.workspace == str(tmp_path)
+
+
+def test_explicit_kwargs_beat_env_vars(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLEET_BUDGET__MAX_USD", "1.0")
+    monkeypatch.setenv("FLEET_CONFIG", str(tmp_path / "absent.yaml"))
+
+    from research_fleet.config import load_config
+
+    assert load_config(budget={"max_usd": 42.0}).budget.max_usd == 42.0
+
+
+def test_a_project_yaml_is_read_and_merged(tmp_path):
+    (tmp_path / "fleet.yaml").write_text(
+        "image: custom:latest\nbudget:\n  max_usd: 3.0\n  default_effort: low\n"
+    )
+    from research_fleet.config import load_config
+
+    cfg = load_config(tmp_path / "fleet.yaml")
+    assert cfg.image == "custom:latest"
+    assert cfg.budget.max_usd == 3.0
+    assert cfg.budget.default_effort == "low"
+    # Unmentioned keys keep their defaults rather than being cleared.
+    assert cfg.budget.default_model == "claude-opus-5"
+
+
+def test_workspace_becomes_the_default_mount_allowlist(tmp_path):
+    from research_fleet.config import FleetConfig
+
+    cfg = FleetConfig(root=str(tmp_path / "root"), workspace=str(tmp_path))
+    assert str(tmp_path.resolve()) in cfg.policy.allowed_mount_roots
+
+
+def test_custom_model_prices_are_registered_from_config(tmp_path):
+    from research_fleet.budget import cost_for
+    from research_fleet.config import FleetConfig
+
+    FleetConfig(
+        root=str(tmp_path),
+        budget={"model_costs": {"my-local-model": {"input_per_mtok": 0.0, "output_per_mtok": 0.0}}},
+    )
+    assert cost_for("my-local-model").cost_usd(input_tokens=10_000_000) == 0.0
+
+
+# ------------------------------------------------- remaining policy branches
+
+
+def test_policy_denies_when_the_run_budget_is_already_spent():
+    b = BudgetTracker()
+    b.open("run", max_usd=0.01, max_tokens=100)
+    p = Policy()
+    d = p.check(_agent_spec(), budget=b, budget_scope="run",
+                estimate=quote("claude-opus-5", process="agent_standard"))
+    assert d.verdict == "deny"
+    assert "budget exceeded" in d.reasons[0]
+
+
+def test_policy_reserves_the_estimate_when_it_allows_a_job():
+    b = BudgetTracker()
+    b.open("run", max_usd=100.0, max_tokens=100_000_000)
+    p = Policy()
+    est = quote("claude-haiku-4-5", process="agent_short")
+    d = p.check(_agent_spec(), budget=b, budget_scope="run", estimate=est)
+    assert d.verdict == "allow"
+    assert d.mutations["budget_reserved"]["usd"] == est.est_cost_usd
+    assert b.get("run").reserved_usd == pytest.approx(est.est_cost_usd)
+
+
+def test_policy_denies_a_mount_path_it_cannot_resolve(tmp_path):
+    """An agent-submitted spec can carry a path that is not resolvable at all."""
+    p = Policy(allowed_mount_roots=[str(tmp_path)], fail_closed=True)
+    spec = JobSpec(name="c", command=["true"], mounts=[Mount(source="bad\0path", target="/x")])
+    d = p.check(spec)
+    assert d.verdict == "deny"
+    assert "cannot resolve" in d.reasons[0]
+
+
+def test_policy_allows_a_mount_target_that_does_not_exist_yet(tmp_path):
+    """Results directories are created by the job, so they legitimately do not exist yet.
+    Path.resolve() is non-strict, which is what makes this work."""
+    p = Policy(allowed_mount_roots=[str(tmp_path)], fail_closed=True)
+    spec = JobSpec(name="c", command=["true"],
+                   mounts=[Mount(source=str(tmp_path / "results" / "run1"), target="/results")])
+    assert p.check(spec).verdict == "allow"
+
+
+def test_policy_merges_its_tool_denylist_into_the_job(tmp_path):
+    p = Policy(agent_default_disallowed_tools=["WebFetch"])
+    spec = _agent_spec()
+    spec.agent.disallowed_tools = ["Bash"]
+    d = p.check(spec)
+    assert d.verdict == "allow"
+    assert d.mutations["agent_disallowed_tools"] == ["Bash", "WebFetch"]
+
+
+def test_policy_gate_can_be_disabled_by_emptying_require_approval_for():
+    p = Policy(require_approval_for=[])
+    p.network.mode = "unrestricted"
+    assert p.check(JobSpec(name="c", command=["true"])).verdict == "allow"

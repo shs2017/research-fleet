@@ -1,0 +1,46 @@
+# A coder and reviewer cycle: implement, review, and repeat until the reviewer
+# approves or the loop runs out of attempts.
+#
+#   fleet workflow examples/code-review-loop.yaml --plan     # see the stages
+#   fleet workflow examples/code-review-loop.yaml --max-usd 10
+name: code-review-loop
+description: Implement a change, then review it until it passes.
+
+model: claude-sonnet-5      # default for every step below
+isolate: true               # each agent works on its own git branch
+
+stages:
+  - name: plan
+    task: |
+      Read the repository and write a short implementation plan for:
+      add a --seed flag to train.py that makes runs reproducible.
+      Write the plan to PLAN.md.
+    gpus: 0
+
+  - name: implement-and-review
+    loop:
+      max_iterations: 3
+      until:
+        step: review
+        output_contains: APPROVED
+      steps:
+        - name: implement
+          task: |
+            Follow PLAN.md and implement the change.
+            {{ steps.review.output }}
+            If the text above contains reviewer feedback, address it.
+          gpus: 0
+
+        - name: review
+          model: claude-opus-5      # review with the stronger model
+          task: |
+            Review the working tree against PLAN.md. Check correctness, tests
+            and clarity. If it is ready to merge, reply with exactly APPROVED
+            on its own line. Otherwise list what must change.
+          gpus: 0
+
+  - name: verify
+    kind: command
+    command: ["python", "-m", "pytest", "-q"]
+    needs: [implement-and-review]
+    gpus: 0

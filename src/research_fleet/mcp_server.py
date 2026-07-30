@@ -1,4 +1,4 @@
-"""MCP server — lets Claude Code, Codex, or any MCP client drive the fleet.
+"""MCP server: lets Claude Code, Codex, or any MCP client drive the fleet.
 
 Register with Claude Code:
 
@@ -6,7 +6,7 @@ Register with Claude Code:
 
 The tool surface is deliberately narrow and cost-aware. `fleet_quote` exists so
 a calling agent can price work *before* committing to it, and every launch tool
-returns the budget remaining afterwards — an agent that can't see the meter will
+returns the budget remaining afterwards: an agent that can't see the meter will
 either overspend or refuse to do anything useful.
 
 Long-running launches return immediately with a run id; the client polls

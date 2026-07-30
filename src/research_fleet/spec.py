@@ -1,9 +1,9 @@
-"""Job specifications — the data model everything else operates on.
+"""Job specifications: the data model everything else operates on.
 
 A fleet run is a DAG of `JobSpec`s. Two kinds exist:
 
-  * `command` — run a process in a container (a training run, an eval, a sweep point)
-  * `agent`   — run an LLM coding agent in a container; it may submit further jobs
+  * `command`: run a process in a container (a training run, an eval, a sweep point)
+  * `agent`  : run an LLM coding agent in a container; it may submit further jobs
 
 Both share the same resource, isolation and audit surface, which is what makes
 "agent that launches its own sweep" work without a second scheduler.
@@ -102,6 +102,10 @@ class JobSpec(BaseModel):
     mounts: list[Mount] = Field(default_factory=list)
     resources: Resources = Field(default_factory=Resources)
 
+    isolate: bool = Field(
+        False,
+        description="Run against a git worktree on its own branch instead of the live tree.",
+    )
     depends_on: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict, description="Sweep coordinates; recorded verbatim in the ledger.")
     labels: dict[str, str] = Field(default_factory=dict)
@@ -122,7 +126,7 @@ class JobSpec(BaseModel):
         return self
 
     def fingerprint(self) -> str:
-        """Stable content hash — lets the ledger prove a job wasn't edited after the fact."""
+        """Stable content hash: lets the ledger prove a job wasn't edited after the fact."""
         payload = self.model_dump(mode="json", exclude={"created_at"})
         blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()
@@ -141,6 +145,9 @@ class JobResult(BaseModel):
     metrics: dict[str, float] = Field(default_factory=dict)
     artifacts: list[str] = Field(default_factory=list)
     usage: dict[str, Any] = Field(default_factory=dict, description="Token/cost accounting for agent jobs.")
+    output: str = Field(
+        "", description="The job's answer: an agent's final message, or a command's last output."
+    )
 
     @property
     def duration_s(self) -> float | None:

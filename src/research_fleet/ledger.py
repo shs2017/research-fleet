@@ -260,14 +260,14 @@ class Ledger:
         count = 0
         for ev in self.read_all():
             if ev.seq != expected_seq:
-                return False, f"seq gap at {ev.seq} (expected {expected_seq}) — records inserted or removed"
+                return False, f"seq gap at {ev.seq} (expected {expected_seq}): records inserted or removed"
             if ev.prev_hash != prev:
-                return False, f"prev_hash mismatch at seq={ev.seq} — history was rewritten"
+                return False, f"prev_hash mismatch at seq={ev.seq}: history was rewritten"
             recomputed = Event.compute_hash(
                 ev.seq, ev.ts, ev.type, ev.run_id, ev.job_id, ev.payload, ev.prev_hash
             )
             if recomputed != ev.hash:
-                return False, f"payload edited at seq={ev.seq} — hash does not match content"
+                return False, f"payload edited at seq={ev.seq}: hash does not match content"
             prev = ev.hash
             expected_seq += 1
             count += 1
@@ -297,7 +297,7 @@ class Ledger:
 class Redactor:
     """Keeps secrets out of the permanent record.
 
-    The ledger is append-only by design, so a leaked key is unrecoverable —
+    The ledger is append-only by design, so a leaked key is unrecoverable, so
     scrubbing has to happen on the write path, before the value is ever
     persisted. Matches on key name for structured payloads and on value shape
     for free text (API keys embedded in a command line or an agent transcript).

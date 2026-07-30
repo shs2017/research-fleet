@@ -1,4 +1,4 @@
-"""Parameter sweeps — the non-LLM half of the workload.
+"""Parameter sweeps: the non-LLM half of the workload.
 
 A sweep expands a grid (or an explicit list of points) into `command` jobs.
 Each point's coordinates are recorded in `JobSpec.params`, so the ledger can
@@ -31,7 +31,7 @@ def parse_grid_args(pairs: Iterable[str]) -> dict[str, list[Any]]:
     out: dict[str, list[Any]] = {}
     for pair in pairs:
         if "=" not in pair:
-            raise ValueError(f"expected name=v1,v2 — got {pair!r}")
+            raise ValueError(f"expected name=v1,v2, got {pair!r}")
         name, raw = pair.split("=", 1)
         values: list[Any] = []
         for token in raw.split(","):

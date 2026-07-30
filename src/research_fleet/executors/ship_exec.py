@@ -1,17 +1,17 @@
-"""Ship executor — runs jobs in research-ship containers.
+"""Ship executor: runs jobs in research-ship containers.
 
 research-fleet does not define what a GPU container looks like. `research-ship`
 does: base image, CUDA, the uv-managed venv, the model cache volumes, the
 non-root user, the egress firewall. This executor asks it for the resolved
 `docker run` argv (`ship docker-args`), appends the fleet's own per-job
-hardening, and owns the process from there — streaming output, enforcing the
+hardening, and owns the process from there: streaming output, enforcing the
 timeout, and stopping the container on cancel.
 
 Keeping container configuration in one place matters more than it sounds: the
 alternative is two tools that each think they know the right mount layout, and
 they drift the first time either changes.
 
-Requires `ship` on PATH — see https://github.com/<you>/research-ship.
+Requires `ship` on PATH: see https://github.com/<you>/research-ship.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 from ..policy import Policy
-from ..spec import JobResult, JobSpec, JobState
+from ..spec import JobKind, JobResult, JobSpec, JobState
 from .base import LineHandler, Placement
 
 
@@ -76,6 +76,17 @@ class ShipExecutor:
         flags = ["--name", name, "--shm-size", f"{int(spec.resources.shm_size_gb)}g"]
         if spec.image:
             flags += ["--image", spec.image]
+
+        # research-ship withholds credentials unless asked. Only agent jobs need them;
+        # a training run or a sweep point has no use for an API token, and every
+        # container that holds one is another place it can leak from.
+        flags += ["--creds"] if spec.kind is JobKind.AGENT else ["--no-creds"]
+
+        # research-ship checks out a git worktree on this branch, so the job cannot
+        # touch the live working tree. The branch is derived from the job, so parallel
+        # agents on one question each land on their own reviewable branch.
+        if spec.isolate:
+            flags += ["--worktree", f"fleet/{spec.run_id}-{spec.name}"[:80]]
 
         if placement.gpu_ids:
             # Quoted form is what Docker's --gpus parser expects for a device list.

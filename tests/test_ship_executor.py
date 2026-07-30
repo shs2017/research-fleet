@@ -137,3 +137,38 @@ def test_image_override_is_delegated_to_ship(fake_ship):
     assert "--image" in log.read_text().splitlines()
     assert "my-custom:v2" in argv
     assert "ship-proj:latest" not in argv
+
+
+def test_isolate_asks_ship_for_a_worktree_on_its_own_branch(fake_ship):
+    """An isolated job must not be handed the live working tree."""
+    executor, log = fake_ship
+    executor.build_argv(
+        _spec(isolate=True, name="ablate"), argv=["true"], env={}, policy=Policy(),
+        placement=Placement(gpu_ids=()), name="n",
+    )
+    flags = log.read_text().splitlines()
+    assert "--worktree" in flags
+    branch = flags[flags.index("--worktree") + 1]
+    assert branch.startswith("fleet/") and "ablate" in branch
+
+
+def test_jobs_are_not_isolated_unless_asked(fake_ship):
+    executor, log = fake_ship
+    executor.build_argv(
+        _spec(), argv=["true"], env={}, policy=Policy(),
+        placement=Placement(gpu_ids=()), name="n",
+    )
+    assert "--worktree" not in log.read_text().splitlines()
+
+
+def test_parallel_isolated_jobs_get_distinct_branches(fake_ship):
+    executor, log = fake_ship
+    branches = set()
+    for name in ("variant-a", "variant-b"):
+        executor.build_argv(
+            _spec(isolate=True, name=name), argv=["true"], env={}, policy=Policy(),
+            placement=Placement(gpu_ids=()), name="n",
+        )
+        flags = log.read_text().splitlines()
+        branches.add(flags[flags.index("--worktree") + 1])
+    assert len(branches) == 2, "each job needs its own branch to be reviewable"

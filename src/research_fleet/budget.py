@@ -2,20 +2,20 @@
 
 Three things live here:
 
-  1. **A price table** (`MODEL_COSTS`) — per-model input/output rates plus the
+  1. **A price table** (`MODEL_COSTS`): per-model input/output rates plus the
      cache multipliers, so spend is computed from real `usage` fields rather
      than guessed.
-  2. **Effort/process multipliers** — the same prompt on the same model costs
+  2. **Effort/process multipliers**: the same prompt on the same model costs
      very different amounts at `low` vs `max` effort, and an agentic loop costs
      a multiple of a single call. These are *estimation* heuristics used for
      pre-flight quotes; actual spend always comes from reported usage.
-  3. **A hierarchical budget tree** (`BudgetTracker`) — a run gets an
+  3. **A hierarchical budget tree** (`BudgetTracker`): a run gets an
      allocation; each job reserves against it; an agent job that spawns
      children sub-allocates from *its own* remaining balance. A child can never
      spend budget its parent doesn't have, so a runaway sub-agent is bounded by
      construction rather than by a global limit it might race other jobs for.
 
-Prices are a snapshot (see `PRICES_AS_OF`) and are overridable from config —
+Prices are a snapshot (see `PRICES_AS_OF`) and are overridable from config:
 never let a stale table silently misreport spend.
 """
 
@@ -84,7 +84,7 @@ ALIASES = {
 }
 
 # Relative token consumption by reasoning effort, normalised to `high` = 1.0.
-# Heuristic — used only to quote before a job runs, never to bill it.
+# Heuristic: used only to quote before a job runs, never to bill it.
 EFFORT_MULTIPLIER = {
     "low": 0.35,
     "medium": 0.6,
@@ -151,8 +151,29 @@ class Usage:
             + self.cache_read_tokens + self.cache_write_tokens
         )
 
+    @property
+    def priced(self) -> bool:
+        """False when the model is absent from the price table, so spend is unknown."""
+        try:
+            return bool(self.model) and bool(cost_for(self.model))
+        except KeyError:
+            return False
+
     def cost_usd(self, model: str | None = None) -> float:
-        return cost_for(model or self.model).cost_usd(
+        """Zero for an unpriced model rather than raising.
+
+        Harnesses report model names we do not price, including synthetic ones for
+        locally generated messages. Charging nothing is wrong but survivable; taking
+        down a running fleet over a label is not. `priced` exposes the difference.
+        """
+        key = model or self.model
+        if not key:
+            return 0.0
+        try:
+            mc = cost_for(key)
+        except KeyError:
+            return 0.0
+        return mc.cost_usd(
             self.input_tokens, self.output_tokens,
             self.cache_read_tokens, self.cache_write_tokens,
         )
@@ -177,6 +198,7 @@ class Usage:
             "cache_write_tokens": self.cache_write_tokens,
             "total_tokens": self.total_tokens,
             "cost_usd": round(self.cost_usd(), 6) if self.model else None,
+            "unpriced_model": bool(self.model) and not self.priced,
         }
 
 
@@ -291,7 +313,7 @@ def render_cost_brief(
         "",
         "Guidance: delegate broad, parallel, or low-stakes work to a cheaper model at "
         "lower effort; reserve the expensive tier for the reasoning that actually needs it. "
-        "Every sub-agent you launch debits the balance above — if a reservation would exceed "
+        "Every sub-agent you launch debits the balance above: if a reservation would exceed "
         "it, the launch is rejected rather than silently truncated, so quote before you spawn.",
         f"(Prices as of {PRICES_AS_OF}.)",
     ]
@@ -312,7 +334,7 @@ class BudgetNode:
 
     @property
     def committed_usd(self) -> float:
-        """Reservations plus actual spend — what's already claimed."""
+        """Reservations plus actual spend: what's already claimed."""
         return self.reserved_usd + self.spent_usd
 
     @property
@@ -426,8 +448,8 @@ class BudgetTracker:
         While a child scope is open the parent holds *both* the full grant (as a
         reservation) and the child's rolled-up spend, so the parent transiently
         under-reports its own remaining balance. That error is in the safe
-        direction — the parent refuses work it could technically afford rather
-        than admitting work it cannot — and this call reconciles it, leaving the
+        direction: the parent refuses work it could technically afford rather
+        than admitting work it cannot, and this call reconciles it, leaving the
         parent charged exactly the child's actual spend.
 
         Only call this once every descendant of `scope` is terminal; releasing

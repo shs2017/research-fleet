@@ -8,7 +8,7 @@ A backend knows three things and nothing else:
 
 That keeps the scheduler, ledger and budget code provider-agnostic: adding a
 backend never touches them. Parsing is line-oriented so reasoning is streamed
-into the ledger as it happens rather than buffered until exit — a job that dies
+into the ledger as it happens rather than buffered until exit, and a job that dies
 mid-run still leaves a complete trace up to the failure.
 """
 
