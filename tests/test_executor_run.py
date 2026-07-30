@@ -20,8 +20,18 @@ from research_fleet.executors.ship_exec import ShipExecutor, ShipUnavailable
 from research_fleet.policy import Policy
 from research_fleet.spec import JobSpec, JobState, Resources
 
+# Mirrors the real ship where it matters: it emits the credential volume when asked
+# for --creds, which is what the fleet inspects to decide whether agents can log in.
 FAKE_SHIP = """#!/usr/bin/env bash
-printf '%s\\n' docker run --rm sandbox:latest
+creds=0
+for a in "$@"; do
+    if [[ "$a" == "--creds" ]]; then creds=1; fi
+done
+printf '%s\\n' docker run --rm
+if [[ "$creds" == "1" ]]; then
+    printf '%s\\n' -v ship-proj-claude:/home/dev/.claude
+fi
+printf '%s\\n' sandbox:latest
 shift
 while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done
 shift || true
@@ -191,3 +201,129 @@ def test_available_gpus_degrades_when_nvidia_smi_is_absent(fake, monkeypatch):
     executor = ShipExecutor(ship_binary=str(ship), docker_binary=str(make_docker("exit 0")))
     monkeypatch.setenv("PATH", str(ship.parent))   # no nvidia-smi here
     assert executor.available_gpus() == []
+
+
+def test_preflight_explains_a_missing_image(fake, monkeypatch):
+    """A missing image made every job die with a bare `exit code 125`."""
+    ship, make_docker = fake
+    docker = make_docker('[[ "$1 $2" == "image inspect" ]] && exit 1\nexit 0')
+    executor = ShipExecutor(ship_binary=str(ship), docker_binary=str(docker),
+                            project_dir=str(ship.parent))
+    with pytest.raises(ShipUnavailable) as caught:
+        executor.preflight(Policy())
+    message = str(caught.value)
+    assert "does not exist" in message
+    assert "ship build" in message, "must say how to fix it"
+    assert str(ship.parent) in message, "must say which project it looked at"
+
+
+def test_preflight_passes_when_the_image_is_present(fake):
+    ship, make_docker = fake
+    executor = ShipExecutor(ship_binary=str(ship), docker_binary=str(make_docker("exit 0")),
+                            project_dir=str(ship.parent))
+    executor.preflight(Policy())      # must not raise
+
+
+def test_a_failure_reports_the_reason_not_just_the_code(fake):
+    """The daemon's complaint was captured in the ledger but never surfaced."""
+    ship, make_docker = fake
+    docker = make_docker("""
+        [[ "$1 $2" == "image inspect" ]] && exit 0
+        echo "docker: Error response from daemon: pull access denied" >&2
+        exit 125
+    """)
+    executor = ShipExecutor(ship_binary=str(ship), docker_binary=str(docker))
+    result = _run(executor, _spec(), [])
+    assert result.state is JobState.FAILED
+    assert "125" in result.error
+    assert "pull access denied" in result.error, "the reason must reach the operator"
+    assert "ship build" in result.error, "and a hint at the usual cause"
+
+
+def test_a_missing_command_inside_the_container_is_explained(fake):
+    ship, make_docker = fake
+    docker = make_docker("""
+        [[ "$1 $2" == "image inspect" ]] && exit 0
+        echo "bash: nosuchthing: command not found" >&2
+        exit 127
+    """)
+    executor = ShipExecutor(ship_binary=str(ship), docker_binary=str(docker))
+    result = _run(executor, _spec(), [])
+    assert "command not found inside the container" in result.error
+
+
+def test_a_clean_failure_with_no_stderr_still_reports_the_code(fake):
+    ship, make_docker = fake
+    docker = make_docker('[[ "$1 $2" == "image inspect" ]] && exit 0\nexit 3')
+    executor = ShipExecutor(ship_binary=str(ship), docker_binary=str(docker))
+    assert "exit code 3" in _run(executor, _spec(), []).error
+
+
+def test_fleet_startup_fails_fast_when_nothing_could_run(tmp_path, fake):
+    """No job should be submitted, and no money spent, if the image is missing."""
+    ship, make_docker = fake
+    docker = make_docker('[[ "$1 $2" == "image inspect" ]] && exit 1\nexit 0')
+    from research_fleet import Fleet
+
+    with pytest.raises(ShipUnavailable, match="does not exist"):
+        Fleet(root=str(tmp_path / "state"), workspace=str(tmp_path),
+              executor={"kind": "ship", "ship_binary": str(ship),
+                        "docker_binary": str(docker)})
+
+
+def test_missing_credentials_are_caught_before_any_agent_runs(tmp_path, fake):
+    """Every agent otherwise burns a container and reports "Not logged in", which reads
+    as a model failure rather than a setup step."""
+    ship, make_docker = fake
+    # image inspect ok; the credential probe fails
+    docker = make_docker("""
+        [[ "$1 $2" == "image inspect" ]] && exit 0
+        [[ "$1" == "run" ]] && exit 1
+        exit 0
+    """)
+    from research_fleet import Fleet
+
+    fleet = Fleet(root=str(tmp_path / "state"), workspace=str(tmp_path),
+                  executor={"kind": "ship", "ship_binary": str(ship),
+                            "docker_binary": str(docker)})
+    try:
+        with pytest.raises(RuntimeError, match="fleet login --import") as caught:
+            fleet.run_agents("do something", n=4, gpus=0)
+        assert "Not logged in" in str(caught.value)
+        assert fleet.scheduler._jobs == {}, "nothing may be submitted"
+    finally:
+        fleet.close()
+
+
+def test_command_only_runs_do_not_need_credentials(tmp_path, fake):
+    ship, make_docker = fake
+    docker = make_docker("""
+        [[ "$1 $2" == "image inspect" ]] && exit 0
+        [[ "$1" == "run" ]] && exit 1
+        exit 0
+    """)
+    from research_fleet import Fleet
+
+    fleet = Fleet(root=str(tmp_path / "state"), workspace=str(tmp_path),
+                  executor={"kind": "ship", "ship_binary": str(ship),
+                            "docker_binary": str(docker)})
+    try:
+        fleet.run_command(["true"], name="train", gpus=0)   # must not raise
+    finally:
+        fleet.close()
+
+
+def test_the_credential_check_happens_once_per_run(tmp_path, fake):
+    ship, make_docker = fake
+    docker = make_docker('[[ "$1 $2" == "image inspect" ]] && exit 0\nexit 0')
+    from research_fleet import Fleet
+
+    fleet = Fleet(root=str(tmp_path / "state"), workspace=str(tmp_path),
+                  executor={"kind": "ship", "ship_binary": str(ship),
+                            "docker_binary": str(docker)})
+    try:
+        fleet.run_agents("a", n=1, gpus=0)
+        assert fleet._checked_credentials
+        fleet.run_agents("b", n=1, gpus=0)      # no second probe
+    finally:
+        fleet.close()

@@ -83,25 +83,34 @@ ALIASES = {
     "default": "claude-opus-5",
 }
 
-# Relative token consumption by reasoning effort, normalised to `high` = 1.0.
-# Heuristic: used only to quote before a job runs, never to bill it.
+# Relative output volume by reasoning effort, normalised to `high` = 1.0. Effort mostly
+# changes how much the model thinks, so it scales output rather than input.
 EFFORT_MULTIPLIER = {
-    "low": 0.35,
-    "medium": 0.6,
+    "low": 0.4,
+    "medium": 0.7,
     "high": 1.0,
-    "xhigh": 1.6,
-    "max": 2.6,
+    "xhigh": 1.5,
+    "max": 2.2,
 }
 
-# How much a whole *process* costs relative to a single request. An agentic loop
-# re-reads its growing context every turn; a sweep point calls once.
-PROCESS_MULTIPLIER = {
-    "single_call": 1.0,
-    "workflow": 3.0,
-    "agent_short": 12.0,      # a handful of tool calls
-    "agent_standard": 40.0,   # typical code-and-iterate session
-    "agent_long": 120.0,      # overnight / long-horizon run
+# Token profiles per shape of work, as (fresh input, cached input, output).
+#
+# Calibrated against measured runs rather than derived from a single-call figure. Two
+# things the earlier multiplier-based estimate got badly wrong: output tokens are far
+# smaller than input (a long session still only writes a few thousand tokens), and most
+# input is cache reads at a tenth of the price. Together those made it overestimate by
+# more than an order of magnitude, which then caused legitimate jobs to be refused for
+# breaching a budget they would never have reached.
+PROCESS_PROFILES = {
+    "single_call":    (4_000, 0, 800),
+    "workflow":       (8_000, 20_000, 1_500),
+    "agent_short":    (10_000, 60_000, 2_000),
+    "agent_standard": (20_000, 150_000, 4_000),
+    "agent_long":     (60_000, 600_000, 15_000),
 }
+
+# Kept for callers that still pass it; the profiles above supersede it.
+PROCESS_MULTIPLIER = {name: 1.0 for name in PROCESS_PROFILES}
 
 
 class BudgetExceeded(Exception):
@@ -212,6 +221,7 @@ class Quote:
     est_input_tokens: int
     est_output_tokens: int
     est_cost_usd: float
+    source: str = "estimated"       # or "measured over N past job(s)"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -221,6 +231,7 @@ class Quote:
             "est_input_tokens": self.est_input_tokens,
             "est_output_tokens": self.est_output_tokens,
             "est_cost_usd": round(self.est_cost_usd, 4),
+            "source": self.source,
         }
 
 
@@ -229,28 +240,29 @@ def quote(
     *,
     effort: str = "high",
     process: str = "agent_standard",
-    base_input_tokens: int = 12_000,
-    base_output_tokens: int = 2_500,
-    cache_hit_rate: float = 0.8,
+    observed: dict[str, Any] | None = None,
 ) -> Quote:
     """Estimate the cost of a unit of work before committing to it.
 
-    `base_*` describe one representative request; `process` scales it to the
-    shape of work (single call vs long agent loop) and `effort` scales the
-    reasoning depth. `cache_hit_rate` matters a lot for agent loops, where the
-    conversation prefix is re-sent every turn at ~0.1x when cached.
+    `observed` is a summary of what work like this has actually cost, from the ledger.
+    When there is enough history it wins: measurement beats a profile. Without it, the
+    profile for `process` is scaled by `effort`.
     """
     mc = cost_for(model)
-    eff = EFFORT_MULTIPLIER.get(effort, 1.0)
-    proc = PROCESS_MULTIPLIER.get(process, 1.0)
 
-    total_in = int(base_input_tokens * proc)
-    total_out = int(base_output_tokens * proc * eff)
+    if observed and observed.get("samples", 0) >= 3:
+        return Quote(
+            mc.model, effort, process,
+            int(observed.get("input_tokens", 0)),
+            int(observed.get("output_tokens", 0)),
+            float(observed["cost_usd"]),
+            source=f"measured over {observed['samples']} past job(s)",
+        )
 
-    cached = int(total_in * max(0.0, min(1.0, cache_hit_rate)))
-    fresh = total_in - cached
-    est = mc.cost_usd(input_tokens=fresh, output_tokens=total_out, cache_read_tokens=cached)
-    return Quote(mc.model, effort, process, total_in, total_out, est)
+    fresh, cached, out = PROCESS_PROFILES.get(process, PROCESS_PROFILES["agent_standard"])
+    out = int(out * EFFORT_MULTIPLIER.get(effort, 1.0))
+    est = mc.cost_usd(input_tokens=fresh, output_tokens=out, cache_read_tokens=cached)
+    return Quote(mc.model, effort, process, fresh + cached, out, est, source="estimated")
 
 
 def cost_menu(

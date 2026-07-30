@@ -20,7 +20,7 @@ from rich.console import Console
 from rich.json import JSON
 from rich.table import Table
 
-from .budget import cost_menu, quote
+from .budget import cost_menu
 from .config import load_config
 from .fleet import Fleet
 from .ledger import Ledger
@@ -39,7 +39,38 @@ console = Console()
 
 
 def _fleet(config: Optional[str], **overrides) -> Fleet:
-    return Fleet(config, **{k: v for k, v in overrides.items() if v is not None})
+    """Build a Fleet, turning setup problems into advice rather than a traceback."""
+    from .executors import ShipUnavailable
+
+    try:
+        return Fleet(config, **{k: v for k, v in overrides.items() if v is not None})
+    except ShipUnavailable as exc:
+        console.print(f"[red]cannot start:[/red] {exc}")
+        raise typer.Exit(1) from None
+
+
+def _gpu_share(requested: Optional[float], agents: int, devices: int) -> tuple[float, str]:
+    """Choose how much GPU each agent reserves, and explain the choice.
+
+    A whole GPU each serialises everything on a single-GPU box, which is the opposite of
+    what `--agents 4` asks for. Sharing the device lets them run together and still see
+    it. An explicit value is always honoured, with a warning if it will serialise.
+    """
+    if requested is not None:
+        if requested > 0 and devices:
+            concurrent = max(1, int(devices / requested))
+            if concurrent < agents:
+                return requested, (
+                    f"[yellow]note: {requested} GPU(s) each on {devices} device(s) means "
+                    f"{concurrent} at a time, so the {agents} agents will queue. "
+                    f"Use --gpus {devices / agents:.2f} to run them together.[/yellow]"
+                )
+        return requested, ""
+
+    if devices == 0:
+        return 0.0, "no GPU on this host, so agents run without one"
+    share = min(1.0, devices / agents)
+    return share, f"{share:.2f} GPU each on {devices} device(s), all {agents} run together"
 
 
 def _overrides(workspace=None, image=None, executor=None, max_usd=None) -> dict:
@@ -50,6 +81,33 @@ def _overrides(workspace=None, image=None, executor=None, max_usd=None) -> dict:
     if max_usd is not None:
         out["budget"] = {"max_usd": max_usd}
     return out
+
+
+def _cancel_on_interrupt(fleet):
+    """Make Ctrl-C stop the run instead of leaving containers behind.
+
+    The default KeyboardInterrupt unwinds through wait(), and close() would then be
+    left to clean up while jobs are still going. Cancelling first is both faster and
+    honest about what happened.
+    """
+    import signal
+
+    state = {"cancelling": False}
+
+    def handler(signum, frame):
+        if state["cancelling"]:
+            console.print("\n[red]forcing exit[/red]")
+            raise SystemExit(130)
+        state["cancelling"] = True
+        console.print("\n[yellow]stopping the run, Ctrl-C again to force[/yellow]")
+        stopped = fleet.cancel("interrupted by operator")
+        console.print(f"[yellow]cancelled {stopped} job(s)[/yellow]")
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, handler)
+    except ValueError:      # not the main thread; leave the default behaviour
+        pass
 
 
 def _live_printer(verbose: bool):
@@ -84,7 +142,10 @@ def run(
     model: Optional[str] = typer.Option(None, "--model", "-m"),
     backend: Optional[str] = typer.Option(None, "--backend", help="claude-cli | codex-cli"),
     effort: Optional[str] = typer.Option(None, "--effort", help="low|medium|high|xhigh|max"),
-    gpus: float = typer.Option(1.0, "--gpus", help="GPUs per agent; <1 packs several per device."),
+    gpus: Optional[float] = typer.Option(
+        None, "--gpus",
+        help="GPUs per agent. Default: share the devices so every agent runs at once.",
+    ),
     workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
     image: Optional[str] = typer.Option(None, "--image"),
     timeout: int = typer.Option(3600, "--timeout", help="Per-agent wall clock, seconds."),
@@ -92,24 +153,34 @@ def run(
     executor: Optional[str] = typer.Option(None, "--executor", help="ship | slurm | ray | dry-run"),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
+    detach: bool = typer.Option(False, "--detach", "-d", help="Return immediately; run in the background."),
+    run_id: Optional[str] = typer.Option(None, "--run-id", hidden=True),
 ):
     """Launch one or more research agents on a task."""
+    if detach:
+        _detach_and_return(config)
+        return
+
     fleet = _fleet(
         config,
         **_overrides(workspace, image, executor, max_usd),
         on_event=_live_printer(verbose),
+        run_id=run_id,
     )
+    _cancel_on_interrupt(fleet)
     try:
-        est = quote(model or fleet.config.budget.default_model,
-                    effort=effort or fleet.config.budget.default_effort)
+        est = fleet.quote(model, effort=effort or fleet.config.budget.default_effort)
+        share, note = _gpu_share(gpus, agents, fleet.scheduler.slots.device_count)
         console.print(
             f"[bold]run {fleet.run_id}[/bold]  {agents} agent(s)  "
-            f"est. ${est.est_cost_usd * agents:.2f}  "
+            f"est. ${est.est_cost_usd * agents:.2f} ({est.source})  "
             f"budget ${fleet.config.budget.max_usd:.2f}"
         )
+        if note:
+            console.print(f"[dim]{note}[/dim]" if not note.startswith("[") else note)
         fleet.run_agents(
             task, n=agents, model=model, backend=backend, effort=effort,
-            gpus=gpus, timeout_s=timeout,
+            gpus=share, timeout_s=timeout,
         )
         report = fleet.wait()
         console.print()
@@ -137,6 +208,7 @@ def sweep(
         **_overrides(workspace, image, executor),
         on_event=_live_printer(verbose),
     )
+    _cancel_on_interrupt(fleet)
     try:
         parsed = parse_grid_args(grid)
         recs = fleet.run_sweep(command, parsed, gpus=gpus, timeout_s=timeout)
@@ -207,6 +279,7 @@ def workflow(
         **_overrides(workspace, None, executor, max_usd),
         on_event=_live_printer(verbose),
     )
+    _cancel_on_interrupt(fleet)
     try:
         console.print(f"[bold]run {fleet.run_id}[/bold]  workflow {wf.name}")
         report = fleet.run_workflow(wf)
@@ -310,6 +383,147 @@ def cost(
         )
     console.print(table)
     console.print(f"[dim]Run budget ceiling: ${cfg.budget.max_usd:.2f} / {cfg.budget.max_tokens:,} tokens[/dim]")
+
+
+def _detach_and_return(config: Optional[str]) -> None:
+    """Re-run this command in the background, logging to a file.
+
+    The scheduler has to stay alive to stream output and settle the budget, so detaching
+    means handing the work to a child in its own session rather than exiting early.
+    """
+    import os
+    import subprocess
+    import sys
+
+    from .spec import new_id
+
+    cfg = load_config(config)
+    run_id = new_id("run")
+    log_dir = cfg.root_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{run_id}.log"
+
+    argv = [a for a in sys.argv if a not in ("--detach", "-d")]
+    argv += ["--run-id", run_id]
+
+    with log_path.open("w", encoding="utf-8") as log:
+        subprocess.Popen(
+            argv, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True,        # survives this shell closing
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+    console.print(f"[bold]run {run_id}[/bold] started in the background")
+    console.print(f"  fleet watch {run_id}      follow it")
+    console.print(f"  fleet ls {run_id}         job states")
+    console.print(f"  fleet kill {run_id}       stop it")
+    console.print(f"[dim]  log: {log_path}[/dim]")
+
+
+@app.command()
+def watch(
+    run_id: str = typer.Argument(..., help="Run to follow."),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+):
+    """Follow a detached run's output."""
+    cfg = load_config(config)
+    log_path = cfg.root_path / "logs" / f"{run_id}.log"
+    if not log_path.exists():
+        console.print(f"[red]no log for {run_id}[/red] at {log_path}")
+        raise typer.Exit(1)
+    import subprocess
+
+    try:
+        subprocess.run(["tail", "-n", "+1", "-f", str(log_path)], check=False)
+    except KeyboardInterrupt:
+        pass
+
+
+@app.command()
+def login(
+    import_host: bool = typer.Option(
+        False, "--import",
+        help="Copy the credentials already on this host instead of signing in.",
+    ),
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+):
+    """Give this project's agents credentials, by delegating to research-ship.
+
+    Credentials belong to the environment, not the scheduler, so this is a thin wrapper
+    over `ship login`. It runs against the project the fleet is configured for, which is
+    what makes it easy to get wrong by hand.
+    """
+    import os
+    import subprocess
+
+    cfg = load_config(config, workspace=workspace)
+    project = str(Path(cfg.executor.project_dir or cfg.workspace).expanduser().resolve())
+    argv = [cfg.executor.ship_binary, "login"] + (["--import"] if import_host else [])
+    console.print(f"[dim]project: {project}[/dim]")
+    done = subprocess.run(argv, env={**os.environ, "SHIP_PROJECT_DIR": project})
+    raise typer.Exit(done.returncode)
+
+
+@app.command()
+def kill(
+    run_id: Optional[str] = typer.Argument(None, help="Which run. Default: every active run."),
+    root: Optional[str] = typer.Option(None, "--root", help="State directory the run used."),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+):
+    """Stop a run's containers and cluster jobs, from any shell.
+
+    Works across processes: containers carry a `fleet.run` label and Slurm jobs are
+    named after the job id, so this does not need the scheduler that started them.
+    """
+    import shutil
+    import subprocess
+
+    cfg = load_config(config, root=root)
+    ledger = Ledger(cfg.root_path)
+    try:
+        # Runs are grouped per state directory, so name it. Killing nothing usually
+        # means the run lives under a different root.
+        console.print(f"[dim]state: {cfg.root_path}[/dim]")
+        targets = [run_id] if run_id else ledger.active_runs()
+        if not targets:
+            console.print("No active runs here.")
+            return
+
+        for target in targets:
+            containers = subprocess.run(
+                ["docker", "ps", "-q", "-f", f"label=fleet.run={target}"],
+                capture_output=True, text=True, check=False,
+            ).stdout.split()
+            if containers:
+                subprocess.run(["docker", "stop", "-t", "10", *containers],
+                               capture_output=True, text=True, check=False)
+
+            # Slurm jobs are not containers. `scancel` exits 0 even when the name
+            # matches nothing, so this is reported as signalled rather than confirmed.
+            unfinished = [
+                j["job_id"] for j in ledger.jobs(target)
+                if j["state"] not in {"succeeded", "failed", "cancelled", "denied"}
+            ]
+            signalled = 0
+            if shutil.which("scancel") and unfinished:
+                for job_id in unfinished:
+                    subprocess.run(["scancel", "--name", f"fleet-{job_id}"],
+                                   capture_output=True, text=True, check=False)
+                signalled = len(unfinished)
+
+            marked = ledger.mark_cancelled(target, "killed by operator")
+            parts = [f"{len(containers)} container(s) stopped"]
+            if signalled:
+                parts.append(f"{signalled} slurm name(s) signalled")
+            parts.append(f"{len(marked)} job(s) marked cancelled")
+            console.print(f"[yellow]{target}[/yellow]: " + ", ".join(parts))
+            if not containers and marked:
+                console.print(
+                    "[dim]  nothing was running; those jobs were stale entries whose "
+                    "scheduler had already gone[/dim]"
+                )
+    finally:
+        ledger.close()
 
 
 @app.command()

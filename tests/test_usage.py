@@ -403,3 +403,94 @@ def test_token_counts_are_not_mistaken_for_secrets(tmp_path):
     assert payload["usage"]["total_tokens"] == 1300
     assert payload["auth_token"] == "[REDACTED]"
     ledger.close()
+
+
+# --------------------------------------------------- estimates from history
+
+
+def test_observed_cost_needs_data_before_it_says_anything(tmp_path):
+    ledger = Ledger(tmp_path)
+    assert ledger.observed_cost("claude-opus-5") == {"samples": 0}
+    ledger.close()
+
+
+def test_observed_cost_summarises_past_jobs(tmp_path):
+    ledger = Ledger(tmp_path)
+    for cost in [0.10, 0.20, 0.30, 0.40]:
+        spec = _spec(name="a", kind=JobKind.AGENT, command=[],
+                     agent={"task": "t", "backend": "claude-cli"})
+        ledger.upsert_job(spec, "succeeded", _result(spec, cost=cost, model="claude-opus-5"))
+
+    seen = ledger.observed_cost("claude-opus-5")
+    assert seen["samples"] == 4
+    # p75 is conservative without inheriting the tail of one runaway job.
+    assert seen["cost_usd"] == pytest.approx(0.40)
+    assert seen["median_cost_usd"] == pytest.approx(0.30)
+    ledger.close()
+
+
+def test_observed_cost_ignores_other_models_and_failures(tmp_path):
+    ledger = Ledger(tmp_path)
+    a = _spec(name="a", kind=JobKind.AGENT, command=[], agent={"task": "t"})
+    ledger.upsert_job(a, "succeeded", _result(a, cost=1.0, model="claude-opus-5"))
+    b = _spec(name="b", kind=JobKind.AGENT, command=[], agent={"task": "t"})
+    ledger.upsert_job(b, "succeeded", _result(b, cost=9.0, model="claude-haiku-4-5"))
+    c = _spec(name="c", kind=JobKind.AGENT, command=[], agent={"task": "t"})
+    ledger.upsert_job(c, "failed", _result(c, cost=9.0, model="claude-opus-5"))
+
+    assert ledger.observed_cost("claude-opus-5")["samples"] == 1
+    ledger.close()
+
+
+def test_a_quote_prefers_measurement_once_there_is_enough_of_it():
+    from research_fleet.budget import quote
+
+    guessed = quote("claude-opus-5", process="agent_standard")
+    assert guessed.source == "estimated"
+
+    measured = quote("claude-opus-5", process="agent_standard",
+                     observed={"samples": 5, "cost_usd": 0.11,
+                               "input_tokens": 30_000, "output_tokens": 900})
+    assert measured.est_cost_usd == pytest.approx(0.11)
+    assert "measured over 5" in measured.source
+
+
+def test_a_quote_ignores_a_handful_of_samples():
+    """Two data points are not a distribution; keep the profile until there are more."""
+    from research_fleet.budget import quote
+
+    q = quote("claude-opus-5", observed={"samples": 2, "cost_usd": 0.01})
+    assert q.source == "estimated"
+    assert q.est_cost_usd > 0.01
+
+
+def test_the_calibrated_profiles_match_what_agents_actually_cost():
+    """Measured agent jobs came in at $0.02 to $0.30. An estimate an order of magnitude
+    above that refuses work which would never have breached the budget."""
+    from research_fleet.budget import quote
+
+    standard = quote("claude-opus-5", process="agent_standard").est_cost_usd
+    assert 0.05 < standard < 0.60, f"opus agent_standard estimated at ${standard:.2f}"
+
+    assert quote("claude-haiku-4-5").est_cost_usd < quote("claude-sonnet-5").est_cost_usd
+    assert quote("claude-sonnet-5").est_cost_usd < quote("claude-opus-5").est_cost_usd
+    assert quote("claude-opus-5", process="agent_short").est_cost_usd < standard
+    assert quote("claude-opus-5", process="agent_long").est_cost_usd > standard
+    assert quote("claude-opus-5", effort="low").est_cost_usd < \
+        quote("claude-opus-5", effort="max").est_cost_usd
+
+
+def test_fleet_quotes_from_its_own_history(tmp_path):
+    fleet = _fleet(tmp_path)
+    try:
+        for cost in [0.05, 0.06, 0.07, 0.08]:
+            spec = _spec(name="past", kind=JobKind.AGENT, command=[],
+                         agent={"task": "t", "backend": "claude-cli"})
+            fleet.ledger.upsert_job(
+                spec, "succeeded", _result(spec, cost=cost, model="claude-opus-5"))
+
+        q = fleet.quote("claude-opus-5")
+        assert "measured" in q.source
+        assert q.est_cost_usd == pytest.approx(0.08)
+    finally:
+        fleet.close()

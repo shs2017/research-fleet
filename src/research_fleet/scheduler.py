@@ -271,10 +271,14 @@ class Scheduler:
         process = spec.labels.get("process") or (
             "agent_long" if spec.timeout_s > 4 * 3600 else "agent_standard"
         )
+        model = spec.agent.model or self.config.budget.default_model
         return quote(
-            spec.agent.model or self.config.budget.default_model,
+            model,
             effort=spec.labels.get("effort", self.config.budget.default_effort),
             process=process,
+            # History beats the profile: reserving a wildly high figure refuses jobs
+            # that would never have cost that much.
+            observed=self.ledger.observed_cost(model),
         )
 
     def _wait_for_deps(self, rec: JobRecord) -> bool:
@@ -329,6 +333,16 @@ class Scheduler:
             result.usage = rec.usage.to_dict()
             result.output = rec.output or "\n".join(rec.tail)
             result.agent_seconds = rec.agent_seconds
+
+            # A cancelled job's container exits non-zero because we stopped it. Reporting
+            # that as a failure would hide the fact that the operator asked for it.
+            if rec.state is JobState.CANCELLED:
+                result.state = JobState.CANCELLED
+                result.error = rec.result.error if rec.result else "cancelled"
+                rec.result = result
+                self._settle_budget(rec)
+                return result
+
             rec.result = result
             self._settle_budget(rec)
             self._set_state(rec, result.state, {"result": result.model_dump(mode="json")})
@@ -694,13 +708,21 @@ class Scheduler:
         )
         return results
 
-    def cancel_all(self, reason: str = "operator cancelled") -> None:
+    def cancel_all(self, reason: str = "operator cancelled") -> int:
+        """Stop every job that has not finished. Returns how many were stopped."""
         self._stop.set()
         with self._lock:
-            active = [r for r in self._jobs.values() if r.state in {JobState.RUNNING, JobState.QUEUED}]
+            active = [r for r in self._jobs.values() if not r.state.terminal]
         for rec in active:
             self.executor.cancel(rec.spec.id)
+            rec.result = rec.result or JobResult(
+                job_id=rec.spec.id, state=JobState.CANCELLED, error=reason
+            )
             self._set_state(rec, JobState.CANCELLED, {"reason": reason})
+        self.ledger.append(
+            "run.cancelled", {"reason": reason, "jobs": len(active)}, run_id=self.run_id
+        )
+        return len(active)
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -721,7 +743,13 @@ class Scheduler:
         }
 
     def close(self) -> None:
+        """Stop everything, promptly.
+
+        Containers are stopped before the pool is drained. The other order looks
+        tidier but makes Ctrl-C hang: the pool waits for jobs that are still running,
+        and nothing has told them to stop yet.
+        """
         self._stop.set()
-        self._pool.shutdown(wait=True, cancel_futures=True)
         self.executor.close()
+        self._pool.shutdown(wait=True, cancel_futures=True)
         shutil.rmtree(self._spool_root, ignore_errors=True)

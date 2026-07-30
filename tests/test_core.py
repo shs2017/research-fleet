@@ -498,3 +498,56 @@ def test_policy_gate_can_be_disabled_by_emptying_require_approval_for():
     p = Policy(require_approval_for=[])
     p.network.mode = "unrestricted"
     assert p.check(JobSpec(name="c", command=["true"])).verdict == "allow"
+
+
+# ------------------------------------------------- concurrent ledger writers
+
+
+def test_two_processes_can_append_without_breaking_the_chain(tmp_path):
+    """`fleet kill` writes to the same ledger as the running scheduler.
+
+    Each process caches the chain head, so without locking they both claimed the same
+    sequence number and one of them crashed on a UNIQUE constraint.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(f"""
+        from research_fleet import Ledger
+        led = Ledger({str(tmp_path)!r})
+        for i in range(40):
+            led.append("tick", {{"i": i}}, run_id="r")
+        led.close()
+    """)
+    procs = [
+        subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True)
+        for _ in range(3)
+    ]
+    for proc in procs:
+        _, err = proc.communicate(timeout=120)
+        assert proc.returncode == 0, err
+
+    ledger = Ledger(tmp_path)
+    ok, msg = ledger.verify()
+    assert ok, f"the chain must survive concurrent writers: {msg}"
+    assert "120 events" in msg, msg
+    ledger.close()
+
+
+def test_a_writer_adopts_a_head_written_by_someone_else(tmp_path):
+    first = Ledger(tmp_path)
+    first.append("a", {})
+
+    second = Ledger(tmp_path)
+    second.append("b", {})
+
+    # `first` still believes it holds the head; its next append must notice and follow.
+    first.append("c", {})
+
+    ok, msg = first.verify()
+    assert ok, msg
+    assert [e.type for e in first.events(limit=10)] == ["a", "b", "c"]
+    first.close()
+    second.close()

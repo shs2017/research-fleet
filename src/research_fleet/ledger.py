@@ -19,6 +19,7 @@ not just stdout.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -161,6 +162,7 @@ class Ledger:
         self._db.commit()
 
         self._seq, self._head = self._recover_head()
+        self._size = self.jsonl_path.stat().st_size if self.jsonl_path.exists() else 0
         self._specs: dict[str, dict] = {}      # scratch for reindex()
 
     # ---------------------------------------------------------------- writing
@@ -190,20 +192,34 @@ class Ledger:
     ) -> Event:
         payload = self._redactor.scrub(payload or {})
         with self._lock:
-            seq = self._seq + 1
-            ts = time.time()
-            h = Event.compute_hash(seq, ts, type_, run_id, job_id, payload, self._head)
-            ev = Event(seq, ts, type_, run_id, job_id, payload, self._head, h)
-
             with self.jsonl_path.open("a", encoding="utf-8") as fh:
-                fh.write(ev.to_json() + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
+                # A hash chain has one head, so appending has to be exclusive across
+                # processes as well as threads. `fleet kill` writes to the same ledger
+                # as the running scheduler, and without this they both believed they
+                # held the head and collided on `seq`.
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    if os.fstat(fh.fileno()).st_size != self._size:
+                        # Someone else appended since we last did; adopt their head.
+                        self._seq, self._head = self._recover_head()
+
+                    seq = self._seq + 1
+                    ts = time.time()
+                    h = Event.compute_hash(seq, ts, type_, run_id, job_id, payload, self._head)
+                    ev = Event(seq, ts, type_, run_id, job_id, payload, self._head, h)
+
+                    fh.write(ev.to_json() + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                    self._size = os.fstat(fh.fileno()).st_size
+                finally:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
             self._db.execute(
-                "INSERT INTO events(seq, ts, run_id, job_id, type, payload, hash, prev_hash)"
+                "INSERT OR REPLACE INTO events"
+                "(seq, ts, run_id, job_id, type, payload, hash, prev_hash)"
                 " VALUES (?,?,?,?,?,?,?,?)",
-                (seq, ts, run_id, job_id, type_, _canonical(payload), h, self._head),
+                (seq, ts, run_id, job_id, type_, _canonical(payload), h, ev.prev_hash),
             )
             self._db.commit()
 
@@ -350,6 +366,77 @@ class Ledger:
              "succeeded": r[4] or 0, "failed": r[5] or 0}
             for r in rows
         ]
+
+    def observed_cost(self, model: str | None = None, kind: str = "agent") -> dict[str, Any]:
+        """What work like this has actually cost, for estimating the next one.
+
+        Returns the 75th percentile rather than the mean: a little conservative, so a
+        reservation has headroom, without inheriting the tail of one runaway job.
+        """
+        clauses = ["kind = ?", "cost_usd > 0", "state = 'succeeded'"]
+        args: list[Any] = [kind]
+        if model:
+            clauses.append("model = ?")
+            args.append(model)
+        rows = self._db.execute(
+            f"SELECT cost_usd, input_tokens + cache_read_tokens, output_tokens"
+            f" FROM usage WHERE {' AND '.join(clauses)} ORDER BY cost_usd",
+            args,
+        ).fetchall()
+        if not rows:
+            return {"samples": 0}
+
+        def percentile(values, fraction):
+            index = min(len(values) - 1, int(len(values) * fraction))
+            return values[index]
+
+        costs = [r[0] for r in rows]
+        return {
+            "samples": len(rows),
+            "cost_usd": percentile(costs, 0.75),
+            "median_cost_usd": percentile(costs, 0.5),
+            "input_tokens": percentile(sorted(r[1] for r in rows), 0.5),
+            "output_tokens": percentile(sorted(r[2] for r in rows), 0.5),
+        }
+
+    def mark_cancelled(self, run_id: str, reason: str) -> list[str]:
+        """Record that a run was killed from outside the process that started it.
+
+        The scheduler that owned those jobs is gone, so nothing else will ever write
+        their terminal state. Without this they sit in the index as `running` forever.
+        """
+        rows = self._db.execute(
+            "SELECT job_id, name FROM jobs WHERE run_id = ? AND state NOT IN"
+            " ('succeeded','failed','cancelled','denied')",
+            (run_id,),
+        ).fetchall()
+        killed = []
+        for job_id, name in rows:
+            self.append(
+                "job.cancelled", {"name": name, "reason": reason},
+                run_id=run_id, job_id=job_id,
+            )
+            with self._lock:
+                self._db.execute(
+                    "UPDATE jobs SET state = 'cancelled', updated_at = ? WHERE job_id = ?",
+                    (time.time(), job_id),
+                )
+                self._db.execute(
+                    "UPDATE usage SET state = 'cancelled' WHERE job_id = ?", (job_id,)
+                )
+                self._db.commit()
+            killed.append(job_id)
+        if killed:
+            self.append("run.cancelled", {"reason": reason, "jobs": len(killed)}, run_id=run_id)
+        return killed
+
+    def active_runs(self) -> list[str]:
+        """Runs with at least one job that never reached a terminal state."""
+        rows = self._db.execute(
+            "SELECT DISTINCT run_id FROM jobs WHERE state NOT IN"
+            " ('succeeded','failed','cancelled','denied') ORDER BY updated_at DESC"
+        ).fetchall()
+        return [r[0] for r in rows if r[0]]
 
     # ------------------------------------------------------------------ usage
 

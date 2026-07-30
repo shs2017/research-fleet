@@ -69,10 +69,28 @@ ship uninstall
 Uninstalling keeps your ledgers, results, Docker images and volumes, so removing and
 reinstalling costs nothing.
 
-Then set up the project you want to research in:
+Then set up **the project you want to research in**, which is not the fleet checkout:
 
 ```bash
 cd ~/my-project && ship init && ship build
+fleet login --import          # give its agents the credentials you already have
+```
+
+`fleet login --import` copies the agent config from your host into that project's
+volume, which is the same thing `ship login --import` does. Use plain `fleet login` to
+sign in interactively for a project-scoped token instead. If you skip this, `fleet` says
+so before submitting rather than letting every agent fail with "Not logged in".
+
+research-ship derives the image name from that directory, so every project you point the
+fleet at needs its own `ship build` once. If you forget, `fleet` says so before
+submitting anything rather than letting each job fail on the Docker daemon:
+
+```console
+$ fleet run "..." --agents 2
+cannot start: the image 'ship-my-project:latest' does not exist, so no job could run.
+research-ship derives it from the project at /home/you/my-project.
+Build it with:  cd /home/you/my-project && ship init && ship build
+Or point `image:` in fleet.yaml at an image you already have.
 ```
 
 Requires Docker with the NVIDIA container runtime, and `uv`:
@@ -92,7 +110,8 @@ fleet cost                       # what does this cost, before I run it?
 # four agents attack the same question independently, capped at $20 for the lot
 fleet run "Does RMSNorm beat LayerNorm at 20M params? Run the ablation." --agents 4 --max-usd 20
 
-fleet run "..." --agents 4 --gpus 0.25          # pack four agents onto one card
+fleet run "..." --agents 4 -d                   # detached: returns straight away
+fleet run "..." --agents 4 --gpus 1             # a whole GPU each, so they queue
 fleet run "..." --agents 16 --executor slurm    # submit to a Slurm cluster
 fleet run "..." --agents 16 --executor ray      # or a Ray cluster
 
@@ -102,6 +121,40 @@ fleet sweep python train.py --lr {lr} --depth {depth} -g lr=1e-3,3e-4 -g depth=6
 # a multi-step pipeline, for example a coder and reviewer loop
 fleet workflow examples/code-review-loop.yaml
 ```
+
+**Agents share the GPUs by default** so that `--agents 4` actually runs four at once.
+On a single-GPU host each gets 0.25 of the device and still sees it; `fleet` prints the
+share it chose. Pass `--gpus` to override, and it warns if your value will serialise
+them:
+
+```console
+$ fleet run "..." --agents 4
+run run_5f160facd590  4 agent(s)  est. $0.31 (estimated)  budget $8.00
+0.25 GPU each on 1 device(s), all 4 run together
+```
+
+`-d` / `--detach` hands the run to a background process and returns immediately:
+
+```console
+$ fleet run "..." --agents 4 -d
+run run_5f160facd590 started in the background
+  fleet watch run_5f160facd590      follow it
+  fleet ls run_5f160facd590         job states
+  fleet kill run_5f160facd590       stop it
+```
+
+Stop a run:
+
+```bash
+Ctrl-C                    # if it is attached: cancels, then exits
+fleet kill                # from any other shell: every active run
+fleet kill <run_id>       # or just one
+```
+
+`fleet kill` does not need the process that started the run. Containers carry a
+`fleet.run` label and Slurm jobs are named after the job id, so it can stop them from
+anywhere, and it marks the jobs cancelled in the ledger so `fleet ls` tells the truth
+afterwards. Pass `--root` if the run used a state directory other than your default.
 
 Then inspect what happened:
 
@@ -401,6 +454,12 @@ $ fleet usage --by run,stage
 └──────────────────┴───────────┴──────┴─────────┴─────────┴─────────┴───────┴───────┘
 6 job(s)  $0.5916  1,112,435 tokens  89s agent / 111s wall  111 GPU-seconds  14 request(s)
 ```
+
+**Estimates learn from this.** Before a run, `fleet` quotes what the work should cost.
+With fewer than three comparable jobs on record it uses a token profile for the shape of
+work; after that it uses the 75th percentile of what those jobs actually cost, so the
+figure converges on your workload rather than a guess. `fleet cost` and the pre-run line
+both say which they used.
 
 Group by `run`, `model`, `stage`, `attempt`, `workflow`, `name`, `kind`, `backend`,
 `state`, `day` or `job`, and combine them with commas. `--jobs` lists every job instead

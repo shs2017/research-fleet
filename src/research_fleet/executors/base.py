@@ -54,5 +54,9 @@ class Executor(Protocol):
     def available_gpus(self) -> list[str]:
         ...
 
+    def preflight(self, policy: Policy) -> None:
+        """Optional. Raise if nothing could possibly run, before anything is submitted."""
+        ...
+
     def close(self) -> None:
         ...

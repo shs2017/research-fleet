@@ -287,3 +287,150 @@ def test_agent_config_defaults_are_conservative():
     cfg = AgentConfig(task="t")
     assert cfg.backend == "claude-cli"
     assert cfg.allowed_tools is None and cfg.disallowed_tools == []
+
+
+# ---------------------------------------------------------------- killing a run
+
+
+def test_cancel_reports_how_many_it_stopped(tmp_path):
+    fleet = _fleet(tmp_path)
+    try:
+        fleet.submit(JobSpec(name="stuck", command=["true"], resources=Resources(gpus=0),
+                             depends_on=["job_never_arrives"]))
+        assert fleet.cancel("operator stopped it") == 1
+        assert "run.cancelled" in {e.type for e in fleet.ledger.events(limit=200)}
+    finally:
+        fleet.close()
+
+
+def test_cancelling_twice_is_harmless(tmp_path):
+    fleet = _fleet(tmp_path)
+    try:
+        fleet.submit(JobSpec(name="stuck", command=["true"], resources=Resources(gpus=0),
+                             depends_on=["nope"]))
+        assert fleet.cancel() == 1
+        assert fleet.cancel() == 0, "nothing left to stop"
+    finally:
+        fleet.close()
+
+
+def test_a_cancelled_job_is_not_relabelled_as_failed(tmp_path):
+    """Stopping a container makes it exit non-zero; that must not read as a failure."""
+    import threading, time as _t
+    from research_fleet.spec import JobResult, JobState as JS
+
+    started = threading.Event()
+
+    class Slow:
+        kind = "slow"
+        def available_gpus(self): return ["g0"]
+        def run(self, spec, *, argv, env, placement, policy, on_line):
+            started.set()
+            _t.sleep(1.0)
+            # Reports failure, as a stopped container would.
+            return JobResult(job_id=spec.id, state=JS.FAILED, exit_code=137,
+                             error="exit code 137")
+        def cancel(self, job_id): return True
+        def close(self): return None
+
+    fleet = _fleet(tmp_path)
+    fleet.executor = fleet.scheduler.executor = Slow()
+    try:
+        rec = fleet.run_command(["true"], name="victim", gpus=0)
+        assert started.wait(timeout=10)
+        fleet.cancel("operator stopped it")
+        fleet.wait(timeout=30)
+        assert rec.state is JobState.CANCELLED
+        assert rec.result.state is JobState.CANCELLED
+    finally:
+        fleet.close()
+
+
+def test_the_ledger_can_mark_a_run_cancelled_from_outside(tmp_path):
+    """`fleet kill` runs in a different process, so nothing else will ever write the
+    terminal state of those jobs."""
+    fleet = _fleet(tmp_path)
+    try:
+        fleet.submit(JobSpec(name="orphan", command=["true"], resources=Resources(gpus=0),
+                             depends_on=["never"]))
+        run_id = fleet.run_id
+    finally:
+        # close() stops the threads without writing terminal states, which is exactly
+        # the situation `fleet kill` has to clean up after.
+        fleet.close()
+
+    ledger = Ledger(tmp_path / "state")
+    try:
+        assert run_id in ledger.active_runs()
+        killed = ledger.mark_cancelled(run_id, "killed by operator")
+        assert len(killed) == 1
+        assert ledger.active_runs() == []
+        states = {j["state"] for j in ledger.jobs(run_id)}
+        assert states == {"cancelled"}
+        ok, msg = ledger.verify()
+        assert ok, msg
+    finally:
+        ledger.close()
+
+
+# ------------------------------------------------------------ gpu sharing
+
+
+def test_agents_share_the_devices_so_they_run_together():
+    """A whole GPU each serialises everything on a one-GPU box, which is the opposite
+    of what --agents asks for."""
+    from research_fleet.cli import _gpu_share
+
+    share, note = _gpu_share(None, agents=4, devices=1)
+    assert share == pytest.approx(0.25)
+    assert "all 4 run together" in note
+
+
+def test_the_share_never_exceeds_a_whole_device():
+    from research_fleet.cli import _gpu_share
+
+    share, _ = _gpu_share(None, agents=2, devices=8)
+    assert share == 1.0
+
+
+def test_more_devices_mean_a_bigger_share_each():
+    from research_fleet.cli import _gpu_share
+
+    assert _gpu_share(None, agents=4, devices=2)[0] == pytest.approx(0.5)
+
+
+def test_a_host_with_no_gpu_reserves_none():
+    from research_fleet.cli import _gpu_share
+
+    share, note = _gpu_share(None, agents=4, devices=0)
+    assert share == 0.0 and "no GPU" in note
+
+
+def test_an_explicit_request_is_honoured_but_warned_about():
+    from research_fleet.cli import _gpu_share
+
+    share, note = _gpu_share(1.0, agents=4, devices=1)
+    assert share == 1.0, "the operator's choice wins"
+    assert "will queue" in note and "--gpus 0.25" in note
+
+
+def test_an_explicit_request_that_fits_says_nothing():
+    from research_fleet.cli import _gpu_share
+
+    assert _gpu_share(0.25, agents=4, devices=1) == (0.25, "")
+
+
+def test_four_fractional_jobs_fit_on_one_device():
+    from research_fleet.scheduler import SlotPool
+
+    pool = SlotPool(["GPU-a"])
+    assert all(pool.acquire(0.25, timeout=0.5) for _ in range(4))
+    assert pool.acquire(0.25, timeout=0.2) is None, "the fifth must wait"
+
+
+def test_whole_gpu_jobs_serialise_on_one_device():
+    from research_fleet.scheduler import SlotPool
+
+    pool = SlotPool(["GPU-a"])
+    assert pool.acquire(1.0, timeout=0.5) is not None
+    assert pool.acquire(1.0, timeout=0.2) is None

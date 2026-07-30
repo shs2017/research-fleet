@@ -16,6 +16,7 @@ Requires `ship` on PATH: see https://github.com/<you>/research-ship.
 
 from __future__ import annotations
 
+import collections
 import os
 import shutil
 import signal
@@ -31,6 +32,22 @@ from .base import LineHandler, Placement
 
 class ShipUnavailable(RuntimeError):
     pass
+
+
+def _explain(code: int | None, stderr_tail) -> str:
+    """Turn an exit code into something a person can act on."""
+    detail = next(
+        (line for line in reversed(stderr_tail) if "Error" in line or "error" in line),
+        stderr_tail[-1] if stderr_tail else "",
+    )
+    hint = ""
+    if code == 125:
+        # The daemon refused to start the container at all, which is nearly always a
+        # missing image.
+        hint = " (docker could not start the container; is the image built? `ship build`)"
+    elif code == 127:
+        hint = " (command not found inside the container)"
+    return f"exit code {code}{hint}" + (f": {detail}" if detail else "")
 
 
 class ShipExecutor:
@@ -67,6 +84,82 @@ class ShipExecutor:
         except (FileNotFoundError, subprocess.SubprocessError):
             return []
         return [line.strip() for line in out.splitlines() if line.strip()]
+
+    def preflight(self, policy: Policy, image: str = "") -> None:
+        """Fail before submitting anything if the project's image is missing.
+
+        Without this, every job dies with a bare `exit code 125` from the Docker daemon
+        and the operator has to go digging for the reason.
+        """
+        # Honour a configured image override, or ship's default for the project.
+        spec = JobSpec(name="preflight", command=["true"], image=image)
+        try:
+            argv = self.build_argv(
+                spec, argv=["true"], env={}, placement=Placement(gpu_ids=()),
+                policy=policy, name="fleet-preflight",
+            )
+        except ShipUnavailable:
+            raise
+        image = self._image_from(argv)
+        if image is None:
+            return
+        found = subprocess.run(
+            [self.docker, "image", "inspect", image],
+            capture_output=True, text=True, check=False,
+        )
+        if found.returncode != 0:
+            where = self.project_dir or os.getcwd()
+            raise ShipUnavailable(
+                f"the image {image!r} does not exist, so no job could run.\n"
+                f"research-ship derives it from the project at {where}.\n"
+                f"Build it with:  cd {where} && ship init && ship build\n"
+                f"Or point `image:` in fleet.yaml at an image you already have."
+            )
+
+    def credential_volume(self, policy: Policy, image: str = "") -> str | None:
+        """The Docker volume research-ship mounts for agent credentials, if any."""
+        spec = JobSpec(kind=JobKind.AGENT, name="probe", image=image,
+                       agent={"task": "probe", "backend": "claude-cli"})
+        argv = self.build_argv(
+            spec, argv=["true"], env={}, placement=Placement(gpu_ids=()),
+            policy=policy, name="fleet-probe",
+        )
+        for token in argv:
+            if token.endswith(":/home/dev/.claude"):
+                return token.split(":", 1)[0]
+        return None
+
+    def credentials_present(self, policy: Policy, image: str = "") -> bool | None:
+        """True, False, or None when it cannot be determined.
+
+        Agent jobs fail one by one with "Not logged in" otherwise, which costs a run and
+        tells the operator nothing about how to fix it.
+        """
+        volume = self.credential_volume(policy, image)
+        if volume is None:
+            return None
+        argv = self.build_argv(
+            JobSpec(name="probe", command=["true"], image=image), argv=["true"], env={},
+            placement=Placement(gpu_ids=()), policy=policy, name="fleet-probe",
+        )
+        resolved = self._image_from(argv)
+        if resolved is None:
+            return None
+        image = resolved
+        done = subprocess.run(
+            [self.docker, "run", "--rm", "-v", f"{volume}:/probe", image,
+             "bash", "-lc", "test -s /probe/.credentials.json || test -s /probe/.claude.json"],
+            capture_output=True, text=True, check=False,
+        )
+        return done.returncode == 0
+
+    @staticmethod
+    def _image_from(argv: list[str]) -> str | None:
+        """The image is the token just before `bash -lc` in what ship emits."""
+        for i, token in enumerate(argv):
+            if token == "bash" and i + 1 < len(argv) and argv[i + 1] == "-lc":
+                return argv[i - 1] if i else None
+        return None
 
     # -------------------------------------------------------------- argv build
 
@@ -204,10 +297,16 @@ class ShipExecutor:
         with self._lock:
             self._procs[spec.id] = proc
 
+        # Kept so a failure can say why, instead of only reporting an exit code.
+        stderr_tail: collections.deque[str] = collections.deque(maxlen=12)
+
         def pump(stream, label: str) -> None:
             try:
                 for line in iter(stream.readline, ""):
-                    on_line(label, line.rstrip("\n"))
+                    text = line.rstrip("\n")
+                    if label == "stderr" and text.strip():
+                        stderr_tail.append(text.strip())
+                    on_line(label, text)
             finally:
                 stream.close()
 
@@ -243,10 +342,14 @@ class ShipExecutor:
             result.state = JobState.SUCCEEDED
         else:
             result.state = JobState.FAILED
-            result.error = f"exit code {proc.returncode}"
+            result.error = _explain(proc.returncode, stderr_tail)
         return result
 
     # ------------------------------------------------------------- lifecycle
+
+    # A cancelled job does not need a long grace period; the operator asked for it to
+    # stop now. A timeout is different: there the container may be mid-write.
+    CANCEL_GRACE_S = 5
 
     def _stop_container(self, name: str, timeout: int = 20) -> None:
         subprocess.run(
@@ -257,7 +360,7 @@ class ShipExecutor:
     def cancel(self, job_id: str) -> bool:
         with self._lock:
             proc = self._procs.get(job_id)
-        self._stop_container(f"fleet-{job_id}")
+        self._stop_container(f"fleet-{job_id}", timeout=self.CANCEL_GRACE_S)
         if proc is not None:
             try:
                 proc.send_signal(signal.SIGTERM)

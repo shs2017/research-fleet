@@ -122,9 +122,14 @@ class Fleet:
             redactor=Redactor() if self.config.policy.redact_secrets else None,
         )
         self.executor = build_executor(self.config)
+        # Fail now, with a reason, rather than letting every job die on the daemon.
+        preflight = getattr(self.executor, "preflight", None)
+        if callable(preflight):
+            preflight(self.config.policy, self.config.image)
         self.scheduler = Scheduler(
             self.config, self.executor, self.ledger, run_id=run_id, on_event=on_event
         )
+        self._checked_credentials = False
 
     # ------------------------------------------------------------------ props
 
@@ -162,6 +167,7 @@ class Fleet:
         Running several on one task is the point: they explore different
         approaches, and you compare their results and their traces afterwards.
         """
+        self._require_credentials()
         specs = []
         for i in range(n):
             specs.append(
@@ -272,6 +278,26 @@ class Fleet:
             run=self.wait(),
         )
 
+    def _require_credentials(self) -> None:
+        """Refuse to launch agents with no credentials, once per run.
+
+        Without this every agent burns a container and reports "Not logged in", which
+        looks like a model failure rather than a setup step.
+        """
+        if self._checked_credentials:
+            return
+        self._checked_credentials = True
+        check = getattr(self.executor, "credentials_present", None)
+        if not callable(check):
+            return
+        if check(self.config.policy, self.config.image) is False:
+            raise RuntimeError(
+                "no agent credentials for this project, so every agent would fail with "
+                "\"Not logged in\".\n"
+                "  fleet login --import    copy the credentials you already have on this host\n"
+                "  fleet login             sign in interactively instead"
+            )
+
     # ---------------------------------------------------------------- control
 
     def wait(self, timeout: float | None = None) -> RunReport:
@@ -287,14 +313,23 @@ class Fleet:
     def deny(self, job_id: str, reason: str = "denied by operator") -> bool:
         return self.scheduler.deny(job_id, reason=reason)
 
-    def cancel(self, reason: str = "operator cancelled") -> None:
-        self.scheduler.cancel_all(reason)
+    def cancel(self, reason: str = "operator cancelled") -> int:
+        """Stop every unfinished job in this run. Returns how many were stopped."""
+        return self.scheduler.cancel_all(reason)
 
     # ----------------------------------------------------------- introspection
 
     def quote(self, model: str | None = None, *, effort: str = "high", process: str = "agent_standard") -> Quote:
-        """What would this cost before I run it?"""
-        return quote(model or self.config.budget.default_model, effort=effort, process=process)
+        """What would this cost before I run it?
+
+        Prefers what past jobs on the same model actually cost, falling back to the
+        token profile for `process` when there is no history yet.
+        """
+        chosen = model or self.config.budget.default_model
+        return quote(
+            chosen, effort=effort, process=process,
+            observed=self.ledger.observed_cost(chosen),
+        )
 
     def cost_menu(self) -> list[dict[str, Any]]:
         return cost_menu(self.config.budget.delegation_models)
