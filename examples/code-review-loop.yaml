@@ -39,8 +39,14 @@ stages:
             on its own line. Otherwise list what must change.
           gpus: 0
 
+  # These two only need the loop, so they run in parallel once it approves.
   - name: verify
     kind: command
     command: ["python", "-m", "pytest", "-q"]
+    needs: [implement-and-review]
+    gpus: 0
+
+  - name: document
+    task: Update the README for the new --seed flag.
     needs: [implement-and-review]
     gpus: 0

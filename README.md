@@ -16,8 +16,8 @@
 
 > [!WARNING]
 > **Work in progress. Use at your own risk.** This is a personal research tool under
-> active development. Interfaces will change without notice, and it has not been
-> audited. It runs AI agents autonomously against your code and your GPUs, and it
+> active development. Interfaces will change without notice.
+> It runs AI agents autonomously against your code and your GPUs, and it
 > spends real money doing so. The budget ceilings and safeguards described below are
 > best-effort, not guarantees: set a low `--max-usd`, keep your work under version
 > control, and check your provider's billing dashboard yourself. Set
@@ -46,36 +46,43 @@ useful on its own for interactive work.
 
 ## Install
 
-Both tools install as commands. Neither needs its checkout afterwards.
+Both tools install the same way: run them from a checkout, and the checkout becomes
+disposable.
 
 ```bash
-# 1. research-ship provides the GPU environment
 git clone https://github.com/shs2017/research-ship
-cd research-ship && ./ship install && cd ..
+cd research-ship && ./ship install && cd ..        # the GPU environment
 
-# 2. research-fleet orchestrates it
-uv tool install git+https://github.com/shs2017/research-fleet
-
-# 3. declare and build the environment for the project you will research in
-cd ~/my-project && ship init && ship build
+git clone https://github.com/shs2017/research-fleet
+cd research-fleet && ./fleet install               # the orchestrator
 ```
 
-`uv tool install` puts `fleet` on your PATH in its own isolated environment, so it
-never collides with your project's dependencies. To remove either tool:
+Both take an optional prefix (`./fleet install /usr/local`) and default to `~/.local`.
+`fleet` lands in its own isolated environment, so it never collides with the
+dependencies of whatever you are researching. To remove either:
 
 ```bash
-uv tool uninstall research-fleet
+fleet uninstall      # or ./fleet uninstall
 ship uninstall
 ```
 
-Requires Docker with the NVIDIA container runtime:
+Uninstalling keeps your ledgers, results, Docker images and volumes, so removing and
+reinstalling costs nothing.
+
+Then set up the project you want to research in:
+
+```bash
+cd ~/my-project && ship init && ship build
+```
+
+Requires Docker with the NVIDIA container runtime, and `uv`:
 
 ```bash
 docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi -L
 ```
 
-For multi-node placement add the Ray extra:
-`uv tool install "research-fleet[ray] @ git+https://github.com/shs2017/research-fleet"`.
+Working from a checkout without installing, `./fleet <command>` runs straight from the
+source, which is handy while developing.
 
 ## Quick start
 
@@ -156,7 +163,103 @@ expression language, and loop conditions are declarative
 (`output_contains`, `output_not_contains`, `succeeded`), so reading the YAML tells you
 when the loop stops.
 
-### Running work in parallel
+### Writing it as a dependency graph
+
+`graph:` is a mapping of node to node, where the edges are the point and there is no
+implicit ordering. **Cycles are allowed, and a cycle is how you say "repeat":**
+
+```yaml
+name: implement-and-review
+max_iterations: 4            # default cap on how many times a cycle repeats
+
+graph:
+  plan:
+    task: Write PLAN.md.
+
+  implement:
+    task: "Follow PLAN.md. {{ steps.review.output }} Address any feedback above."
+    needs: [plan, review]    # depends on the reviewer, which closes the cycle
+
+  review:
+    task: Review the tree. Reply APPROVED if ready, else list what must change.
+    needs: [implement]
+    until:
+      output_contains: APPROVED    # ends the cycle it belongs to
+
+  verify:
+    kind: command
+    command: [pytest, -q]
+    needs: [review]
+
+  document:
+    task: Update the README.
+    needs: [review]
+```
+
+`implement` and `review` depend on each other, so they form a cycle and repeat as a
+unit. `plan` runs before it, and `verify` and `document` run after it, in parallel.
+`--plan` shows exactly that:
+
+```console
+$ fleet workflow implement-and-review.yaml --plan
+warning: cycle implement -> review -> implement repeats, at most 4 time(s).
+Stops early when review is satisfied.
+  wave 1
+    plan (agent)
+  wave 2 cycle implement -> review -> implement  (until review says so, max 4x)
+    implement (agent)
+    review (agent)
+  wave 3 (in parallel)
+    document (agent)  after review
+    verify (command)  after review
+```
+
+A node may also depend on **itself**, which is the shortest way to repeat one step:
+
+```yaml
+graph:
+  tune:
+    task: Adjust the config and report validation loss as a bare number.
+    needs: [tune]
+    max_iterations: 6
+```
+
+**Cycles always terminate.** Every cycle is bounded by `max_iterations`, from the node
+if it sets one, otherwise the workflow default. `until` on any node in the cycle ends it
+early. A cycle with no `until` runs every round, and `fleet` warns you about that up
+front so an indefinite-looking loop is never a surprise:
+
+```
+warning: cycle a -> b -> a repeats, at most 3 time(s). No stop condition, so it
+will always run all 3 rounds. Add `until` to a node in the cycle to end it sooner.
+```
+
+### Or as an ordered list
+
+`stages:` is the same model with sequencing built in, which suits a straight pipeline:
+
+- a stage **with** `needs` runs once those finish, so siblings sharing a dependency run
+  in parallel;
+- a stage **without** `needs` runs after everything declared before it, which keeps a
+  plain list sequential and makes a bare stage a natural barrier.
+
+The two spellings mix in one file. `stages:` entries come first, `graph:` nodes after,
+and `needs` may point in either direction:
+
+```yaml
+stages:
+  - name: setup
+    task: Prepare the data.
+graph:
+  left:  {task: "Try approach A.", needs: [setup]}
+  right: {task: "Try approach B.", needs: [setup]}
+```
+
+Execution is wave by wave: everything in a wave starts together and the next wave waits
+for all of it. A cyclic component takes a wave to itself, since its nodes repeat
+together.
+
+### Running work in parallel### Running work in parallel
 
 `copies` runs the same step several times; `for_each` runs it once per item:
 
@@ -281,6 +384,48 @@ executor:
 `slots` is the only knob that needs thought: Slurm does the real queueing, so this just
 caps how many submissions the fleet keeps in flight. Fractional GPUs round up, because
 `--gres` cannot express half a device.
+
+## What it cost
+
+Every finished job is recorded, so spend and compute are queryable across runs rather
+than scrolling back through logs:
+
+```console
+$ fleet usage --by run,stage
+                          usage by run,stage
+┌──────────────────┬───────────┬──────┬─────────┬─────────┬─────────┬───────┬───────┐
+│ run              │ stage     │ jobs │  tokens │    cost │ agent_s │wall_s │ gpu_s │
+├──────────────────┼───────────┼──────┼─────────┼─────────┼─────────┼───────┼───────┤
+│ run_fd139aed1e59 │ review    │    3 │ 902,431 │ $0.4812 │      61 │    77 │    77 │
+│ run_fd139aed1e59 │ implement │    3 │ 210,004 │ $0.1104 │      28 │    34 │    34 │
+└──────────────────┴───────────┴──────┴─────────┴─────────┴─────────┴───────┴───────┘
+6 job(s)  $0.5916  1,112,435 tokens  89s agent / 111s wall  111 GPU-seconds  14 request(s)
+```
+
+Group by `run`, `model`, `stage`, `attempt`, `workflow`, `name`, `kind`, `backend`,
+`state`, `day` or `job`, and combine them with commas. `--jobs` lists every job instead
+of totals; `--run`, `--days` and `--kind` narrow it.
+
+**A repeated node counts once per attempt.** A cycle that runs three times gives three
+rows under `--by stage,attempt`, so you can see whether a review loop is getting cheaper
+or more expensive as it iterates, rather than one merged figure.
+
+**Agent time and wall time are separate.** `agent_s` is what the harness reported working;
+`wall_s` includes starting the container and pulling the image. `gpu_s` is GPUs multiplied
+by wall time, which is what a shared cluster actually charges you for.
+
+The same data in Python:
+
+```python
+with Fleet() as fleet:
+    print(fleet.usage())                       # totals across every run
+    print(fleet.usage("model"))                # per model
+    print(fleet.usage("run,stage,attempt"))    # per attempt of each stage
+    print(fleet.usage_jobs(run_id="run_abc"))  # one row per job
+```
+
+This table is derived from the ledger, not a second source of truth, so
+`fleet audit reindex` rebuilds it from the JSONL if it is ever lost or stale.
 
 ## Auditability
 

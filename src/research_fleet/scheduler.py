@@ -107,6 +107,7 @@ class JobRecord:
     decision: Decision | None = None
     usage: Usage = field(default_factory=Usage)
     output: str = ""            # the agent's final message, or the command's last lines
+    agent_seconds: float | None = None   # what the harness said it spent
     tail: list[str] = field(default_factory=list)
     reserved_usd: float = 0.0
     reserved_tokens: int = 0
@@ -327,6 +328,7 @@ class Scheduler:
 
             result.usage = rec.usage.to_dict()
             result.output = rec.output or "\n".join(rec.tail)
+            result.agent_seconds = rec.agent_seconds
             rec.result = result
             self._settle_budget(rec)
             self._set_state(rec, result.state, {"result": result.model_dump(mode="json")})
@@ -504,8 +506,14 @@ class Scheduler:
                     rec.usage = rec.usage.merge(event.usage)
             # The harness's `result` event carries the agent's answer, which is what a
             # later step wants to read.
-            if event.type == "result" and event.text:
-                rec.output = event.text
+            if event.type == "result":
+                if event.text:
+                    rec.output = event.text
+                # Wall clock includes pulling the image and starting the container;
+                # this is the part the harness itself was busy for.
+                reported = event.payload.get("duration_ms")
+                if reported:
+                    rec.agent_seconds = float(reported) / 1000.0
             self.ledger.append(
                 f"agent.{event.type}", event.to_ledger(),
                 run_id=self.run_id, job_id=spec_id,

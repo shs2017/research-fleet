@@ -154,6 +154,7 @@ class Fleet:
         mounts: Sequence[Mount] | None = None,
         env: dict[str, str] | None = None,
         isolate: bool | None = None,
+        labels: dict[str, str] | None = None,
         name_prefix: str = "agent",
     ) -> list[JobRecord]:
         """Launch `n` agents on the same task, each in its own container and GPU slot.
@@ -181,7 +182,8 @@ class Fleet:
                     mounts=list(mounts or []),
                     env=dict(env or {}),
                     isolate=self.config.isolate_agents if isolate is None else isolate,
-                    labels={"effort": effort or self.config.budget.default_effort},
+                    labels={"effort": effort or self.config.budget.default_effort,
+                            **(labels or {})},
                 )
             )
         return [self.submit(s) for s in specs]
@@ -218,6 +220,7 @@ class Fleet:
         timeout_s: int = 3600,
         env: dict[str, str] | None = None,
         isolate: bool | None = None,
+        labels: dict[str, str] | None = None,
     ) -> JobRecord:
         return self.submit(
             JobSpec(
@@ -228,6 +231,7 @@ class Fleet:
                 timeout_s=timeout_s,
                 env=dict(env or {}),
                 isolate=bool(isolate),
+                labels=dict(labels or {}),
             )
         )
 
@@ -294,6 +298,28 @@ class Fleet:
 
     def cost_menu(self) -> list[dict[str, Any]]:
         return cost_menu(self.config.budget.delegation_models)
+
+    def usage(
+        self,
+        group_by: str | None = None,
+        *,
+        run_id: str | None = None,
+        since: float | None = None,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        """Compute and spend across every run this root has recorded.
+
+        With `group_by`, totals per bucket (comma separate keys for a finer grain, for
+        example `run,stage,attempt` so a repeated node is counted per attempt). Without
+        it, one row of overall totals.
+        """
+        if group_by:
+            return self.ledger.usage_by(group_by, run_id=run_id, since=since, kind=kind)
+        return self.ledger.usage_totals(run_id=run_id, since=since, kind=kind)
+
+    def usage_jobs(self, *, run_id: str | None = None, limit: int = 1000) -> list[dict[str, Any]]:
+        """Per-job usage rows, newest first."""
+        return self.ledger.usage_rows(run_id=run_id, limit=limit)
 
     def verify_audit(self) -> tuple[bool, str | None]:
         return self.ledger.verify()

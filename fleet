@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Bootstrap for research-fleet, so installing works the same way as research-ship:
+#
+#   ./fleet install            put `fleet` on PATH under ~/.local
+#   ./fleet install /usr/local  or under another prefix
+#   ./fleet uninstall          take it off again
+#
+# Anything else is forwarded to the package straight out of this checkout, so
+# `./fleet run "..."` works before installing anything.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+DEFAULT_PREFIX="${HOME}/.local"
+
+need_uv() {
+    if ! command -v uv >/dev/null 2>&1; then
+        echo "uv is required: https://docs.astral.sh/uv/getting-started/installation/" >&2
+        exit 1
+    fi
+}
+
+# uv keeps each tool in its own environment, so installing cannot disturb the
+# project's dependencies. Pointing its dirs at PREFIX mirrors research-ship's layout.
+tool_env() {
+    local prefix="$1"
+    export UV_TOOL_BIN_DIR="${prefix}/bin"
+    export UV_TOOL_DIR="${prefix}/share/research-fleet/tools"
+}
+
+case "${1:-help}" in
+    install)
+        need_uv
+        prefix="${2:-${DEFAULT_PREFIX}}"
+        tool_env "${prefix}"
+        mkdir -p "${UV_TOOL_BIN_DIR}" "${UV_TOOL_DIR}"
+        # --force upgrades in place instead of failing; --reinstall rebuilds from the
+        # checkout, so editing the source and reinstalling cannot leave stale code
+        # behind (uv otherwise reuses a cached build of the same path).
+        if ! out=$(uv tool install --force --reinstall "${REPO}[ray,mcp]" 2>&1); then
+            echo "${out}" >&2
+            exit 1
+        fi
+        echo "Installed fleet to ${UV_TOOL_BIN_DIR}/fleet"
+        echo "This checkout is no longer needed; fleet runs from its own environment."
+        case ":${PATH}:" in
+            *":${UV_TOOL_BIN_DIR}:"*) ;;
+            *) echo "NOTE: ${UV_TOOL_BIN_DIR} is not on your PATH. Add it to your shell profile." ;;
+        esac
+        ;;
+
+    uninstall)
+        need_uv
+        prefix="${2:-${DEFAULT_PREFIX}}"
+        tool_env "${prefix}"
+        uv tool uninstall research-fleet >/dev/null 2>&1 \
+            && echo "Removed ${UV_TOOL_BIN_DIR}/fleet" \
+            || echo "fleet was not installed under ${prefix}"
+        rm -rf "${UV_TOOL_DIR}"
+        echo "Ledgers and results under ~/.research-fleet were kept."
+        ;;
+
+    help|--help|-h)
+        sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        echo
+        echo "Once installed, run 'fleet --help' for the full command list."
+        ;;
+
+    *)
+        # Run from the checkout without installing, for development.
+        need_uv
+        exec uv run --project "${REPO}" fleet "$@"
+        ;;
+esac

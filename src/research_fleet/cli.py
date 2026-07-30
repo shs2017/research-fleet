@@ -159,26 +159,47 @@ def workflow(
     plan: bool = typer.Option(False, "--plan", help="Validate and print the stages, run nothing."),
 ):
     """Run a multi-step pipeline, for example a coder and reviewer loop."""
-    from .workflow import Loop, Workflow
+    from .workflow import Loop, Step, Workflow
 
     wf = Workflow.from_yaml(file)
 
     if plan:
         console.print(f"[bold]{wf.name}[/bold]  {wf.description}")
-        for stage in wf.stages:
-            if isinstance(stage, Loop):
-                until = f"until {stage.until.step} contains '{stage.until.output_contains}'" \
-                    if stage.until and stage.until.output_contains else "until done"
-                console.print(f"  loop {stage.name}  max {stage.max_iterations}x, {until}")
-                for inner in stage.steps:
-                    console.print(f"    - {inner.name} ({inner.kind.value})")
-            else:
-                fan = ""
-                if stage.for_each:
-                    fan = f" x{len(stage.for_each)}"
-                elif stage.copies > 1:
-                    fan = f" x{stage.copies}"
-                console.print(f"  {stage.name} ({stage.kind.value}){fan}")
+        for note in wf.warnings():
+            console.print(f"[yellow]warning:[/yellow] {note}")
+
+        by_name = {st.name: st for st in wf.stages}
+        cyclic = {tuple(group) for group in wf.cycles()}
+        for depth, wave in enumerate(wf.levels(), start=1):
+            if tuple(wave) in cyclic:
+                limit = wf.repeat_limit(wave)
+                stops = [n for n, _ in wf.stop_conditions(wave)]
+                how = f"until {', '.join(stops)} says so, " if stops else ""
+                console.print(f"  [dim]wave {depth}[/dim] [yellow]cycle[/yellow] "
+                              f"{' -> '.join(wave)} -> {wave[0]}  ({how}max {limit}x)")
+                for name in wave:
+                    console.print(f"    {name} ({by_name[name].kind.value})"
+                                  if isinstance(by_name[name], Step) else f"    {name} (loop)")
+                continue
+            together = " (in parallel)" if len(wave) > 1 else ""
+            console.print(f"  [dim]wave {depth}[/dim]{together}")
+            for name in wave:
+                stage = by_name[name]
+                waits = sorted(wf.graph()[name])
+                after = f"  [dim]after {', '.join(waits)}[/dim]" if waits else ""
+                if isinstance(stage, Loop):
+                    until = (f"until {stage.until.step} contains '{stage.until.output_contains}'"
+                             if stage.until and stage.until.output_contains else "until done")
+                    console.print(f"    loop {name}  max {stage.max_iterations}x, {until}{after}")
+                    for inner in stage.steps:
+                        console.print(f"      - {inner.name} ({inner.kind.value})")
+                else:
+                    fan = ""
+                    if stage.for_each:
+                        fan = f" x{len(stage.for_each)}"
+                    elif stage.copies > 1:
+                        fan = f" x{stage.copies}"
+                    console.print(f"    {name} ({stage.kind.value}){fan}{after}")
         return
 
     fleet = _fleet(
@@ -233,6 +254,44 @@ def submit(
 
 
 @app.command()
+def uninstall(
+    prefix: str = typer.Argument("", help="Prefix it was installed under. Default ~/.local."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask."),
+):
+    """Remove the `fleet` command. Ledgers and results are kept."""
+    import os
+    import shutil
+    import subprocess
+
+    root = Path(prefix).expanduser() if prefix else Path.home() / ".local"
+    if shutil.which("uv") is None:
+        console.print("[red]uv not found[/red]; remove it however you installed it.")
+        raise typer.Exit(1)
+    if not yes and not typer.confirm(f"Remove fleet from {root}?"):
+        raise typer.Exit(0)
+
+    env = dict(
+        os.environ,
+        UV_TOOL_BIN_DIR=str(root / "bin"),
+        UV_TOOL_DIR=str(root / "share" / "research-fleet" / "tools"),
+    )
+    done = subprocess.run(
+        ["uv", "tool", "uninstall", "research-fleet"],
+        capture_output=True, text=True, env=env, check=False,
+    )
+
+    # Past this point the environment this process is running from has been deleted,
+    # so anything that imports lazily (rich markup, typer's error rendering) will fail.
+    # Plain print and SystemExit need nothing that is not already loaded.
+    if done.returncode == 0:
+        print(f"Removed {root / 'bin' / 'fleet'}")
+        print("Ledgers and results under ~/.research-fleet were kept.")
+        raise SystemExit(0)
+    print(f"fleet was not installed under {root}")
+    raise SystemExit(1)
+
+
+@app.command()
 def cost(
     process: str = typer.Option("agent_standard", "--process",
                                 help="single_call|workflow|agent_short|agent_standard|agent_long"),
@@ -251,6 +310,71 @@ def cost(
         )
     console.print(table)
     console.print(f"[dim]Run budget ceiling: ${cfg.budget.max_usd:.2f} / {cfg.budget.max_tokens:,} tokens[/dim]")
+
+
+@app.command()
+def usage(
+    by: str = typer.Option("run", "--by", "-b",
+                           help="run, model, stage, attempt, name, kind, backend, day, job. "
+                                "Comma separated for a finer grain, e.g. run,stage,attempt."),
+    run_id: Optional[str] = typer.Option(None, "--run", help="Only this run."),
+    days: Optional[int] = typer.Option(None, "--days", help="Only the last N days."),
+    kind: Optional[str] = typer.Option(None, "--kind", help="agent or command."),
+    jobs: bool = typer.Option(False, "--jobs", help="List every job instead of totals."),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+):
+    """Compute and spend across runs, from the audit ledger."""
+    cfg = load_config(config)
+    ledger = Ledger(cfg.root_path)
+    since = time.time() - days * 86400 if days else None
+    try:
+        if jobs:
+            rows = ledger.usage_rows(run_id=run_id, since=since, kind=kind)
+            table = Table(title="jobs")
+            for col in ("run", "stage", "try", "model", "tokens", "cost",
+                        "agent_s", "wall_s", "gpu_s", "state"):
+                table.add_column(col)
+            for r in rows:
+                table.add_row(
+                    (r["run_id"] or "")[-8:], r["stage"] or r["name"], str(r["attempt"]),
+                    (r["model"] or "-").replace("claude-", ""),
+                    f"{r['total_tokens']:,}", f"${r['cost_usd']:.4f}",
+                    f"{(r['agent_seconds'] or 0):.0f}", f"{(r['duration_s'] or 0):.0f}",
+                    f"{r['gpu_seconds']:.0f}", r["state"],
+                )
+            console.print(table)
+        else:
+            grouped = ledger.usage_by(by, run_id=run_id, since=since, kind=kind)
+            keys = [k.strip() for k in by.split(",") if k.strip()]
+            table = Table(title=f"usage by {by}")
+            for key in keys:
+                table.add_column(key)
+            for col in ("jobs", "tokens", "cost", "agent_s", "wall_s", "gpu_s"):
+                table.add_column(col, justify="right")
+            for r in grouped:
+                cells = [str(r[k] if r[k] is not None else "-")[-24:] for k in keys]
+                table.add_row(
+                    *cells, str(r["jobs"]), f"{r['total_tokens']:,}",
+                    f"${r['cost_usd']:.4f}", f"{r['agent_seconds']:.0f}",
+                    f"{r['duration_s']:.0f}", f"{r['gpu_seconds']:.0f}",
+                )
+            console.print(table)
+
+        total = ledger.usage_totals(run_id=run_id, since=since, kind=kind)
+        console.print(
+            f"[bold]{total['jobs']} job(s)[/bold]  ${total['cost_usd']:.4f}  "
+            f"{total['total_tokens']:,} tokens  "
+            f"{total['agent_seconds']:.0f}s agent / {total['duration_s']:.0f}s wall  "
+            f"{total['gpu_seconds']:.0f} GPU-seconds  "
+            f"{total['requests']} request(s)"
+        )
+        if total.get("unpriced_jobs"):
+            console.print(
+                f"[yellow]{total['unpriced_jobs']} job(s) used a model with no price, "
+                "so their cost reads as zero.[/yellow]"
+            )
+    finally:
+        ledger.close()
 
 
 @app.command()

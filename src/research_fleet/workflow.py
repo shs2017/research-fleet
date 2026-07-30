@@ -7,8 +7,16 @@ A workflow is an ordered list of stages. Each stage is one of:
     iterations (a coder/reviewer cycle is the canonical case),
   * a **fan-out**, which is a step with `for_each` or `copies`, run in parallel.
 
-Steps declare `needs` to run after earlier stages, and read earlier results through
-`{{ }}` templating, so a reviewer can be handed exactly what the coder said.
+Stages form a graph, and the rule for reading one is deliberately simple:
+
+  * a stage with `needs` runs once those stages are done, so siblings sharing a
+    dependency run in parallel;
+  * a stage without `needs` runs after everything declared before it, which keeps a
+    plain list sequential and makes a bare stage a natural barrier.
+
+That means a flat list behaves like a sequence, adding `needs` opts into parallelism,
+and the two mix without a mode switch. Stages read earlier results through `{{ }}`
+templating, so a reviewer can be handed exactly what the coder said.
 
 Two deliberate limits keep this predictable. Templating is plain substitution, not an
 expression language, so a prompt cannot compute. Loop conditions are declarative
@@ -19,11 +27,12 @@ you when the loop stops. Python callers who want real logic pass a callable inst
 from __future__ import annotations
 
 import re
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from .spec import JobKind, JobResult
 
@@ -52,15 +61,17 @@ def render(text: str, context: dict[str, Any]) -> str:
 
 
 class Condition(BaseModel):
-    """When a loop should stop. Every field given must hold."""
+    """When repetition should stop. Every field given must hold."""
 
-    step: str = Field(..., description="Which step's result to inspect.")
+    step: str | None = Field(
+        None, description="Whose result to inspect. Defaults to the node holding it."
+    )
     output_contains: str | None = None
     output_not_contains: str | None = None
     succeeded: bool | None = None
 
-    def met(self, results: dict[str, JobResult]) -> bool:
-        result = results.get(self.step)
+    def met(self, results: dict[str, JobResult], default_step: str | None = None) -> bool:
+        result = results.get(self.step or default_step or "")
         if result is None:
             return False
         text = result.output or ""
@@ -88,6 +99,12 @@ class Step(BaseModel):
     timeout_s: int = 3600
     isolate: bool | None = None
     needs: list[str] = Field(default_factory=list)
+
+    # When this node is part of a cycle, these govern how long the cycle repeats.
+    until: Condition | None = Field(
+        None, description="Stop repeating once this holds of the node's own output."
+    )
+    max_iterations: int | None = Field(None, ge=1, description="Cap on repeats of this node's cycle.")
 
     # Fan-out: run the same step many times, in parallel.
     for_each: list[Any] = Field(default_factory=list, description="One run per item; use {{ item }}.")
@@ -125,6 +142,8 @@ class Loop(BaseModel):
 
 
 class Workflow(BaseModel):
+    model_config = {"extra": "forbid"}
+
     name: str = "workflow"
     description: str = ""
     stages: list[Step | Loop] = Field(default_factory=list)
@@ -134,6 +153,12 @@ class Workflow(BaseModel):
     effort: str | None = None
     gpus: float | None = None
     isolate: bool | None = None
+    max_iterations: int = Field(
+        3, ge=1, description="Default cap on how many times a cycle repeats."
+    )
+
+    # Names that came from a `graph:` block, so they keep exactly the edges they state.
+    _graph_nodes: set[str] = PrivateAttr(default_factory=set)
 
     @model_validator(mode="after")
     def _check(self) -> Workflow:
@@ -142,13 +167,171 @@ class Workflow(BaseModel):
         names = [st.name for st in self.stages]
         if len(names) != len(set(names)):
             raise ValueError("stage names must be unique")
-        known: set[str] = set()
+        known = set(names)
         for stage in self.stages:
             for need in stage.needs:
                 if need not in known:
-                    raise ValueError(f"stage {stage.name!r} needs {need!r}, which is not defined above it")
-            known.add(stage.name)
+                    raise ValueError(f"stage {stage.name!r} needs {need!r}, which is not a stage")
         return self
+
+    # ------------------------------------------------------------------ graph
+
+    def graph(self) -> dict[str, set[str]]:
+        """Node name to the nodes it waits for.
+
+        Nodes declared under `graph:` use exactly the edges they state. Nodes declared
+        under `stages:` without `needs` get an implicit edge to everything above them,
+        and that implicit edge is skipped where it would invent a cycle the author did
+        not write. So a reported cycle is always a real, intended one.
+        """
+        explicit = {st.name: set(st.needs) for st in self.stages}
+
+        def depends_on(start: str, target: str, seen: set[str] | None = None) -> bool:
+            seen = seen if seen is not None else set()
+            for dep in explicit.get(start, ()):
+                if dep == target or (dep not in seen and depends_on(dep, target, seen | {dep})):
+                    return True
+            return False
+
+        graph_nodes = getattr(self, "_graph_nodes", set())
+        edges: dict[str, set[str]] = {}
+        earlier: list[str] = []
+        for stage in self.stages:
+            if stage.needs or stage.name in graph_nodes:
+                edges[stage.name] = set(stage.needs)
+            else:
+                edges[stage.name] = {
+                    prior for prior in earlier if not depends_on(prior, stage.name)
+                }
+            earlier.append(stage.name)
+        return edges
+
+    def components(self) -> list[list[str]]:
+        """Nodes grouped into strongly connected components, in dependency order.
+
+        A component of one node with no self-edge runs once. Any larger component, or a
+        self-edge, is a cycle: its nodes repeat together. Condensing to components is
+        what lets a cyclic graph be scheduled at all, since the cycle becomes a single
+        unit with a well-defined place in the order.
+        """
+        edges = self.graph()
+        order = [st.name for st in self.stages]
+        index: dict[str, int] = {}
+        low: dict[str, int] = {}
+        on_stack: dict[str, bool] = {}
+        stack: list[str] = []
+        found: list[list[str]] = []
+        counter = [0]
+
+        def strong_connect(node: str) -> None:
+            index[node] = low[node] = counter[0]
+            counter[0] += 1
+            stack.append(node)
+            on_stack[node] = True
+            for dep in sorted(edges.get(node, ())):
+                if dep not in index:
+                    strong_connect(dep)
+                    low[node] = min(low[node], low[dep])
+                elif on_stack.get(dep):
+                    low[node] = min(low[node], index[dep])
+            if low[node] == index[node]:
+                group = []
+                while True:
+                    top = stack.pop()
+                    on_stack[top] = False
+                    group.append(top)
+                    if top == node:
+                        break
+                found.append(group)
+
+        for name in order:
+            if name not in index:
+                strong_connect(name)
+
+        # Tarjan emits components in reverse topological order of the condensation, so
+        # dependencies come first already. Sort within a component by declaration order
+        # so a cycle repeats in the order it reads.
+        rank = {name: i for i, name in enumerate(order)}
+        return [sorted(group, key=lambda n: rank[n]) for group in found]
+
+    def is_cyclic_component(self, group: list[str]) -> bool:
+        if len(group) > 1:
+            return True
+        only = group[0]
+        return only in self.graph().get(only, set())
+
+    def cycles(self) -> list[list[str]]:
+        """Every cyclic component. Empty means the graph is acyclic."""
+        return [g for g in self.components() if self.is_cyclic_component(g)]
+
+    def repeat_limit(self, group: list[str]) -> int:
+        """How many times a cyclic component may repeat."""
+        by_name = {st.name: st for st in self.stages}
+        caps = [
+            by_name[n].max_iterations
+            for n in group
+            if isinstance(by_name.get(n), Step) and by_name[n].max_iterations
+        ]
+        return min(caps) if caps else self.max_iterations
+
+    def stop_conditions(self, group: list[str]) -> list[tuple[str, Condition]]:
+        by_name = {st.name: st for st in self.stages}
+        return [
+            (n, by_name[n].until)
+            for n in group
+            if isinstance(by_name.get(n), Step) and by_name[n].until is not None
+        ]
+
+    def levels(self) -> list[list[str]]:
+        """Waves of components that can run together.
+
+        Components with no outstanding dependency on each other share a wave. A cyclic
+        component takes a wave of its own, because its nodes repeat as a unit.
+        """
+        comps = self.components()
+        edges = self.graph()
+        place = {n: i for i, g in enumerate(comps) for n in g}
+
+        comp_deps: list[set[int]] = []
+        for i, group in enumerate(comps):
+            comp_deps.append(
+                {place[d] for n in group for d in edges.get(n, ()) if place[d] != i}
+            )
+
+        waves: list[list[str]] = []
+        done: set[int] = set()
+        while len(done) < len(comps):
+            ready = [i for i in range(len(comps)) if i not in done and comp_deps[i] <= done]
+            if not ready:                                    # pragma: no cover
+                raise ValueError("could not order components; this is a bug")
+            cyclic = [i for i in ready if self.is_cyclic_component(comps[i])]
+            if cyclic:
+                waves.append(comps[cyclic[0]])
+                done.add(cyclic[0])
+            else:
+                waves.append(sorted(n for i in ready for n in comps[i]))
+                done.update(ready)
+        return waves
+
+    def warnings(self) -> list[str]:
+        """Things worth saying before anything runs."""
+        notes: list[str] = []
+        for group in self.cycles():
+            limit = self.repeat_limit(group)
+            stops = self.stop_conditions(group)
+            note = (
+                f"cycle {' -> '.join(group)} -> {group[0]} repeats, at most "
+                f"{limit} time(s)."
+            )
+            if stops:
+                note += " Stops early when " + ", ".join(n for n, _ in stops) + " is satisfied."
+            else:
+                note += (
+                    " No stop condition, so it will always run all "
+                    f"{limit} rounds. Add `until` to a node in the cycle to end it sooner."
+                )
+            notes.append(note)
+        return notes
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> Workflow:
@@ -157,9 +340,16 @@ class Workflow(BaseModel):
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Workflow:
-        """Accepts `stages:` entries that are either steps or `loop:` blocks."""
+        """Accepts two equivalent spellings, and a mix of them.
+
+        `stages:` is an ordered list, where a node without `needs` waits for everything
+        above it. `graph:` is a mapping of name to node, with no implicit ordering at
+        all, for when the dependencies are the point. Nodes from `graph:` are appended
+        after any `stages:`, and `needs` may point in either direction.
+        """
         data = dict(raw)
         stages: list[Any] = []
+
         for entry in data.pop("stages", []) or []:
             if "loop" in entry:
                 body = dict(entry["loop"])
@@ -167,7 +357,26 @@ class Workflow(BaseModel):
                 stages.append(Loop(**body))
             else:
                 stages.append(Step(**entry))
-        return cls(stages=stages, **data)
+
+        for name, body in (data.pop("graph", {}) or {}).items():
+            body = dict(body or {})
+            body["name"] = name
+            # A graph node is explicit about its edges, so it never gets an implicit one.
+            body.setdefault("needs", [])
+            if "loop" in body:
+                inner = dict(body.pop("loop"))
+                inner["name"] = name
+                inner["needs"] = body["needs"]
+                stages.append(Loop(**inner))
+            else:
+                stages.append(Step(**body))
+            data.setdefault("_explicit", set())
+            data["_explicit"].add(name)
+
+        explicit = data.pop("_explicit", set())
+        wf = cls(stages=stages, **data)
+        wf._graph_nodes = explicit
+        return wf
 
 
 # ---------------------------------------------------------------------- runner
@@ -231,10 +440,19 @@ class WorkflowRunner:
         for index, item in enumerate(items):
             item_ctx = {**ctx, "item": item, "index": index}
             name = label if len(items) == 1 else f"{label}-{index}"
+            # The logical stage and the attempt travel as labels, so a repeated node
+            # stays one row per attempt in the usage table rather than being merged.
+            labels = {
+                "workflow": self.workflow.name,
+                "stage": step.name,
+                "attempt": str(extra_ctx.get("iteration", 1)),
+            }
+            if len(items) > 1:
+                labels["copy"] = str(index)
             if step.kind is JobKind.AGENT:
                 records += self.fleet.run_agents(
                     render(step.task, item_ctx),
-                    n=1, name_prefix=name,
+                    n=1, name_prefix=name, labels=labels,
                     model=opts["model"], effort=opts["effort"], gpus=opts["gpus"],
                     timeout_s=step.timeout_s, isolate=opts["isolate"],
                 )
@@ -243,18 +461,17 @@ class WorkflowRunner:
                     self.fleet.run_command(
                         [render(part, item_ctx) for part in step.command],
                         name=name, gpus=opts["gpus"], timeout_s=step.timeout_s,
-                        isolate=opts["isolate"],
+                        isolate=opts["isolate"], labels=labels,
                     )
                 )
         return [r.spec.id for r in records]
 
-    def _collect(self, step_name: str, job_ids: list[str]) -> None:
-        """Wait for the submitted jobs and record the step's result.
+    def _record(self, step_name: str, job_ids: list[str], report) -> None:
+        """Record a step's results from a finished report.
 
         A fan-out records the first job under the bare step name so later templates can
         refer to it simply, plus each copy under `name-N`.
         """
-        report = self.fleet.wait()
         for index, job_id in enumerate(job_ids):
             result = report.results.get(job_id)
             if result is None:
@@ -263,17 +480,88 @@ class WorkflowRunner:
                 self.results[step_name] = result
             self.results[f"{step_name}-{index}"] = result
 
+    def _collect(self, step_name: str, job_ids: list[str]) -> None:
+        self._record(step_name, job_ids, self.fleet.wait())
+
     # ------------------------------------------------------------------- run
 
     def run(self) -> list[StageOutcome]:
-        for stage in self.workflow.stages:
-            if isinstance(stage, Loop):
-                self.outcomes.append(self._run_loop(stage))
-            else:
-                job_ids = self._submit(stage, stage.name, {"iteration": 1})
-                self._collect(stage.name, job_ids)
-                self.outcomes.append(StageOutcome(stage=stage.name, job_ids=job_ids))
+        """Execute the dependency graph, component by component.
+
+        Independent nodes share a wave and run together. A cyclic component repeats its
+        nodes in declaration order until one of their `until` conditions holds or the
+        repeat limit is reached, so a cycle is how you express "keep going until".
+        """
+        for note in self.workflow.warnings():
+            warnings.warn(f"{self.workflow.name}: {note}", stacklevel=2)
+            self.fleet.ledger.append(
+                "workflow.warning", {"workflow": self.workflow.name, "note": note},
+                run_id=self.fleet.run_id,
+            )
+
+        by_name: dict[str, Step | Loop] = {st.name: st for st in self.workflow.stages}
+        outcomes: dict[str, StageOutcome] = {}
+
+        # `levels` gives a cyclic component a wave to itself, so a wave repeats only
+        # when it *is* that component. A wave of several independent nodes is not a
+        # cycle, however many nodes it holds.
+        cyclic = {tuple(group) for group in self.workflow.cycles()}
+
+        for wave in self.workflow.levels():
+            if tuple(wave) in cyclic:
+                outcomes.update(self._run_cycle(wave, by_name))
+                continue
+
+            stages = [by_name[name] for name in wave]
+            steps = [st for st in stages if isinstance(st, Step)]
+            loops = [st for st in stages if isinstance(st, Loop)]
+
+            # Submit every plain node in the wave before waiting, so independent work
+            # genuinely overlaps.
+            submitted = {st.name: self._submit(st, st.name, {"iteration": 1}) for st in steps}
+            if submitted:
+                report = self.fleet.wait()
+                for name, job_ids in submitted.items():
+                    self._record(name, job_ids, report)
+                    outcomes[name] = StageOutcome(stage=name, job_ids=job_ids)
+
+            for loop in loops:
+                outcomes[loop.name] = self._run_loop(loop)
+
+        self.outcomes = [outcomes[st.name] for st in self.workflow.stages if st.name in outcomes]
         return self.outcomes
+
+    def _run_cycle(
+        self, group: list[str], by_name: dict[str, Step | Loop]
+    ) -> dict[str, StageOutcome]:
+        """Repeat a cyclic component until a stop condition holds or the limit is hit."""
+        limit = self.workflow.repeat_limit(group)
+        stops = self.workflow.stop_conditions(group)
+        outcomes = {name: StageOutcome(stage=name, iterations=0) for name in group}
+
+        for iteration in range(1, limit + 1):
+            for name in group:
+                stage = by_name[name]
+                outcomes[name].iterations = iteration
+                if isinstance(stage, Loop):
+                    inner = self._run_loop(stage)
+                    outcomes[name].job_ids += inner.job_ids
+                    continue
+                label = f"{name}-{iteration}" if iteration > 1 else name
+                job_ids = self._submit(stage, label, {"iteration": iteration})
+                outcomes[name].job_ids += job_ids
+                # Recorded under the bare name, so `{{ steps.review.output }}` always
+                # means the current round.
+                self._collect(name, job_ids)
+
+            met = [n for n, cond in stops if cond.met(self.results, default_step=n)]
+            predicate = self.predicates.get(group[0])
+            if met or (predicate is not None and predicate(self.results)):
+                for outcome in outcomes.values():
+                    outcome.stopped_early = True
+                break
+
+        return outcomes
 
     def _run_loop(self, loop: Loop) -> StageOutcome:
         outcome = StageOutcome(stage=loop.name, iterations=0)

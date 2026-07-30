@@ -148,6 +148,11 @@ class JobResult(BaseModel):
     output: str = Field(
         "", description="The job's answer: an agent's final message, or a command's last output."
     )
+    agent_seconds: float | None = Field(
+        None,
+        description="Time the harness reported working, excluding container start and "
+                    "teardown. None for command jobs.",
+    )
 
     @property
     def duration_s(self) -> float | None:

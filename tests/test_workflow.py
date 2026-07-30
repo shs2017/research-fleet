@@ -8,11 +8,12 @@ approves, and the loop must stop on its own.
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 import pytest
 
-from research_fleet import Condition, Fleet, Loop, Workflow
+from research_fleet import Condition, Fleet, Loop, Step, Workflow
 from research_fleet.spec import JobKind, JobResult, JobState
 from research_fleet.workflow import render
 
@@ -22,11 +23,14 @@ class ScriptedExecutor:
 
     kind = "scripted"
 
-    def __init__(self, script: dict[str, list[str]] | None = None):
+    def __init__(self, script: dict[str, list[str]] | None = None, delay: float = 0.0):
         self.script = {k: list(v) for k, v in (script or {}).items()}
+        self.delay = delay
         self.calls: list[str] = []          # job names, in execution order
         self.tasks: list[str] = []          # the prompt each agent received
         self.isolated: list[bool] = []
+        self.spans: dict[str, tuple[float, float]] = {}   # name -> (start, end)
+        self._lock = threading.Lock()
 
     def _output_for(self, name: str) -> str:
         for key, queue in self.script.items():
@@ -40,9 +44,13 @@ class ScriptedExecutor:
         return ["GPU-0", "GPU-1", "GPU-2", "GPU-3"]
 
     def run(self, spec, *, argv, env, placement, policy, on_line) -> JobResult:
-        self.calls.append(spec.name)
-        self.isolated.append(spec.isolate)
-        text = self._output_for(spec.name)
+        began = time.time()
+        with self._lock:
+            self.calls.append(spec.name)
+            self.isolated.append(spec.isolate)
+            text = self._output_for(spec.name)
+        if self.delay:
+            time.sleep(self.delay)
 
         if spec.kind is JobKind.AGENT:
             prompt = argv[argv.index("-p") + 1] if "-p" in argv else ""
@@ -58,8 +66,10 @@ class ScriptedExecutor:
             on_line("stdout", text)
 
         now = time.time()
+        with self._lock:
+            self.spans[spec.name] = (began, now)
         return JobResult(job_id=spec.id, state=JobState.SUCCEEDED, exit_code=0,
-                         started_at=now, ended_at=now)
+                         started_at=began, ended_at=now)
 
     def cancel(self, job_id: str) -> bool:
         return True
@@ -167,7 +177,7 @@ def test_command_steps_are_parsed(tmp_path):
         ({"stages": [{"name": "a", "kind": "agent"}]}, "need a `task`"),
         ({"stages": [{"name": "a", "kind": "command"}]}, "need a `command`"),
         ({"stages": [{"name": "a", "task": "t"}, {"name": "a", "task": "t"}]}, "unique"),
-        ({"stages": [{"name": "a", "task": "t", "needs": ["later"]}]}, "not defined above it"),
+        ({"stages": [{"name": "a", "task": "t", "needs": ["nope"]}]}, "not a stage"),
         ({"stages": [{"name": "a", "task": "t", "for_each": [1], "copies": 2}]}, "not both"),
     ],
 )
@@ -418,5 +428,314 @@ def test_a_workflow_can_be_loaded_from_a_path(tmp_path):
         report = fleet.run_workflow(path)
         assert report.workflow == "fromfile"
         assert stub.calls == ["s"]
+    finally:
+        fleet.close()
+
+
+# ------------------------------------------------------------------- the graph
+
+
+def _wf(*stages, **kw):
+    return Workflow.from_dict({"stages": list(stages), **kw})
+
+
+def test_a_plain_list_stays_sequential():
+    """No `needs` anywhere means each stage waits for everything before it."""
+    wf = _wf({"name": "a", "task": "t"}, {"name": "b", "task": "t"}, {"name": "c", "task": "t"})
+    assert wf.levels() == [["a"], ["b"], ["c"]]
+
+
+def test_shared_needs_put_siblings_in_one_wave():
+    wf = _wf(
+        {"name": "plan", "task": "t"},
+        {"name": "left", "task": "t", "needs": ["plan"]},
+        {"name": "right", "task": "t", "needs": ["plan"]},
+    )
+    assert wf.levels() == [["plan"], ["left", "right"]]
+
+
+def test_a_stage_without_needs_acts_as_a_barrier():
+    """This is what makes a trailing `verify` wait for every branch."""
+    wf = _wf(
+        {"name": "plan", "task": "t"},
+        {"name": "left", "task": "t", "needs": ["plan"]},
+        {"name": "right", "task": "t", "needs": ["plan"]},
+        {"name": "verify", "task": "t"},
+    )
+    assert wf.levels() == [["plan"], ["left", "right"], ["verify"]]
+    assert wf.graph()["verify"] == {"plan", "left", "right"}
+
+
+def test_sequence_and_graph_styles_mix():
+    wf = _wf(
+        {"name": "setup", "task": "t"},                              # sequence
+        {"name": "x", "task": "t", "needs": ["setup"]},              # graph
+        {"name": "y", "task": "t", "needs": ["setup"]},              # graph
+        {"name": "merge", "task": "t", "needs": ["x", "y"]},          # graph
+        {"name": "report", "task": "t"},                             # sequence barrier
+    )
+    assert wf.levels() == [["setup"], ["x", "y"], ["merge"], ["report"]]
+
+
+def test_needs_may_point_at_a_stage_declared_later():
+    """Order in the file is presentation; the graph decides execution."""
+    wf = _wf({"name": "second", "task": "t", "needs": ["first"]}, {"name": "first", "task": "t"})
+    assert wf.levels() == [["first"], ["second"]]
+    assert wf.cycles() == []
+
+
+def test_a_dag_reports_no_warnings():
+    wf = _wf({"name": "a", "task": "t"}, {"name": "b", "task": "t", "needs": ["a"]})
+    assert wf.cycles() == []
+    assert wf.warnings() == []
+
+
+# ------------------------------------------------------------------- cycles
+
+
+def test_a_two_stage_cycle_is_detected():
+    wf = _wf({"name": "x", "task": "t", "needs": ["y"]},
+             {"name": "y", "task": "t", "needs": ["x"]})
+    assert wf.cycles() == [["x", "y"]]
+
+
+def test_a_longer_cycle_is_detected_and_named():
+    wf = _wf({"name": "a", "task": "t", "needs": ["c"]},
+             {"name": "b", "task": "t", "needs": ["a"]},
+             {"name": "c", "task": "t", "needs": ["b"]})
+    assert set(wf.cycles()[0]) == {"a", "b", "c"}
+
+
+def test_a_self_dependency_is_a_cycle_of_one():
+    """A node that needs itself is the shortest way to say "repeat this"."""
+    wf = Workflow(name="w", stages=[Step(name="tune", task="t", needs=["tune"])])
+    assert wf.cycles() == [["tune"]]
+    assert wf.is_cyclic_component(["tune"])
+
+
+def test_a_cycle_is_schedulable_and_sits_in_dependency_order():
+    wf = _wf(
+        {"name": "plan", "task": "t"},
+        {"name": "implement", "task": "t", "needs": ["plan", "review"]},
+        {"name": "review", "task": "t", "needs": ["implement"]},
+        {"name": "ship", "task": "t", "needs": ["review"]},
+    )
+    assert wf.components() == [["plan"], ["implement", "review"], ["ship"]]
+    assert wf.levels() == [["plan"], ["implement", "review"], ["ship"]]
+
+
+def test_a_cycle_warns_about_repeating_and_names_its_limit():
+    wf = _wf({"name": "x", "task": "t", "needs": ["y"]},
+             {"name": "y", "task": "t", "needs": ["x"]}, max_iterations=5)
+    note = wf.warnings()[0]
+    assert "repeats" in note and "5 time(s)" in note
+    assert "No stop condition" in note, "must say it will use every round"
+
+
+def test_a_cycle_with_a_stop_condition_says_so():
+    wf = _wf(
+        {"name": "implement", "task": "t", "needs": ["review"]},
+        {"name": "review", "task": "t", "needs": ["implement"],
+         "until": {"output_contains": "APPROVED"}},
+    )
+    note = wf.warnings()[0]
+    assert "Stops early when review" in note
+
+
+def test_the_tightest_max_iterations_in_a_cycle_wins():
+    wf = _wf(
+        {"name": "a", "task": "t", "needs": ["b"], "max_iterations": 7},
+        {"name": "b", "task": "t", "needs": ["a"], "max_iterations": 2},
+        max_iterations=9,
+    )
+    assert wf.repeat_limit(["a", "b"]) == 2
+
+
+# ------------------------------------------------------------ cycles that run
+
+
+def test_a_cycle_repeats_until_a_node_is_satisfied(tmp_path):
+    """The reviewer objects once, then approves, so the cycle runs twice."""
+    stub = ScriptedExecutor({"review": ["needs work: add tests", "APPROVED"]})
+    fleet = _fleet(tmp_path, stub)
+    try:
+        with pytest.warns(UserWarning, match="repeats"):
+            report = fleet.run_workflow({
+                "max_iterations": 5,
+                "graph": {
+                    "implement": {"task": "implement. {{ steps.review.output }}",
+                                  "needs": ["review"], "gpus": 0},
+                    "review": {"task": "review it", "needs": ["implement"], "gpus": 0,
+                               "until": {"output_contains": "APPROVED"}},
+                },
+            })
+        assert stub.calls == ["implement", "review", "implement-2", "review-2"]
+        outcome = {o.stage: o for o in report.outcomes}["review"]
+        assert outcome.iterations == 2 and outcome.stopped_early
+        # The second round saw the objection from the first.
+        assert "add tests" in stub.tasks[2]
+    finally:
+        fleet.close()
+
+
+def test_a_cycle_without_a_stop_condition_uses_every_round(tmp_path):
+    stub = ScriptedExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        with pytest.warns(UserWarning, match="No stop condition"):
+            report = fleet.run_workflow({
+                "max_iterations": 3,
+                "graph": {"a": {"task": "t", "needs": ["b"], "gpus": 0},
+                          "b": {"task": "t", "needs": ["a"], "gpus": 0}},
+            })
+        assert len(stub.calls) == 6              # two nodes, three rounds
+        assert all(not o.stopped_early for o in report.outcomes)
+    finally:
+        fleet.close()
+
+
+def test_a_self_dependency_repeats_one_node(tmp_path):
+    stub = ScriptedExecutor({"tune": ["0.9", "0.4"]})
+    fleet = _fleet(tmp_path, stub)
+    try:
+        with pytest.warns(UserWarning):
+            fleet.run_workflow({
+                "max_iterations": 4,
+                "graph": {"tune": {"task": "tune it", "needs": ["tune"], "gpus": 0,
+                                   "until": {"output_contains": "0.4"}}},
+            })
+        assert stub.calls == ["tune", "tune-2"]
+    finally:
+        fleet.close()
+
+
+def test_a_cycle_runs_after_what_it_depends_on_and_before_what_follows(tmp_path):
+    stub = ScriptedExecutor({"review": ["APPROVED"]})
+    fleet = _fleet(tmp_path, stub)
+    try:
+        with pytest.warns(UserWarning):
+            fleet.run_workflow({
+                "graph": {
+                    "plan": {"task": "t", "gpus": 0},
+                    "implement": {"task": "t", "needs": ["plan", "review"], "gpus": 0},
+                    "review": {"task": "t", "needs": ["implement"], "gpus": 0,
+                               "until": {"output_contains": "APPROVED"}},
+                    "ship": {"task": "t", "needs": ["review"], "gpus": 0},
+                },
+            })
+        assert stub.calls == ["plan", "implement", "review", "ship"]
+    finally:
+        fleet.close()
+
+
+def test_a_predicate_can_stop_a_graph_cycle(tmp_path):
+    stub = ScriptedExecutor({"measure": ["0.42"]})
+    fleet = _fleet(tmp_path, stub)
+    try:
+        with pytest.warns(UserWarning):
+            report = fleet.run_workflow(
+                {"max_iterations": 4, "graph": {
+                    "measure": {"task": "t", "needs": ["adjust"], "gpus": 0},
+                    "adjust": {"task": "t", "needs": ["measure"], "gpus": 0}}},
+                # Keyed on the first node of the cycle, in declaration order.
+                predicates={"measure": lambda r: float(r["measure"].output or 1) < 0.5},
+            )
+        assert report.outcomes[0].stopped_early
+        assert len(stub.calls) == 2
+    finally:
+        fleet.close()
+
+
+# ------------------------------------------------------- the graph spelling
+
+
+def test_graph_nodes_use_only_the_edges_they_declare():
+    """Unlike a `stages` list, a graph node gets no implicit barrier edge."""
+    wf = Workflow.from_dict({"graph": {
+        "a": {"task": "t"},
+        "b": {"task": "t"},
+    }})
+    assert wf.graph() == {"a": set(), "b": set()}
+    assert wf.levels() == [["a", "b"]], "independent graph nodes run together"
+
+
+def test_stages_and_graph_can_be_combined():
+    wf = Workflow.from_dict({
+        "stages": [{"name": "setup", "task": "t"}],
+        "graph": {
+            "left": {"task": "t", "needs": ["setup"]},
+            "right": {"task": "t", "needs": ["setup"]},
+        },
+    })
+    assert wf.levels() == [["setup"], ["left", "right"]]
+
+
+def test_a_graph_node_can_hold_a_loop():
+    wf = Workflow.from_dict({"graph": {
+        "prep": {"task": "t"},
+        "cycle": {"needs": ["prep"], "loop": {"steps": [{"name": "s", "task": "t"}]}},
+    }})
+    assert wf.levels() == [["prep"], ["cycle"]]
+    assert isinstance({st.name: st for st in wf.stages}["cycle"], Loop)
+
+
+# --------------------------------------------------------- parallel execution
+
+
+def test_independent_stages_run_at_the_same_time(tmp_path):
+    stub = ScriptedExecutor(delay=0.4)
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({"stages": [
+            {"name": "plan", "task": "t", "gpus": 0},
+            {"name": "left", "task": "t", "needs": ["plan"], "gpus": 0},
+            {"name": "right", "task": "t", "needs": ["plan"], "gpus": 0},
+        ]})
+        left, right = stub.spans["left"], stub.spans["right"]
+        assert left[0] < right[1] and right[0] < left[1], "the siblings should overlap"
+    finally:
+        fleet.close()
+
+
+def test_a_dependent_stage_waits_for_its_dependency(tmp_path):
+    stub = ScriptedExecutor(delay=0.2)
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({"stages": [
+            {"name": "first", "task": "t", "gpus": 0},
+            {"name": "second", "task": "t", "needs": ["first"], "gpus": 0},
+        ]})
+        assert stub.spans["first"][1] <= stub.spans["second"][0]
+    finally:
+        fleet.close()
+
+
+def test_outcomes_are_reported_in_declaration_order(tmp_path):
+    stub = ScriptedExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        report = fleet.run_workflow({"stages": [
+            {"name": "plan", "task": "t", "gpus": 0},
+            {"name": "left", "task": "t", "needs": ["plan"], "gpus": 0},
+            {"name": "right", "task": "t", "needs": ["plan"], "gpus": 0},
+        ]})
+        assert [o.stage for o in report.outcomes] == ["plan", "left", "right"]
+    finally:
+        fleet.close()
+
+
+def test_a_loop_can_depend_on_an_earlier_stage(tmp_path):
+    stub = ScriptedExecutor({"review": ["APPROVED"]})
+    fleet = _fleet(tmp_path, stub)
+    try:
+        report = fleet.run_workflow({"stages": [
+            {"name": "plan", "task": "t", "gpus": 0},
+            {"name": "cycle", "needs": ["plan"], "loop": {
+                "max_iterations": 2,
+                "until": {"step": "review", "output_contains": "APPROVED"},
+                "steps": [{"name": "review", "task": "t", "gpus": 0}]}},
+        ]})
+        assert stub.calls[0] == "plan"
+        assert report.outcomes[1].stopped_early
     finally:
         fleet.close()

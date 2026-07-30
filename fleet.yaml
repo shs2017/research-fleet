@@ -7,6 +7,8 @@
 # Container configuration (base image, CUDA, torch, model cache, mounts) is NOT
 # here: it lives in this project's .ship.conf and is owned by research-ship.
 
+# The ledger, results and the cross-run usage table live here. Point several projects
+# at one root to see their combined spend in `fleet usage`.
 root: ~/.research-fleet
 workspace: .
 # Give every agent job its own git worktree and branch, so an agent's mistakes cost a

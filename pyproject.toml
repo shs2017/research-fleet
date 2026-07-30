@@ -30,3 +30,4 @@ packages = ["src/research_fleet"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["slow: builds an environment; deselect with -m 'not slow'"]
