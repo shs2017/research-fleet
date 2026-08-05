@@ -1,26 +1,7 @@
-"""The scheduler: dependency graph, GPU slots, budgets, and the audit trail.
+"""Schedule jobs across GPU slots with policy, budgets, and an audit trail.
 
-Design notes worth reading before changing anything here:
-
-**GPU slots.** Devices are handed out by UUID from a free pool. Fractional
-requests (`gpus: 0.5`) pack multiple jobs onto one device by tracking remaining
-capacity per UUID, which is how you oversubscribe a single card with several
-small agents without them fighting over memory blindly.
-
-**Agent → child submission goes through a spool directory, not a socket.**
-Each agent job gets `<root>/spool/<job_id>/` mounted read-write at
-`/workspace/.fleet/submit`. To launch work, the agent writes a JSON file there
-(the `fleet` CLI inside the image does this for it). The scheduler picks it up,
-runs it through the *same* policy and budget path as any other job, and records
-the submission in the ledger with the parent's id.
-
-That choice is deliberate: it keeps `network.mode=none` viable for agent
-containers, gives every child a durable, inspectable provenance record, and
-means a compromised agent gets a queue slot rather than a control channel.
-
-**Budgets are hierarchical.** A run opens a root scope; each agent job opens a
-child scope carved from its parent's remaining balance. A sub-agent physically
-cannot spend money its parent doesn't have.
+Agents submit child jobs through per-job spool directories. Every child returns through
+the normal validation path and receives a budget scope bounded by its parent.
 """
 
 from __future__ import annotations
@@ -172,8 +153,6 @@ class Scheduler:
             run_id=self.run_id,
         )
 
-    # ------------------------------------------------------------- submission
-
     def submit(self, spec: JobSpec, *, parent: JobRecord | None = None) -> JobRecord:
         spec.run_id = self.run_id
         depth = (parent.depth + 1) if parent else 0
@@ -265,8 +244,6 @@ class Scheduler:
         rec.result = JobResult(job_id=rec.spec.id, state=JobState.DENIED, error="; ".join(decision.reasons))
         self._set_state(rec, JobState.DENIED, {"reasons": decision.reasons})
 
-    # -------------------------------------------------------------- execution
-
     def _estimate(self, spec: JobSpec):
         if spec.kind is not JobKind.AGENT or spec.agent is None:
             return None
@@ -278,8 +255,6 @@ class Scheduler:
             model,
             effort=spec.labels.get("effort", self.config.budget.default_effort),
             process=process,
-            # History beats the profile: reserving a wildly high figure refuses jobs
-            # that would never have cost that much.
             observed=self.ledger.observed_cost(model),
         )
 
@@ -288,9 +263,10 @@ class Scheduler:
         deps = list(rec.spec.depends_on)
         while deps and not self._stop.is_set():
             pending = []
+            with self._lock:
+                records = {dep: self._jobs.get(dep) for dep in deps}
             for dep in deps:
-                with self._lock:
-                    d = self._jobs.get(dep)
+                d = records[dep]
                 if d is None:
                     pending.append(dep)
                 elif d.state is JobState.SUCCEEDED:
@@ -321,12 +297,12 @@ class Scheduler:
             placement = Placement(node="local", gpu_ids=gpu_ids)
             self._set_state(rec, JobState.RUNNING, {"gpu_ids": list(gpu_ids), "argv_preview": argv[:2]})
 
-            backend = get_backend(spec.agent.backend) if spec.agent else None
-            handler = self._make_line_handler(rec, backend)
-
             result = self.executor.run(
                 spec, argv=argv, env=env, placement=placement,
-                policy=self.policy, on_line=handler,
+                policy=self.policy,
+                on_line=self._make_line_handler(
+                    rec, get_backend(spec.agent.backend) if spec.agent else None
+                ),
             )
 
             if spec.kind is JobKind.AGENT:
@@ -336,8 +312,6 @@ class Scheduler:
             result.output = rec.output or "\n".join(rec.tail)
             result.agent_seconds = rec.agent_seconds
 
-            # A cancelled job's container exits non-zero because we stopped it. Reporting
-            # that as a failure would hide the fact that the operator asked for it.
             if rec.state is JobState.CANCELLED:
                 result.state = JobState.CANCELLED
                 result.error = rec.result.error if rec.result else "cancelled"
@@ -363,14 +337,7 @@ class Scheduler:
             self._write_result_files(rec)
 
     def _write_result_files(self, rec: JobRecord) -> None:
-        """Land a job's own record in its results directory.
-
-        The ledger is the source of truth, but it is one append-only file for the
-        whole root and every CLI view truncates it. A job that produced no artifacts
-        of its own would otherwise leave an empty directory, so write the answer and
-        the outcome next to whatever the job wrote itself. Best-effort: a failure
-        here must not change the job's result.
-        """
+        """Write a best-effort result summary beside the job's artifacts."""
         if rec.stream_log is not None:
             try:
                 rec.stream_log.close()
@@ -401,16 +368,12 @@ class Scheduler:
         env["FLEET_RUN_ID"] = self.run_id
         env["FLEET_JOB_ID"] = spec.id
 
-        # Fleet-owned mounts, added after the policy check: they live under
-        # `root` and are what the mount allowlist is defined in terms of.
-        # Anything user- or agent-supplied went through policy.check at submit.
+        # Fleet mounts are trusted because they are added after policy validation.
         results_dir = self.config.results_path / self.run_id / spec.id
         results_dir.mkdir(parents=True, exist_ok=True)
         spec.mounts.append(Mount(source=str(results_dir), target="/results", mode="rw"))
         env["FLEET_RESULTS_DIR"] = "/results"
         rec.results_dir = results_dir
-        # Opened before the job starts and written as lines arrive, so a job that
-        # crashes halfway still leaves the transcript up to the failure on disk.
         rec.stream_log = (results_dir / "stream.log").open("w", buffering=1)
 
         if spec.kind is JobKind.COMMAND:
@@ -419,11 +382,9 @@ class Scheduler:
         assert spec.agent is not None
         backend = get_backend(spec.agent.backend)
 
-        # Secrets: forward by name only. Empty value = inherit from the daemon env.
         for key in set(backend.required_env()) | set(self.config.agent.passthrough_env):
             env.setdefault(key, "")
 
-        # Sub-allocate this agent's budget from its parent's remaining balance.
         parent_scope = rec.budget_scope
         parent_node = self.budget.get(parent_scope)
         frac = self.config.budget.max_child_grant_fraction
@@ -432,8 +393,7 @@ class Scheduler:
             min(self.policy.max_tokens_per_job, parent_node.remaining_tokens * frac + rec.reserved_tokens)
         )
         child_scope = f"{spec.id}"
-        # The job's own reservation is folded into its scope, so release it first
-        # to avoid charging the parent twice for the same work.
+        # Move the reservation into the child scope instead of charging it twice.
         self.budget.release(parent_scope, usd=rec.reserved_usd, tokens=rec.reserved_tokens)
         rec.reserved_usd = rec.reserved_tokens = 0
         try:
@@ -449,9 +409,7 @@ class Scheduler:
         rec.owns_scope = True
         node = self.budget.get(child_scope)
 
-        # Mounted at /spool rather than under /workspace: nesting a mount inside
-        # research-ship's project bind mount would shadow a real directory in the
-        # user's repo and leave a stray .fleet/ behind on the host.
+        # Keep the spool outside /workspace so it cannot shadow project files.
         spool_dir = self._spool_root / spec.id
         spool_dir.mkdir(parents=True, exist_ok=True)
         spec.mounts.append(Mount(source=str(spool_dir), target="/spool", mode="rw"))
@@ -524,8 +482,6 @@ class Scheduler:
             )
         return "\n".join(parts)
 
-    # ---------------------------------------------------------------- streams
-
     def _make_line_handler(self, rec: JobRecord, backend) -> Callable[[str, str], None]:
         spec_id = rec.spec.id
 
@@ -534,14 +490,10 @@ class Scheduler:
                 try:
                     rec.stream_log.write(f"{stream}\t{line}\n")
                 except (ValueError, OSError):
-                    # A full disk or a closed handle must not take the job down;
-                    # the ledger is still the authoritative record.
                     pass
 
             if backend is None:
                 if stream == "stdout" and line.strip():
-                    # A command job's output is its last few lines; enough for a
-                    # workflow to branch on without holding a whole training log.
                     rec.tail = (rec.tail + [line])[-20:]
                 self.ledger.append(
                     "job.output", {"stream": stream, "line": line},
@@ -563,13 +515,9 @@ class Scheduler:
             if event.usage is not None:
                 with self._lock:
                     rec.usage = rec.usage.merge(event.usage)
-            # The harness's `result` event carries the agent's answer, which is what a
-            # later step wants to read.
             if event.type == "result":
                 if event.text:
                     rec.output = event.text
-                # Wall clock includes pulling the image and starting the container;
-                # this is the part the harness itself was busy for.
                 reported = event.payload.get("duration_ms")
                 if reported:
                     rec.agent_seconds = float(reported) / 1000.0
@@ -588,8 +536,6 @@ class Scheduler:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------- spool intake
-
     def _drain_spool(self, parent: JobRecord, spool_dir: Path) -> list[JobRecord]:
         """Ingest child job requests an agent wrote to its spool directory."""
         submitted: list[JobRecord] = []
@@ -605,8 +551,7 @@ class Scheduler:
                 payload.pop("id", None)
                 payload.pop("run_id", None)
                 payload.pop("parent_job_id", None)
-                # An agent cannot pick its own image: that would let it escape the
-                # ship the operator configured for this project.
+                # Child jobs cannot replace the operator-selected image.
                 payload["image"] = self.config.image
                 child = JobSpec(**payload)
             except Exception as exc:
@@ -636,8 +581,6 @@ class Scheduler:
             pass
         self.ledger.append("agent.job_rejected", {"file": path.name, "reason": reason}, run_id=self.run_id)
 
-    # ---------------------------------------------------------------- budget
-
     def _maybe_close_scope(self, rec: JobRecord) -> None:
         """Return an agent's unused grant to its parent: but only once every
         descendant is terminal, so a still-running child stays bounded by the
@@ -645,8 +588,6 @@ class Scheduler:
         if not rec.state.terminal:
             return
         if not rec.owns_scope:
-            # Nothing of our own to close, but our finishing may be what the
-            # parent's scope was waiting on.
             self._close_parent_scope(rec)
             return
         with self._lock:
@@ -694,8 +635,6 @@ class Scheduler:
             run_id=self.run_id, job_id=rec.spec.id,
         )
 
-    # ----------------------------------------------------------------- state
-
     def _set_state(self, rec: JobRecord, state: JobState, extra: dict | None = None) -> None:
         rec.state = state
         self.ledger.append(
@@ -704,8 +643,6 @@ class Scheduler:
         )
         self.ledger.upsert_job(rec.spec, state.value, rec.result)
         self._emit(f"job.{state.value}", {"job_id": rec.spec.id, "name": rec.spec.name})
-
-    # -------------------------------------------------------------- lifecycle
 
     def wait(self, timeout: float | None = None) -> dict[str, JobResult]:
         """Block until every job (including ones agents spawned) is terminal.
@@ -788,12 +725,7 @@ class Scheduler:
         }
 
     def close(self) -> None:
-        """Stop everything, promptly.
-
-        Containers are stopped before the pool is drained. The other order looks
-        tidier but makes Ctrl-C hang: the pool waits for jobs that are still running,
-        and nothing has told them to stop yet.
-        """
+        """Stop executors before waiting for their worker threads."""
         self._stop.set()
         self.executor.close()
         self._pool.shutdown(wait=True, cancel_futures=True)

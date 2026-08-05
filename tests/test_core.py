@@ -493,6 +493,21 @@ def test_policy_reserves_the_estimate_when_it_allows_a_job():
     assert b.get("run").reserved_usd == pytest.approx(est.est_cost_usd)
 
 
+def test_policy_does_not_reserve_budget_for_an_invalid_job(tmp_path):
+    budget = BudgetTracker()
+    budget.open("run", max_usd=100.0, max_tokens=100_000_000)
+    policy = Policy(allowed_mount_roots=[str(tmp_path)])
+    spec = _agent_spec(mounts=[Mount(source="/etc", target="/etc")])
+
+    decision = policy.check(
+        spec, budget=budget, budget_scope="run",
+        estimate=quote("claude-haiku-4-5", process="agent_short"),
+    )
+
+    assert decision.verdict == "deny"
+    assert budget.get("run").reserved_usd == 0
+
+
 def test_policy_denies_a_mount_path_it_cannot_resolve(tmp_path):
     """An agent-submitted spec can carry a path that is not resolvable at all."""
     p = Policy(allowed_mount_roots=[str(tmp_path)], fail_closed=True)

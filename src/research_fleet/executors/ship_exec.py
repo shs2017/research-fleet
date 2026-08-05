@@ -1,22 +1,7 @@
-"""Ship executor: runs jobs in research-ship containers.
-
-research-fleet does not define what a GPU container looks like. `research-ship`
-does: base image, CUDA, the uv-managed venv, the model cache volumes, the
-non-root user, the egress firewall. This executor asks it for the resolved
-`docker run` argv (`ship docker-args`), appends the fleet's own per-job
-hardening, and owns the process from there: streaming output, enforcing the
-timeout, and stopping the container on cancel.
-
-Keeping container configuration in one place matters more than it sounds: the
-alternative is two tools that each think they know the right mount layout, and
-they drift the first time either changes.
-
-Requires `ship` on PATH: see https://github.com/<you>/research-ship.
-"""
+"""Run jobs in research-ship containers with fleet resource limits."""
 
 from __future__ import annotations
 
-import collections
 import os
 import re
 import shutil
@@ -28,16 +13,13 @@ from pathlib import Path
 
 from ..policy import Policy
 from ..spec import JobKind, JobResult, JobSpec, JobState
-from .base import LineHandler, Placement
+from .base import LineHandler, Placement, run_process
 
 
 class ShipUnavailable(RuntimeError):
     pass
 
 
-# What `resolve_worktree()` in `ship` prints on stderr once it isolates a job, so a
-# result can say where the work actually landed instead of that line vanishing with
-# the rest of `ship docker-args`' stderr.
 _WORKTREE_RE = re.compile(r"^\[ship\] isolated in worktree (\S+) on branch (\S+)$", re.MULTILINE)
 
 
@@ -49,8 +31,6 @@ def _explain(code: int | None, stderr_tail) -> str:
     )
     hint = ""
     if code == 125:
-        # The daemon refused to start the container at all, which is nearly always a
-        # missing image.
         hint = " (docker could not start the container; is the image built? `ship build`)"
     elif code == 127:
         hint = " (command not found inside the container)"
@@ -79,8 +59,6 @@ class ShipExecutor:
                 "`ship` script somewhere on your PATH."
             )
 
-    # ------------------------------------------------------------- discovery
-
     def available_gpus(self) -> list[str]:
         """GPU UUIDs on this host, in index order."""
         try:
@@ -94,7 +72,6 @@ class ShipExecutor:
 
     def preflight(self, policy: Policy, image: str = "") -> None:
         """Ensure ship's project environment exists before submitting anything."""
-        # Honour a configured image override, or ship's default for the project.
         spec = JobSpec(name="preflight", command=["true"], image=image)
         argv = self.build_argv(
             spec, argv=["true"], env={}, placement=Placement(gpu_ids=()),
@@ -104,9 +81,6 @@ class ShipExecutor:
         if resolved_image is None or self._image_exists(resolved_image):
             return
 
-        # An explicit image belongs to the caller; do not silently build a different
-        # one. The default image, however, is entirely derived by ship and is safe to
-        # initialise and build on demand.
         if image:
             raise ShipUnavailable(
                 f"configured image {resolved_image!r} does not exist. Build or pull it, or remove "
@@ -165,11 +139,7 @@ class ShipExecutor:
         return None
 
     def credentials_present(self, policy: Policy, image: str = "") -> bool | None:
-        """True, False, or None when it cannot be determined.
-
-        Agent jobs fail one by one with "Not logged in" otherwise, which costs a run and
-        tells the operator nothing about how to fix it.
-        """
+        """Return whether credentials exist, or None when this cannot be determined."""
         volume = self.credential_volume(policy, image)
         if volume is None:
             return None
@@ -196,8 +166,6 @@ class ShipExecutor:
                 return argv[i - 1] if i else None
         return None
 
-    # -------------------------------------------------------------- argv build
-
     def _ship_flags(
         self, spec: JobSpec, env: dict[str, str], placement: Placement, policy: Policy, name: str
     ) -> list[str]:
@@ -205,29 +173,18 @@ class ShipExecutor:
         if spec.image:
             flags += ["--image", spec.image]
 
-        # research-ship withholds credentials unless asked. Only agent jobs need them;
-        # a training run or a sweep point has no use for an API token, and every
-        # container that holds one is another place it can leak from.
         flags += ["--creds"] if spec.kind is JobKind.AGENT else ["--no-creds"]
 
-        # research-ship checks out a git worktree on this branch, so the job cannot
-        # touch the live working tree. The branch is derived from the job, so parallel
-        # agents on one question each land on their own reviewable branch.
         if spec.isolate:
             flags += ["--worktree", f"fleet/{spec.run_id}-{spec.name}"[:80]]
             if spec.worktree_base:
-                # Same derivation as above, applied to the job this one continues from,
-                # so a chain of steps (plan -> implement -> review) keeps each other's
-                # file edits without sharing a single branch.
                 flags += ["--worktree-base", f"fleet/{spec.run_id}-{spec.worktree_base}"[:80]]
 
         if placement.gpu_ids:
-            # Quoted form is what Docker's --gpus parser expects for a device list.
             flags += ["--gpus", f'"device={",".join(placement.gpu_ids)}"']
         else:
             flags += ["--gpus", "0"]
 
-        # The fleet's network policy maps onto research-ship's egress allowlist.
         mode = policy.network.mode
         if mode == "none":
             flags += ["--network", "none", "--no-firewall"]
@@ -239,8 +196,6 @@ class ShipExecutor:
         for m in spec.mounts:
             flags += ["--mount", m.to_docker_arg()]
         for key, value in env.items():
-            # A bare KEY inherits from the daemon environment, so a secret never
-            # lands in the argv we are about to write to the audit ledger.
             flags += ["--env", key if value == "" else f"{key}={value}"]
 
         flags += ["--label", f"fleet.job={spec.id}", "--label", f"fleet.run={spec.run_id}"]
@@ -269,15 +224,31 @@ class ShipExecutor:
         if len(tokens) < 2 or tokens[0] != "docker":
             raise ShipUnavailable(f"unexpected output from ship docker-args: {out[:200]!r}")
 
-        # Insert the fleet's resource ceilings after `docker run`. These are the
-        # limits research-ship has no opinion about, because they are a scheduling
-        # concern rather than an environment one.
         limits = [
             "--cpus", str(spec.resources.cpus),
             "--memory", f"{int(spec.resources.memory_gb * 1024)}m",
             *policy.container.docker_args(),
         ]
         return [self.docker, "run", *limits, *tokens[2:]]
+
+    def _docker_argv(
+        self,
+        spec: JobSpec,
+        *,
+        argv: list[str],
+        env: dict[str, str],
+        placement: Placement,
+        policy: Policy,
+        name: str,
+    ) -> tuple[list[str], str]:
+        proc = self._resolve_docker_args(
+            spec, argv=argv, env=env, placement=placement, policy=policy, name=name
+        )
+        if proc.returncode:
+            raise ShipUnavailable(
+                f"`ship docker-args` failed ({proc.returncode}): {proc.stderr.strip()}"
+            )
+        return self._finish_argv(spec, policy, proc.stdout), proc.stderr
 
     def build_argv(
         self,
@@ -290,16 +261,10 @@ class ShipExecutor:
         name: str,
     ) -> list[str]:
         """Ask research-ship for the container argv, then layer the fleet's limits on."""
-        proc = self._resolve_docker_args(
+        docker_argv, _ = self._docker_argv(
             spec, argv=argv, env=env, placement=placement, policy=policy, name=name
         )
-        if proc.returncode != 0:
-            raise ShipUnavailable(
-                f"`ship docker-args` failed ({proc.returncode}): {proc.stderr.strip()}"
-            )
-        return self._finish_argv(spec, policy, proc.stdout)
-
-    # ------------------------------------------------------------------- run
+        return docker_argv
 
     def run(
         self,
@@ -319,14 +284,9 @@ class ShipExecutor:
         )
 
         try:
-            resolve_proc = self._resolve_docker_args(
+            docker_argv, ship_stderr = self._docker_argv(
                 spec, argv=argv, env=env, placement=placement, policy=policy, name=name
             )
-            if resolve_proc.returncode != 0:
-                raise ShipUnavailable(
-                    f"`ship docker-args` failed ({resolve_proc.returncode}): {resolve_proc.stderr.strip()}"
-                )
-            docker_argv = self._finish_argv(spec, policy, resolve_proc.stdout)
         except ShipUnavailable as exc:
             result.state = JobState.FAILED
             result.error = str(exc)
@@ -334,83 +294,45 @@ class ShipExecutor:
             return result
 
         if spec.isolate:
-            match = _WORKTREE_RE.search(resolve_proc.stderr)
+            match = _WORKTREE_RE.search(ship_stderr)
             if match:
                 result.worktree_path, result.worktree_branch = match.group(1), match.group(2)
 
-        # Secret-bearing vars reach the daemon through the subprocess environment,
-        # never through the command line.
         child_env = dict(os.environ)
         for key, value in env.items():
             if value == "":
                 child_env.setdefault(key, os.environ.get(key, ""))
 
+        def register(proc: subprocess.Popen) -> None:
+            with self._lock:
+                self._procs[spec.id] = proc
+
         try:
-            proc = subprocess.Popen(
-                docker_argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, bufsize=1, env=child_env,
+            outcome = run_process(
+                docker_argv, env=child_env, timeout_s=spec.timeout_s, on_line=on_line,
+                on_start=register, on_timeout=lambda: self._stop_container(name),
+                stderr_tail_size=12,
             )
         except OSError as exc:
             result.state = JobState.FAILED
             result.error = f"failed to start container: {exc}"
             result.ended_at = time.time()
             return result
-
-        with self._lock:
-            self._procs[spec.id] = proc
-
-        # Kept so a failure can say why, instead of only reporting an exit code.
-        stderr_tail: collections.deque[str] = collections.deque(maxlen=12)
-
-        def pump(stream, label: str) -> None:
-            try:
-                for line in iter(stream.readline, ""):
-                    text = line.rstrip("\n")
-                    if label == "stderr" and text.strip():
-                        stderr_tail.append(text.strip())
-                    on_line(label, text)
-            finally:
-                stream.close()
-
-        threads = [
-            threading.Thread(target=pump, args=(proc.stdout, "stdout"), daemon=True),
-            threading.Thread(target=pump, args=(proc.stderr, "stderr"), daemon=True),
-        ]
-        for t in threads:
-            t.start()
-
-        timed_out = False
-        try:
-            proc.wait(timeout=spec.timeout_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            self._stop_container(name)
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-
-        for t in threads:
-            t.join(timeout=10)
         with self._lock:
             self._procs.pop(spec.id, None)
 
-        result.exit_code = proc.returncode
+        result.exit_code = outcome.exit_code
         result.ended_at = time.time()
-        if timed_out:
+        if outcome.timed_out:
             result.state = JobState.FAILED
             result.error = f"timed out after {spec.timeout_s}s"
-        elif proc.returncode == 0:
+        elif outcome.exit_code == 0:
             result.state = JobState.SUCCEEDED
         else:
             result.state = JobState.FAILED
-            result.error = _explain(proc.returncode, stderr_tail)
+            result.error = _explain(outcome.exit_code, outcome.stderr_tail)
         return result
 
-    # ------------------------------------------------------------- lifecycle
-
-    # A cancelled job does not need a long grace period; the operator asked for it to
-    # stop now. A timeout is different: there the container may be mid-write.
     CANCEL_GRACE_S = 5
 
     def _stop_container(self, name: str, timeout: int = 20) -> None:
@@ -432,10 +354,7 @@ class ShipExecutor:
         return False
 
     def drop_worktree(self, branch: str) -> None:
-        """Ask ship to discard an isolated job's worktree/branch. Fire-and-forget:
-        the branch's content is either already folded into something else's history
-        or was never needed again, so a failure here just leaves disk unreclaimed
-        rather than losing anything."""
+        """Ask ship to discard an isolated worktree and branch."""
         subprocess.run(
             [self.ship, "worktree-drop", branch],
             capture_output=True, text=True, timeout=30, env=self._ship_env(), check=False,

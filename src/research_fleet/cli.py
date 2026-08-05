@@ -190,14 +190,11 @@ def run(
         _detach_and_return(config)
         return
 
-    fleet = _fleet(
-        config,
-        **_overrides(workspace, image, executor, max_usd),
-        on_event=_live_printer(verbose),
-        run_id=run_id,
-    )
-    _cancel_on_interrupt(fleet)
-    try:
+    with _fleet(
+        config, **_overrides(workspace, image, executor, max_usd),
+        on_event=_live_printer(verbose), run_id=run_id,
+    ) as fleet:
+        _cancel_on_interrupt(fleet)
         est = fleet.quote(model, effort=effort or fleet.config.budget.default_effort)
         share, note = _gpu_share(gpus, agents, fleet.scheduler.slots.device_count)
         cpu_share, cpu_note = _cpu_share(cpus, agents)
@@ -221,8 +218,6 @@ def run(
         console.print()
         console.print(report.summary())
         raise typer.Exit(0 if not report.failed else 1)
-    finally:
-        fleet.close()
 
 
 @app.command()
@@ -238,21 +233,16 @@ def sweep(
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
     """Run a hyperparameter sweep across the available GPUs. No LLM involved."""
-    fleet = _fleet(
-        config,
-        **_overrides(workspace, image, executor),
-        on_event=_live_printer(verbose),
-    )
-    _cancel_on_interrupt(fleet)
-    try:
+    with _fleet(
+        config, **_overrides(workspace, image, executor), on_event=_live_printer(verbose),
+    ) as fleet:
+        _cancel_on_interrupt(fleet)
         parsed = parse_grid_args(grid)
         recs = fleet.run_sweep(command, parsed, gpus=gpus, timeout_s=timeout)
         console.print(f"[bold]run {fleet.run_id}[/bold]  {len(recs)} points")
         report = fleet.wait()
         console.print(report.summary())
         raise typer.Exit(0 if not report.failed else 1)
-    finally:
-        fleet.close()
 
 
 @app.command()
@@ -309,13 +299,11 @@ def workflow(
                     console.print(f"    {name} ({stage.kind.value}){fan}{after}")
         return
 
-    fleet = _fleet(
-        config,
-        **_overrides(workspace, None, executor, max_usd),
+    with _fleet(
+        config, **_overrides(workspace, None, executor, max_usd),
         on_event=_live_printer(verbose),
-    )
-    _cancel_on_interrupt(fleet)
-    try:
+    ) as fleet:
+        _cancel_on_interrupt(fleet)
         console.print(f"[bold]run {fleet.run_id}[/bold]  workflow {wf.name}")
         try:
             report = fleet.run_workflow(wf)
@@ -324,8 +312,6 @@ def workflow(
         console.print()
         console.print(report.summary())
         raise typer.Exit(0 if not report.run.failed else 1)
-    finally:
-        fleet.close()
 
 
 @app.command()
@@ -354,14 +340,11 @@ def submit(
         )
         return
 
-    fleet = _fleet(config)
-    try:
+    with _fleet(config) as fleet:
         rec = fleet.submit(JobSpec(**payload))
         console.print(f"{rec.spec.id}  {rec.state.value}")
         report = fleet.wait()
         console.print(report.summary())
-    finally:
-        fleet.close()
 
 
 @app.command()
@@ -633,17 +616,16 @@ def usage(
 def runs(config: Optional[str] = typer.Option(None, "--config", "-c")):
     """List past runs."""
     cfg = load_config(config)
-    ledger = Ledger(cfg.root_path)
-    table = Table(title="runs")
-    for col in ("run_id", "jobs", "ok", "failed", "started"):
-        table.add_column(col)
-    for r in ledger.runs():
-        table.add_row(
-            r["run_id"], str(r["jobs"]), str(r["succeeded"]), str(r["failed"]),
-            time.strftime("%Y-%m-%d %H:%M", time.localtime(r["started_at"] or 0)),
-        )
-    console.print(table)
-    ledger.close()
+    with Ledger(cfg.root_path) as ledger:
+        table = Table(title="runs")
+        for col in ("run_id", "jobs", "ok", "failed", "started"):
+            table.add_column(col)
+        for r in ledger.runs():
+            table.add_row(
+                r["run_id"], str(r["jobs"]), str(r["succeeded"]), str(r["failed"]),
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(r["started_at"] or 0)),
+            )
+        console.print(table)
 
 
 @app.command("ls")
@@ -653,16 +635,17 @@ def list_jobs(
 ):
     """List jobs, optionally filtered to one run."""
     cfg = load_config(config)
-    ledger = Ledger(cfg.root_path)
-    table = Table(title=f"jobs{f' in {run_id}' if run_id else ''}")
-    for col in ("job_id", "name", "kind", "state", "parent"):
-        table.add_column(col)
-    for j in ledger.jobs(run_id):
-        colour = {"succeeded": "green", "failed": "red", "denied": "red"}.get(j["state"], "yellow")
-        table.add_row(j["job_id"], j["name"], j["kind"],
-                      f"[{colour}]{j['state']}[/{colour}]", j["parent"] or "-")
-    console.print(table)
-    ledger.close()
+    with Ledger(cfg.root_path) as ledger:
+        table = Table(title=f"jobs{f' in {run_id}' if run_id else ''}")
+        for col in ("job_id", "name", "kind", "state", "parent"):
+            table.add_column(col)
+        for j in ledger.jobs(run_id):
+            colour = {"succeeded": "green", "failed": "red", "denied": "red"}.get(
+                j["state"], "yellow"
+            )
+            table.add_row(j["job_id"], j["name"], j["kind"],
+                          f"[{colour}]{j['state']}[/{colour}]", j["parent"] or "-")
+        console.print(table)
 
 
 @app.command()
@@ -675,43 +658,42 @@ def trace(
 ):
     """Replay one job's full reasoning and tool trace from the ledger."""
     cfg = load_config(config)
-    ledger = Ledger(cfg.root_path)
     wanted = types.split(",") if types else None
-    for ev in ledger.events(job_id=job_id, types=wanted, limit=limit):
-        if raw:
-            print(ev.to_json())
-            continue
-        ts = time.strftime("%H:%M:%S", time.localtime(ev.ts))
-        if ev.type == "job.output":
-            stream = ev.payload.get("stream", "stdout")
-            style = "red" if stream == "stderr" else "white"
-            console.print(f"[dim]{ts}[/dim] [{style}]{ev.payload.get('line', '')}[/{style}]")
-        elif ev.type == "agent.message":
-            console.print(f"[dim]{ts}[/dim] [bold]agent[/bold]: {ev.payload.get('text', '')}")
-        elif ev.type == "agent.tool_use":
-            console.print(f"[dim]{ts}[/dim] [cyan]tool[/cyan] {ev.payload.get('tool')}")
-            console.print(JSON.from_data(ev.payload.get("payload", {})), style="dim")
-        elif ev.type == "agent.tool_result":
-            console.print(f"[dim]{ts}[/dim] [magenta]result[/magenta]")
-            console.print(JSON.from_data(ev.payload.get("payload", {})), style="dim")
-        elif ev.type == "budget.committed":
-            u = ev.payload.get("usage", {})
-            console.print(
-                f"[dim]{ts}[/dim] [yellow]budget[/yellow] ${ev.payload.get('cost_usd', 0):.4f} "
-                f"({u.get('total_tokens', 0):,} tokens)"
-            )
-        else:
-            console.print(f"[dim]{ts} {ev.type}[/dim] {str(ev.payload)[:300]}")
-    ledger.close()
+    with Ledger(cfg.root_path) as ledger:
+        for ev in ledger.events(job_id=job_id, types=wanted, limit=limit):
+            if raw:
+                print(ev.to_json())
+                continue
+            ts = time.strftime("%H:%M:%S", time.localtime(ev.ts))
+            if ev.type == "job.output":
+                stream = ev.payload.get("stream", "stdout")
+                style = "red" if stream == "stderr" else "white"
+                console.print(f"[dim]{ts}[/dim] [{style}]{ev.payload.get('line', '')}[/{style}]")
+            elif ev.type == "agent.message":
+                console.print(f"[dim]{ts}[/dim] [bold]agent[/bold]: {ev.payload.get('text', '')}")
+            elif ev.type == "agent.tool_use":
+                console.print(f"[dim]{ts}[/dim] [cyan]tool[/cyan] {ev.payload.get('tool')}")
+                console.print(JSON.from_data(ev.payload.get("payload", {})), style="dim")
+            elif ev.type == "agent.tool_result":
+                console.print(f"[dim]{ts}[/dim] [magenta]result[/magenta]")
+                console.print(JSON.from_data(ev.payload.get("payload", {})), style="dim")
+            elif ev.type == "budget.committed":
+                usage = ev.payload.get("usage", {})
+                console.print(
+                    f"[dim]{ts}[/dim] [yellow]budget[/yellow] "
+                    f"${ev.payload.get('cost_usd', 0):.4f} "
+                    f"({usage.get('total_tokens', 0):,} tokens)"
+                )
+            else:
+                console.print(f"[dim]{ts} {ev.type}[/dim] {str(ev.payload)[:300]}")
 
 
 @audit_app.command("verify")
 def audit_verify(config: Optional[str] = typer.Option(None, "--config", "-c")):
     """Verify the hash chain: proves the log has not been edited."""
     cfg = load_config(config)
-    ledger = Ledger(cfg.root_path)
-    ok, msg = ledger.verify()
-    ledger.close()
+    with Ledger(cfg.root_path) as ledger:
+        ok, msg = ledger.verify()
     if ok:
         console.print(f"[green]✓ audit chain intact[/green]: {msg}")
         raise typer.Exit(0)
@@ -744,9 +726,8 @@ def audit_export(
 def audit_reindex(config: Optional[str] = typer.Option(None, "--config", "-c")):
     """Rebuild the query index from the append-only JSONL."""
     cfg = load_config(config)
-    ledger = Ledger(cfg.root_path)
-    n = ledger.reindex()
-    ledger.close()
+    with Ledger(cfg.root_path) as ledger:
+        n = ledger.reindex()
     console.print(f"reindexed {n} events")
 
 
@@ -760,18 +741,17 @@ def pending(config: Optional[str] = typer.Option(None, "--config", "-c")):
     a job whose scheduler has exited cannot be resumed, only resubmitted.
     """
     cfg = load_config(config)
-    ledger = Ledger(cfg.root_path)
-    rows = [j for j in ledger.jobs() if j["state"] == "awaiting_approval"]
-    if not rows:
-        console.print("nothing awaiting approval")
-    for j in rows:
-        reasons = [
-            e.payload.get("reasons", [])
-            for e in ledger.events(job_id=j["job_id"], types=["job.awaiting_approval"])
-        ]
-        flat = [r for group in reasons for r in group]
-        console.print(f"[yellow]{j['job_id']}[/yellow]  {j['name']}  {'; '.join(flat)}")
-    ledger.close()
+    with Ledger(cfg.root_path) as ledger:
+        rows = [j for j in ledger.jobs() if j["state"] == "awaiting_approval"]
+        if not rows:
+            console.print("nothing awaiting approval")
+        for j in rows:
+            reasons = [
+                e.payload.get("reasons", [])
+                for e in ledger.events(job_id=j["job_id"], types=["job.awaiting_approval"])
+            ]
+            flat = [r for group in reasons for r in group]
+            console.print(f"[yellow]{j['job_id']}[/yellow]  {j['name']}  {'; '.join(flat)}")
 
 
 @app.command()

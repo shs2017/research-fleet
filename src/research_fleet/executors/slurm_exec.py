@@ -30,7 +30,7 @@ import time
 
 from ..policy import Policy
 from ..spec import JobResult, JobSpec, JobState
-from .base import LineHandler, Placement
+from .base import LineHandler, Placement, run_process
 
 
 class SlurmUnavailable(RuntimeError):
@@ -72,14 +72,10 @@ class SlurmExecutor:
         self._procs: dict[str, subprocess.Popen] = {}
         self._lock = threading.Lock()
 
-    # ------------------------------------------------------------- discovery
-
     def available_gpus(self) -> list[str]:
         """Placeholder slots. Slurm does the real allocation; this only bounds how
         many submissions the fleet keeps in flight."""
         return [f"slurm-slot-{i}" for i in range(self.slots)]
-
-    # -------------------------------------------------------------- argv build
 
     def job_name(self, spec: JobSpec) -> str:
         return f"fleet-{spec.id}"
@@ -121,8 +117,6 @@ class SlurmExecutor:
         inner.append(self.container_image)
         return cmd + inner + argv
 
-    # ------------------------------------------------------------------- run
-
     def run(
         self,
         spec: JobSpec,
@@ -145,65 +139,35 @@ class SlurmExecutor:
         for key, value in env.items():
             child_env[key] = value or os.environ.get(key, "")
 
+        def register(proc: subprocess.Popen) -> None:
+            with self._lock:
+                self._procs[spec.id] = proc
+
         try:
-            proc = subprocess.Popen(
-                self.build_argv(spec, argv, policy),
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, bufsize=1, env=child_env,
+            outcome = run_process(
+                self.build_argv(spec, argv, policy), env=child_env,
+                timeout_s=spec.timeout_s + 60, on_line=on_line,
+                on_start=register, on_timeout=lambda: self.cancel(spec.id),
             )
         except OSError as exc:
             result.state = JobState.FAILED
             result.error = f"failed to submit to slurm: {exc}"
             result.ended_at = time.time()
             return result
-
-        with self._lock:
-            self._procs[spec.id] = proc
-
-        def pump(stream, label: str) -> None:
-            try:
-                for line in iter(stream.readline, ""):
-                    on_line(label, line.rstrip("\n"))
-            finally:
-                stream.close()
-
-        threads = [
-            threading.Thread(target=pump, args=(proc.stdout, "stdout"), daemon=True),
-            threading.Thread(target=pump, args=(proc.stderr, "stderr"), daemon=True),
-        ]
-        for t in threads:
-            t.start()
-
-        timed_out = False
-        try:
-            # A little longer than Slurm's own limit, so its message arrives first.
-            proc.wait(timeout=spec.timeout_s + 60)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            self.cancel(spec.id)
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-
-        for t in threads:
-            t.join(timeout=10)
         with self._lock:
             self._procs.pop(spec.id, None)
 
-        result.exit_code = proc.returncode
+        result.exit_code = outcome.exit_code
         result.ended_at = time.time()
-        if timed_out:
+        if outcome.timed_out:
             result.state = JobState.FAILED
             result.error = f"timed out after {spec.timeout_s}s"
-        elif proc.returncode == 0:
+        elif outcome.exit_code == 0:
             result.state = JobState.SUCCEEDED
         else:
             result.state = JobState.FAILED
-            result.error = f"exit code {proc.returncode}"
+            result.error = f"exit code {outcome.exit_code}"
         return result
-
-    # ------------------------------------------------------------- lifecycle
 
     def cancel(self, job_id: str) -> bool:
         subprocess.run(

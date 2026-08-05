@@ -165,8 +165,6 @@ class Ledger:
         self._size = self.jsonl_path.stat().st_size if self.jsonl_path.exists() else 0
         self._specs: dict[str, dict] = {}      # scratch for reindex()
 
-    # ---------------------------------------------------------------- writing
-
     def _recover_head(self) -> tuple[int, str]:
         """Read the tail of the JSONL to resume the chain across restarts."""
         if not self.jsonl_path.exists() or self.jsonl_path.stat().st_size == 0:
@@ -225,8 +223,6 @@ class Ledger:
 
             self._seq, self._head = seq, h
             return ev
-
-    # -------------------------------------------------------- job projections
 
     def upsert_job(self, spec, state: str, result=None) -> None:
         """Maintain the queryable job table. The events remain the source of truth."""
@@ -308,8 +304,6 @@ class Ledger:
                 1 if usage.get("unpriced_model") else 0,
             ),
         )
-
-    # ---------------------------------------------------------------- reading
 
     def read_all(self) -> Iterator[Event]:
         if not self.jsonl_path.exists():
@@ -438,8 +432,6 @@ class Ledger:
         ).fetchall()
         return [r[0] for r in rows if r[0]]
 
-    # ------------------------------------------------------------------ usage
-
     USAGE_TOTALS = (
         "COUNT(*) AS jobs",
         "COALESCE(SUM(cost_usd), 0) AS cost_usd",
@@ -524,8 +516,6 @@ class Ledger:
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-    # ------------------------------------------------------------ integrity
-
     def verify(self) -> tuple[bool, str | None]:
         """Walk the chain. Returns (ok, message)."""
         prev = GENESIS_HASH
@@ -585,6 +575,12 @@ class Ledger:
     def close(self) -> None:
         with self._lock:
             self._db.close()
+
+    def __enter__(self) -> "Ledger":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
 
 
 class Redactor:

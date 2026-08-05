@@ -93,10 +93,8 @@ class JobSpec(BaseModel):
     kind: JobKind = JobKind.COMMAND
     name: str = ""
 
-    # command jobs
     command: list[str] = Field(default_factory=list)
 
-    # agent jobs
     agent: AgentConfig | None = None
 
     image: str = Field(

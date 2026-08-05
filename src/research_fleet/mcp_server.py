@@ -1,18 +1,4 @@
-"""MCP server: lets Claude Code, Codex, or any MCP client drive the fleet.
-
-Register with Claude Code:
-
-    claude mcp add research-fleet -- fleet mcp
-
-The tool surface is deliberately narrow and cost-aware. `fleet_quote` exists so
-a calling agent can price work *before* committing to it, and every launch tool
-returns the budget remaining afterwards: an agent that can't see the meter will
-either overspend or refuse to do anything useful.
-
-Long-running launches return immediately with a run id; the client polls
-`fleet_status` and reads traces with `fleet_trace`. Blocking an MCP call for an
-hour is a good way to hit a client timeout and lose the handle to a running job.
-"""
+"""Expose fleet launches, status, traces, and budgets through MCP."""
 
 from __future__ import annotations
 
@@ -120,34 +106,25 @@ def serve(config_path: Optional[str] = None) -> None:
         fleet = _get(run_id)
         if fleet is not None:
             return json.dumps(fleet.status(), indent=2, default=str)
-        ledger = Ledger(cfg.root_path)
-        try:
+        with Ledger(cfg.root_path) as ledger:
             return json.dumps({"run_id": run_id, "jobs": ledger.jobs(run_id)}, indent=2, default=str)
-        finally:
-            ledger.close()
 
     @mcp.tool()
     def fleet_trace(job_id: str, limit: int = 200) -> str:
         """Read a job's reasoning and tool-use trace from the audit ledger."""
-        ledger = Ledger(cfg.root_path)
-        try:
+        with Ledger(cfg.root_path) as ledger:
             events = ledger.events(job_id=job_id, limit=limit)
             return json.dumps(
                 [{"seq": e.seq, "type": e.type, **e.payload} for e in events],
                 indent=2, default=str,
             )
-        finally:
-            ledger.close()
 
     @mcp.tool()
     def fleet_audit_verify() -> str:
         """Verify the audit chain has not been tampered with."""
-        ledger = Ledger(cfg.root_path)
-        try:
+        with Ledger(cfg.root_path) as ledger:
             ok, msg = ledger.verify()
             return json.dumps({"intact": ok, "detail": msg}, indent=2)
-        finally:
-            ledger.close()
 
     @mcp.tool()
     def fleet_cancel(run_id: str, reason: str = "cancelled via MCP") -> str:

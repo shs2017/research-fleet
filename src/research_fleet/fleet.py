@@ -173,13 +173,9 @@ class Fleet:
         )
         self._checked_credentials = False
 
-    # ------------------------------------------------------------------ props
-
     @property
     def run_id(self) -> str:
         return self.scheduler.run_id
-
-    # --------------------------------------------------------------- submit
 
     def submit(self, spec: JobSpec) -> JobRecord:
         return self.scheduler.submit(spec)
@@ -364,8 +360,6 @@ class Fleet:
             )
         self._checked_credentials = True
 
-    # ---------------------------------------------------------------- control
-
     def wait(self, timeout: float | None = None) -> RunReport:
         results = self.scheduler.wait(timeout=timeout)
         return RunReport(self.run_id, results, self.scheduler.status())
@@ -382,8 +376,6 @@ class Fleet:
     def cancel(self, reason: str = "operator cancelled") -> int:
         """Stop every unfinished job in this run. Returns how many were stopped."""
         return self.scheduler.cancel_all(reason)
-
-    # ----------------------------------------------------------- introspection
 
     def quote(self, model: str | None = None, *, effort: str = "high", process: str = "agent_standard") -> Quote:
         """What would this cost before I run it?

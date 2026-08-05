@@ -108,21 +108,17 @@ class ContainerPolicy(BaseModel):
 class Policy(BaseModel):
     """The full safeguard surface. Serialised into the ledger at run start."""
 
-    # --- structural limits on agent recursion
     max_agent_depth: int = Field(2, ge=0, description="0 = agents may not spawn agents at all.")
     max_children_per_agent: int = Field(8, ge=0)
     max_concurrent_jobs: int = Field(16, ge=1)
 
-    # --- per-job resource ceilings
     max_gpus_per_job: float = Field(8.0, gt=0)
     max_memory_gb_per_job: float = Field(256.0, gt=0)
     max_timeout_s: int = Field(24 * 3600, gt=0)
 
-    # --- budget ceilings
     max_usd_per_job: float = Field(25.0, gt=0)
     max_tokens_per_job: int = Field(20_000_000, gt=0)
 
-    # --- filesystem
     allowed_mount_roots: list[str] = Field(default_factory=list)
     deny_mount_paths: list[str] = Field(
         default_factory=lambda: [
@@ -135,7 +131,6 @@ class Policy(BaseModel):
     container: ContainerPolicy = Field(default_factory=ContainerPolicy)
     network: NetworkPolicy = Field(default_factory=NetworkPolicy)
 
-    # --- command / tool control
     deny_command_patterns: list[str] = Field(
         default_factory=lambda: [
             r"\brm\s+-rf\s+/(?:\s|$)",
@@ -153,7 +148,6 @@ class Policy(BaseModel):
         description="Labels emitted by the checks below; matching jobs park for human approval.",
     )
 
-    # --- misc
     redact_secrets: bool = True
     fail_closed: bool = Field(
         True, description="If a check cannot be evaluated, deny rather than allow."
@@ -174,27 +168,34 @@ class Policy(BaseModel):
         gates: list[str] = []
         mutations: dict[str, Any] = {}
 
-        # ---- recursion bounds
-        if depth > self.max_agent_depth:
-            return Decision("deny", [f"agent depth {depth} exceeds max_agent_depth={self.max_agent_depth}"])
-        if spec.parent_job_id and sibling_count >= self.max_children_per_agent:
-            return Decision(
-                "deny",
-                [f"parent {spec.parent_job_id} already has {sibling_count} children "
-                 f"(max_children_per_agent={self.max_children_per_agent})"],
-            )
-
-        # ---- resources
-        r = spec.resources
-        if r.gpus > self.max_gpus_per_job:
-            return Decision("deny", [f"requested {r.gpus} GPUs > max_gpus_per_job={self.max_gpus_per_job}"])
-        if r.memory_gb > self.max_memory_gb_per_job:
-            return Decision("deny", [f"requested {r.memory_gb}GB > max_memory_gb_per_job={self.max_memory_gb_per_job}"])
+        error = self._limit_error(spec, depth, sibling_count)
+        if error:
+            return Decision("deny", [error])
         if spec.timeout_s > self.max_timeout_s:
             mutations["timeout_s"] = self.max_timeout_s
             reasons.append(f"timeout clamped {spec.timeout_s}s -> {self.max_timeout_s}s")
 
-        # ---- budget
+        mount_error, outside_rw = self._mount_error(spec, workspace_roots)
+        if mount_error:
+            return Decision("deny", [mount_error])
+        if outside_rw:
+            gates.append("mount:rw-outside-workspace")
+
+        command_error = self._command_error(spec.command)
+        if command_error:
+            return Decision("deny", [command_error])
+
+        if spec.agent is not None:
+            merged = sorted(
+                set(self.agent_default_disallowed_tools) | set(spec.agent.disallowed_tools)
+            )
+            if merged != spec.agent.disallowed_tools:
+                mutations["agent_disallowed_tools"] = merged
+                reasons.append(f"tool denylist merged from policy: {merged}")
+
+        if self.network.mode == "unrestricted":
+            gates.append("net:unrestricted")
+
         if estimate is not None:
             if estimate.est_cost_usd > self.max_usd_per_job:
                 return Decision(
@@ -218,52 +219,68 @@ class Policy(BaseModel):
                 except BudgetExceeded as exc:
                     return Decision("deny", [str(exc)])
 
-        # ---- filesystem
-        roots = [Path(p).expanduser().resolve() for p in (self.allowed_mount_roots or (workspace_roots or []))]
+        triggered = [
+            gate for gate in gates
+            if any(fnmatch.fnmatch(gate, pattern) for pattern in self.require_approval_for)
+        ]
+        if triggered:
+            reasons.extend(f"gate: {gate}" for gate in triggered)
+            return Decision("require_approval", reasons, mutations)
+        return Decision("allow", reasons, mutations)
+
+    def _limit_error(self, spec, depth: int, sibling_count: int) -> str | None:
+        if depth > self.max_agent_depth:
+            return f"agent depth {depth} exceeds max_agent_depth={self.max_agent_depth}"
+        if spec.parent_job_id and sibling_count >= self.max_children_per_agent:
+            return (
+                f"parent {spec.parent_job_id} already has {sibling_count} children "
+                f"(max_children_per_agent={self.max_children_per_agent})"
+            )
+        if spec.resources.gpus > self.max_gpus_per_job:
+            return f"requested {spec.resources.gpus} GPUs > max_gpus_per_job={self.max_gpus_per_job}"
+        if spec.resources.memory_gb > self.max_memory_gb_per_job:
+            return (
+                f"requested {spec.resources.memory_gb}GB > "
+                f"max_memory_gb_per_job={self.max_memory_gb_per_job}"
+            )
+        return None
+
+    def _mount_error(
+        self, spec, workspace_roots: list[str] | None
+    ) -> tuple[str | None, bool]:
+        roots = [
+            Path(path).expanduser().resolve()
+            for path in (self.allowed_mount_roots or workspace_roots or [])
+        ]
         denied = [Path(p).expanduser() for p in self.deny_mount_paths]
-        for m in spec.mounts:
-            src = Path(m.source).expanduser()
+        outside_rw = False
+        for mount in spec.mounts:
             try:
-                resolved = src.resolve()
+                resolved = Path(mount.source).expanduser().resolve()
             except (OSError, ValueError, RuntimeError) as exc:
                 if self.fail_closed:
-                    return Decision("deny", [f"cannot resolve mount source {m.source!r}: {exc}"])
+                    return f"cannot resolve mount source {mount.source!r}: {exc}", False
                 continue
-            for d in denied:
-                dr = d.resolve() if d.exists() else d
-                if resolved == dr or (dr in resolved.parents and dr != Path("/")):
-                    return Decision("deny", [f"mount {resolved} is under denied path {d}"])
-            if roots and not any(resolved == r or r in resolved.parents for r in roots):
+            for path in denied:
+                denied_path = path.resolve() if path.exists() else path
+                if resolved == denied_path or (
+                    denied_path != Path("/") and denied_path in resolved.parents
+                ):
+                    return f"mount {resolved} is under denied path {path}", False
+            within_roots = any(resolved == root or root in resolved.parents for root in roots)
+            if roots and not within_roots:
                 if self.fail_closed:
-                    return Decision(
-                        "deny",
-                        [f"mount {resolved} is outside allowed_mount_roots "
-                         f"({', '.join(str(r) for r in roots)})"],
+                    return (
+                        f"mount {resolved} is outside allowed_mount_roots "
+                        f"({', '.join(str(root) for root in roots)})",
+                        False,
                     )
-            if m.mode == "rw" and roots and not any(r in resolved.parents or r == resolved for r in roots):
-                gates.append("mount:rw-outside-workspace")
+                outside_rw |= mount.mode == "rw"
+        return None, outside_rw
 
-        # ---- commands
-        if spec.command:
-            joined = " ".join(spec.command)
-            for pat in self.deny_command_patterns:
-                if re.search(pat, joined):
-                    return Decision("deny", [f"command matches denied pattern {pat!r}"])
-
-        # ---- agent tools
-        if spec.agent is not None:
-            merged_deny = sorted(set(self.agent_default_disallowed_tools) | set(spec.agent.disallowed_tools))
-            if merged_deny != spec.agent.disallowed_tools:
-                mutations["agent_disallowed_tools"] = merged_deny
-                reasons.append(f"tool denylist merged from policy: {merged_deny}")
-
-        # ---- network
-        if self.network.mode == "unrestricted":
-            gates.append("net:unrestricted")
-
-        # ---- approval gates
-        triggered = [g for g in gates if any(fnmatch.fnmatch(g, p) for p in self.require_approval_for)]
-        if triggered:
-            return Decision("require_approval", reasons + [f"gate: {g}" for g in triggered], mutations)
-
-        return Decision("allow", reasons, mutations)
+    def _command_error(self, command: list[str]) -> str | None:
+        joined = " ".join(command)
+        for pattern in self.deny_command_patterns:
+            if re.search(pattern, joined):
+                return f"command matches denied pattern {pattern!r}"
+        return None

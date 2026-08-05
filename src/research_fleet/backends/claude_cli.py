@@ -61,8 +61,6 @@ class ClaudeCLIBackend:
     def required_env(self) -> list[str]:
         return ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"]
 
-    # ------------------------------------------------------------------ parse
-
     # The harness reports this for messages it generated locally, which are not billed.
     SYNTHETIC_MODEL = "<synthetic>"
 
