@@ -95,11 +95,14 @@ def test_agent_prompt_carries_budget_and_delegation_brief(tmp_path):
         fleet.wait(timeout=30)
 
         argv = stub.seen_argv[0]
-        prompt = argv[argv.index("-p") + 1]
-        assert "## Budget" in prompt
-        assert "investigate the loss spike" in prompt
-        assert "claude-haiku-4-5" in prompt          # cheaper option is offered
-        assert "$FLEET_SUBMIT_DIR" in prompt         # knows how to delegate
+        # The task is passed verbatim; the brief rides in the system prompt so a
+        # leading slash command in the task keeps working (`claude -p` only honours
+        # one at position 0).
+        assert argv[argv.index("-p") + 1] == "investigate the loss spike"
+        brief = argv[argv.index("--append-system-prompt") + 1]
+        assert "## Budget" in brief
+        assert "claude-haiku-4-5" in brief           # cheaper option is offered
+        assert "$FLEET_SUBMIT_DIR" in brief          # knows how to delegate
 
         env = stub.seen_env[0]
         assert env["FLEET_SUBMIT_DIR"] == "/spool"
@@ -116,8 +119,8 @@ def test_agent_at_max_depth_is_told_it_cannot_delegate(tmp_path):
     try:
         fleet.run_agents("do it yourself", n=1, gpus=1)
         fleet.wait(timeout=30)
-        prompt = stub.seen_argv[0][stub.seen_argv[0].index("-p") + 1]
-        assert "cannot launch sub-agents" in prompt
+        argv = stub.seen_argv[0]
+        assert "cannot launch sub-agents" in argv[argv.index("--append-system-prompt") + 1]
     finally:
         fleet.close()
 

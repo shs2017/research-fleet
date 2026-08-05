@@ -91,6 +91,10 @@ class Step(BaseModel):
     name: str
     kind: JobKind = JobKind.AGENT
     task: str = ""                          # agent steps
+    # A long prompt belongs in its own file, where it can be diffed and reused,
+    # rather than inlined in the workflow. Resolved relative to the workflow file
+    # at load time and folded into `task`, so nothing downstream sees the difference.
+    task_file: str = ""
     command: list[str] = Field(default_factory=list)   # command steps
 
     model: str | None = None
@@ -112,8 +116,10 @@ class Step(BaseModel):
 
     @model_validator(mode="after")
     def _check(self) -> Step:
+        # `task_file` is resolved into `task` by `Workflow.from_dict`, so by the time
+        # a Step exists the two are equivalent and only `task` needs checking.
         if self.kind is JobKind.AGENT and not self.task:
-            raise ValueError(f"step {self.name!r}: agent steps need a `task`")
+            raise ValueError(f"step {self.name!r}: agent steps need a `task` or `task_file`")
         if self.kind is JobKind.COMMAND and not self.command:
             raise ValueError(f"step {self.name!r}: command steps need a `command`")
         if self.for_each and self.copies > 1:
@@ -335,11 +341,36 @@ class Workflow(BaseModel):
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> Workflow:
-        raw = yaml.safe_load(Path(path).expanduser().read_text(encoding="utf-8")) or {}
-        return cls.from_dict(raw)
+        p = Path(path).expanduser()
+        raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        return cls.from_dict(raw, base_dir=p.parent)
+
+    @staticmethod
+    def _resolve_task_file(entry: dict[str, Any], base_dir: Path | None) -> dict[str, Any]:
+        """Fold a step's `task_file` into its `task`.
+
+        Paths are relative to the workflow file, not the working directory, so a
+        workflow keeps working when it is run from somewhere else.
+        """
+        ref = entry.get("task_file")
+        if not ref:
+            return entry
+        name = entry.get("name", "?")
+        if entry.get("task"):
+            raise ValueError(f"step {name!r}: set either `task` or `task_file`, not both")
+        path = Path(ref).expanduser()
+        if not path.is_absolute() and base_dir is not None:
+            path = base_dir / path
+        try:
+            entry["task"] = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"step {name!r}: cannot read task_file {str(path)!r}: {exc}") from exc
+        if not entry["task"].strip():
+            raise ValueError(f"step {name!r}: task_file {str(path)!r} is empty")
+        return entry
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> Workflow:
+    def from_dict(cls, raw: dict[str, Any], base_dir: str | Path | None = None) -> Workflow:
         """Accepts two equivalent spellings, and a mix of them.
 
         `stages:` is an ordered list, where a node without `needs` waits for everything
@@ -348,25 +379,33 @@ class Workflow(BaseModel):
         after any `stages:`, and `needs` may point in either direction.
         """
         data = dict(raw)
+        base = Path(base_dir) if base_dir is not None else None
         stages: list[Any] = []
 
         for entry in data.pop("stages", []) or []:
             if "loop" in entry:
                 body = dict(entry["loop"])
                 body.setdefault("name", entry.get("name", f"loop{len(stages)}"))
+                body["steps"] = [
+                    cls._resolve_task_file(dict(s), base) for s in body.get("steps", []) or []
+                ]
                 stages.append(Loop(**body))
             else:
-                stages.append(Step(**entry))
+                stages.append(Step(**cls._resolve_task_file(dict(entry), base)))
 
         for name, body in (data.pop("graph", {}) or {}).items():
             body = dict(body or {})
             body["name"] = name
+            body = cls._resolve_task_file(body, base)
             # A graph node is explicit about its edges, so it never gets an implicit one.
             body.setdefault("needs", [])
             if "loop" in body:
                 inner = dict(body.pop("loop"))
                 inner["name"] = name
                 inner["needs"] = body["needs"]
+                inner["steps"] = [
+                    cls._resolve_task_file(dict(s), base) for s in inner.get("steps", []) or []
+                ]
                 stages.append(Loop(**inner))
             else:
                 stages.append(Step(**body))

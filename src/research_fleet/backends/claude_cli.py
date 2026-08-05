@@ -26,7 +26,13 @@ class ClaudeCLIBackend:
         return "claude-opus-5"
 
     def build_command(self, agent: AgentConfig, *, brief: str = "") -> list[str]:
-        prompt = agent.task if not brief else f"{brief}\n\n---\n\n{agent.task}"
+        # The budget brief goes into the system prompt rather than in front of the
+        # task. `claude -p` interprets a leading slash command (`/goal ...`), and it
+        # only does so at position 0 -- prepending anything turns the command into
+        # ordinary prose, silently. Keeping the task verbatim preserves that, and the
+        # brief is operator context anyway, which is what a system prompt is for.
+        prompt = agent.task
+        system = "\n\n".join(p for p in (brief, agent.system_prompt) if p)
         argv = [
             self.binary,
             "-p", prompt,
@@ -39,8 +45,10 @@ class ClaudeCLIBackend:
             "--dangerously-skip-permissions",
         ]
         argv += ["--model", agent.model or self.default_model()]
-        if agent.system_prompt:
-            argv += ["--append-system-prompt", agent.system_prompt]
+        if system:
+            argv += ["--append-system-prompt", system]
+        if agent.effort:
+            argv += ["--effort", agent.effort]
         if agent.max_turns:
             argv += ["--max-turns", str(agent.max_turns)]
         if agent.allowed_tools:

@@ -233,6 +233,9 @@ class Fleet:
                         model=model or self.config.budget.default_model,
                         task=task,
                         system_prompt=system_prompt,
+                        # Passed to the harness as well as recorded as a label: the
+                        # label drives cost estimation, this drives the actual run.
+                        effort=effort or self.config.budget.default_effort,
                         max_turns=max_turns,
                         allowed_tools=list(allowed_tools) if allowed_tools else None,
                     ),

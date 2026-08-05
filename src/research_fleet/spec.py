@@ -75,6 +75,10 @@ class AgentConfig(BaseModel):
     model: str | None = Field(None, description="Backend-specific model id. None = backend default.")
     task: str = Field(..., description="The prompt / research question given to the agent.")
     system_prompt: str | None = None
+    # Validated here rather than left to the harness: `claude --effort <bad>` only warns
+    # and silently falls back to the default, so a typo would quietly cost you the
+    # reasoning depth you asked for. Not every backend supports it (codex-cli ignores it).
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
     max_turns: int | None = Field(None, ge=1)
     allowed_tools: list[str] | None = Field(
         None, description="Tool allowlist passed through to the agent CLI. None = backend default."

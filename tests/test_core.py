@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from research_fleet import (
     Fleet,
@@ -338,9 +339,34 @@ def test_agent_command_includes_budget_brief():
         AgentConfig(task="find the bug", model="claude-opus-5"), brief="## Budget\n$5 left"
     )
     assert "-p" in argv
-    prompt = argv[argv.index("-p") + 1]
-    assert "$5 left" in prompt and "find the bug" in prompt
+    # Task verbatim, brief in the system prompt: `claude -p` only honours a slash
+    # command at position 0, so anything prepended would silently disable it.
+    assert argv[argv.index("-p") + 1] == "find the bug"
+    assert "$5 left" in argv[argv.index("--append-system-prompt") + 1]
     assert argv[argv.index("--output-format") + 1] == "stream-json"
+
+
+def test_agent_command_preserves_a_leading_slash_command():
+    backend = get_backend("claude-cli")
+    argv = backend.build_command(
+        AgentConfig(task="/goal ship it", model="claude-opus-5"), brief="## Budget\n$5 left"
+    )
+    assert argv[argv.index("-p") + 1].startswith("/goal ")
+
+
+def test_agent_command_passes_effort_through():
+    backend = get_backend("claude-cli")
+    argv = backend.build_command(AgentConfig(task="t", model="claude-opus-5", effort="high"))
+    assert argv[argv.index("--effort") + 1] == "high"
+    # Omitted rather than sent empty, so the harness default applies.
+    assert "--effort" not in backend.build_command(AgentConfig(task="t"))
+
+
+def test_agent_command_rejects_an_unknown_effort():
+    # The CLI only warns and falls back to its default, which would silently cost
+    # the caller the reasoning depth they asked for. Fail at construction instead.
+    with pytest.raises(ValidationError):
+        AgentConfig(task="t", effort="highest")
 
 
 # ------------------------------------------------------------------ end to end

@@ -32,7 +32,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TextIO
 
 from .backends import AgentEvent, get_backend
 from .budget import BudgetExceeded, BudgetTracker, Usage, quote, render_cost_brief
@@ -116,6 +116,8 @@ class JobRecord:
     depth: int = 0
     future: Future | None = None
     children: list[str] = field(default_factory=list)
+    results_dir: Path | None = None
+    stream_log: TextIO | None = None    # open handle on <results>/stream.log
 
 
 class Scheduler:
@@ -358,6 +360,37 @@ class Scheduler:
         finally:
             self.slots.release(gpu_ids, spec.resources.gpus)
             self._maybe_close_scope(rec)
+            self._write_result_files(rec)
+
+    def _write_result_files(self, rec: JobRecord) -> None:
+        """Land a job's own record in its results directory.
+
+        The ledger is the source of truth, but it is one append-only file for the
+        whole root and every CLI view truncates it. A job that produced no artifacts
+        of its own would otherwise leave an empty directory, so write the answer and
+        the outcome next to whatever the job wrote itself. Best-effort: a failure
+        here must not change the job's result.
+        """
+        if rec.stream_log is not None:
+            try:
+                rec.stream_log.close()
+            except OSError:
+                pass
+            rec.stream_log = None
+
+        if rec.results_dir is None:
+            return
+        try:
+            result = rec.result
+            if result is not None:
+                (rec.results_dir / "result.json").write_text(
+                    json.dumps(result.model_dump(mode="json"), indent=2, default=str)
+                )
+            text = (result.output if result else "") or rec.output
+            if text:
+                (rec.results_dir / "output.md").write_text(text)
+        except OSError:
+            pass
 
     def _prepare(self, rec: JobRecord) -> tuple[list[str], dict[str, str]]:
         """Build the argv and env for a job, mounting its results and (for agent
@@ -375,6 +408,10 @@ class Scheduler:
         results_dir.mkdir(parents=True, exist_ok=True)
         spec.mounts.append(Mount(source=str(results_dir), target="/results", mode="rw"))
         env["FLEET_RESULTS_DIR"] = "/results"
+        rec.results_dir = results_dir
+        # Opened before the job starts and written as lines arrive, so a job that
+        # crashes halfway still leaves the transcript up to the failure on disk.
+        rec.stream_log = (results_dir / "stream.log").open("w", buffering=1)
 
         if spec.kind is JobKind.COMMAND:
             return list(spec.command), env
@@ -493,6 +530,14 @@ class Scheduler:
         spec_id = rec.spec.id
 
         def handle(stream: str, line: str) -> None:
+            if rec.stream_log is not None:
+                try:
+                    rec.stream_log.write(f"{stream}\t{line}\n")
+                except (ValueError, OSError):
+                    # A full disk or a closed handle must not take the job down;
+                    # the ledger is still the authoritative record.
+                    pass
+
             if backend is None:
                 if stream == "stdout" and line.strip():
                     # A command job's output is its last few lines; enough for a

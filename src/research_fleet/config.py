@@ -115,13 +115,17 @@ class FleetConfig(BaseModel):
         for name, fields in self.budget.model_costs.items():
             register_model_cost(ModelCost(model=name, **fields))
 
+    # Both are resolved to absolute paths: everything under `root` (results, spool)
+    # becomes a Docker bind-mount source, and the daemon rejects a relative one.
+    # A relative `root:` in a project's fleet.yaml is otherwise only caught when the
+    # first container fails to start.
     @property
     def root_path(self) -> Path:
-        return Path(self.root).expanduser()
+        return Path(self.root).expanduser().resolve()
 
     @property
     def results_path(self) -> Path:
-        return Path(self.results_dir).expanduser()
+        return Path(self.results_dir).expanduser().resolve()
 
 
 def _deep_merge(base: dict, over: dict) -> dict:
