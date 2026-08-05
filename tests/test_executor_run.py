@@ -224,6 +224,32 @@ def test_preflight_passes_when_the_image_is_present(fake):
     executor.preflight(Policy())      # must not raise
 
 
+def test_preflight_initializes_and_builds_a_new_project(tmp_path):
+    log = tmp_path / "ship.log"
+    marker = tmp_path / "built"
+    ship = _script(tmp_path / "ship", f"""#!/usr/bin/env bash
+echo "$1" >> {log}
+case "$1" in
+  init) touch .ship.conf ;;
+  build) touch {marker} ;;
+  docker-args)
+    printf '%s\\n' docker run --rm sandbox:latest bash -lc 'exec true'
+    ;;
+esac
+""")
+    docker = _script(tmp_path / "docker", f"""#!/usr/bin/env bash
+[[ "$1 $2" == "image inspect" && -f {marker} ]]
+""")
+    executor = ShipExecutor(
+        ship_binary=str(ship), docker_binary=str(docker), project_dir=str(tmp_path)
+    )
+
+    executor.preflight(Policy())
+
+    assert (tmp_path / ".ship.conf").exists()
+    assert log.read_text().splitlines() == ["docker-args", "init", "build"]
+
+
 def test_a_failure_reports_the_reason_not_just_the_code(fake):
     """The daemon's complaint was captured in the ledger but never surfaced."""
     ship, make_docker = fake
@@ -291,6 +317,7 @@ def test_missing_credentials_are_caught_before_any_agent_runs(tmp_path, fake):
             fleet.run_agents("do something", n=4, gpus=0)
         assert "Not logged in" in str(caught.value)
         assert fleet.scheduler._jobs == {}, "nothing may be submitted"
+        assert not fleet._checked_credentials, "a failed check must be retryable after login"
     finally:
         fleet.close()
 

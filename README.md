@@ -72,7 +72,7 @@ reinstalling costs nothing.
 Then set up **the project you want to research in**, which is not the fleet checkout:
 
 ```bash
-cd ~/my-project && ship init && ship build
+cd ~/my-project
 fleet login --import          # give its agents the credentials you already have
 ```
 
@@ -81,17 +81,9 @@ volume, which is the same thing `ship login --import` does. Use plain `fleet log
 sign in interactively for a project-scoped token instead. If you skip this, `fleet` says
 so before submitting rather than letting every agent fail with "Not logged in".
 
-research-ship derives the image name from that directory, so every project you point the
-fleet at needs its own `ship build` once. If you forget, `fleet` says so before
-submitting anything rather than letting each job fail on the Docker daemon:
-
-```console
-$ fleet run "..." --agents 2
-cannot start: the image 'ship-my-project:latest' does not exist, so no job could run.
-research-ship derives it from the project at /home/you/my-project.
-Build it with:  cd /home/you/my-project && ship init && ship build
-Or point `image:` in fleet.yaml at an image you already have.
-```
+research-ship derives the image name from that directory. On the first run, `fleet`
+automatically runs `ship init` when needed and builds the image. Explicit `image:`
+overrides are never built implicitly; they must already exist locally.
 
 Requires Docker with the NVIDIA container runtime, and `uv`:
 

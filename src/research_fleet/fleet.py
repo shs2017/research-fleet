@@ -30,6 +30,10 @@ if TYPE_CHECKING:
     from .workflow import Workflow
 
 
+class CredentialsUnavailable(RuntimeError):
+    """An agent job cannot start until the project has credentials."""
+
+
 def _default_cpus(n: int = 1) -> float:
     """A per-job CPU request that fits the host, split across `n` jobs meant to run
     at once.
@@ -348,17 +352,17 @@ class Fleet:
         """
         if self._checked_credentials:
             return
-        self._checked_credentials = True
         check = getattr(self.executor, "credentials_present", None)
         if not callable(check):
+            self._checked_credentials = True
             return
         if check(self.config.policy, self.config.image) is False:
-            raise RuntimeError(
-                "no agent credentials for this project, so every agent would fail with "
-                "\"Not logged in\".\n"
-                "  fleet login --import    copy the credentials you already have on this host\n"
-                "  fleet login             sign in interactively instead"
+            raise CredentialsUnavailable(
+                "This project is not logged in yet (agents would report \"Not logged in\").\n"
+                "Run `fleet login --import` to use your existing host login, or "
+                "`fleet login` to sign in interactively."
             )
+        self._checked_credentials = True
 
     # ---------------------------------------------------------------- control
 

@@ -22,7 +22,7 @@ from rich.table import Table
 
 from .budget import cost_menu
 from .config import load_config
-from .fleet import Fleet
+from .fleet import CredentialsUnavailable, Fleet
 from .ledger import Ledger
 from .spec import JobSpec, new_id
 from .sweep import parse_grid_args
@@ -47,6 +47,12 @@ def _fleet(config: Optional[str], **overrides) -> Fleet:
     except ShipUnavailable as exc:
         console.print(f"[red]cannot start:[/red] {exc}")
         raise typer.Exit(1) from None
+
+
+def _credentials_error(exc: CredentialsUnavailable) -> None:
+    """Render expected login setup as a CLI message instead of a traceback."""
+    console.print(f"[red]cannot run agents:[/red] {exc}")
+    raise typer.Exit(1) from None
 
 
 def _gpu_share(requested: Optional[float], agents: int, devices: int) -> tuple[float, str]:
@@ -204,10 +210,13 @@ def run(
             console.print(f"[dim]{note}[/dim]" if not note.startswith("[") else note)
         if cpu_note:
             console.print(f"[dim]{cpu_note}[/dim]" if not cpu_note.startswith("[") else cpu_note)
-        fleet.run_agents(
-            task, n=agents, model=model, backend=backend, effort=effort,
-            gpus=share, cpus=cpu_share, timeout_s=timeout,
-        )
+        try:
+            fleet.run_agents(
+                task, n=agents, model=model, backend=backend, effort=effort,
+                gpus=share, cpus=cpu_share, timeout_s=timeout,
+            )
+        except CredentialsUnavailable as exc:
+            _credentials_error(exc)
         report = fleet.wait()
         console.print()
         console.print(report.summary())
@@ -308,7 +317,10 @@ def workflow(
     _cancel_on_interrupt(fleet)
     try:
         console.print(f"[bold]run {fleet.run_id}[/bold]  workflow {wf.name}")
-        report = fleet.run_workflow(wf)
+        try:
+            report = fleet.run_workflow(wf)
+        except CredentialsUnavailable as exc:
+            _credentials_error(exc)
         console.print()
         console.print(report.summary())
         raise typer.Exit(0 if not report.run.failed else 1)

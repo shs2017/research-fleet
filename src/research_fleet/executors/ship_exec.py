@@ -93,34 +93,62 @@ class ShipExecutor:
         return [line.strip() for line in out.splitlines() if line.strip()]
 
     def preflight(self, policy: Policy, image: str = "") -> None:
-        """Fail before submitting anything if the project's image is missing.
-
-        Without this, every job dies with a bare `exit code 125` from the Docker daemon
-        and the operator has to go digging for the reason.
-        """
+        """Ensure ship's project environment exists before submitting anything."""
         # Honour a configured image override, or ship's default for the project.
         spec = JobSpec(name="preflight", command=["true"], image=image)
-        try:
-            argv = self.build_argv(
-                spec, argv=["true"], env={}, placement=Placement(gpu_ids=()),
-                policy=policy, name="fleet-preflight",
-            )
-        except ShipUnavailable:
-            raise
-        image = self._image_from(argv)
-        if image is None:
+        argv = self.build_argv(
+            spec, argv=["true"], env={}, placement=Placement(gpu_ids=()),
+            policy=policy, name="fleet-preflight",
+        )
+        resolved_image = self._image_from(argv)
+        if resolved_image is None or self._image_exists(resolved_image):
             return
-        found = subprocess.run(
+
+        # An explicit image belongs to the caller; do not silently build a different
+        # one. The default image, however, is entirely derived by ship and is safe to
+        # initialise and build on demand.
+        if image:
+            raise ShipUnavailable(
+                f"configured image {resolved_image!r} does not exist. Build or pull it, or remove "
+                "`image:` from fleet.yaml to let fleet prepare the project automatically."
+            )
+
+        project = Path(self.project_dir or os.getcwd())
+        if not (project / ".ship.conf").exists():
+            self._run_ship_setup("init", project)
+        self._run_ship_setup("build", project)
+        if not self._image_exists(resolved_image):
+            raise ShipUnavailable(
+                f"automatic `ship build` completed, but image {resolved_image!r} still does not exist. "
+                f"Run `ship build` in {project} to inspect the problem."
+            )
+
+    def _image_exists(self, image: str) -> bool:
+        return subprocess.run(
             [self.docker, "image", "inspect", image],
             capture_output=True, text=True, check=False,
-        )
-        if found.returncode != 0:
-            where = self.project_dir or os.getcwd()
+        ).returncode == 0
+
+    def _ship_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        if self.project_dir:
+            env["SHIP_PROJECT_DIR"] = self.project_dir
+        return env
+
+    def _run_ship_setup(self, command: str, project: Path) -> None:
+        """Run one automatic setup step and report its useful output, not Python internals."""
+        try:
+            done = subprocess.run(
+                [self.ship, command], cwd=project, env=self._ship_env(),
+                capture_output=True, text=True,
+            )
+        except OSError as exc:
+            raise ShipUnavailable(f"could not run `ship {command}`: {exc}") from None
+        if done.returncode:
+            detail = (done.stderr or done.stdout).strip()
+            suffix = f"\n{detail}" if detail else ""
             raise ShipUnavailable(
-                f"the image {image!r} does not exist, so no job could run.\n"
-                f"research-ship derives it from the project at {where}.\n"
-                f"Build it with:  cd {where} && ship init && ship build\n"
-                f"Or point `image:` in fleet.yaml at an image you already have."
+                f"automatic `ship {command}` failed in {project} (exit {done.returncode}).{suffix}"
             )
 
     def credential_volume(self, policy: Policy, image: str = "") -> str | None:
@@ -231,9 +259,7 @@ class ShipExecutor:
         """Run `ship docker-args`, unchecked, so callers can inspect stderr too --
         that's where an isolated job's worktree location is reported."""
         cmd = [self.ship, "docker-args", *self._ship_flags(spec, env, placement, policy, name), "--", *argv]
-        proc_env = dict(os.environ)
-        if self.project_dir:
-            proc_env["SHIP_PROJECT_DIR"] = self.project_dir
+        proc_env = self._ship_env()
         if policy.network.allowed_hosts:
             proc_env["FIREWALL_EXTRA_DOMAINS"] = " ".join(policy.network.allowed_hosts)
         return subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=proc_env)
@@ -410,12 +436,9 @@ class ShipExecutor:
         the branch's content is either already folded into something else's history
         or was never needed again, so a failure here just leaves disk unreclaimed
         rather than losing anything."""
-        proc_env = dict(os.environ)
-        if self.project_dir:
-            proc_env["SHIP_PROJECT_DIR"] = self.project_dir
         subprocess.run(
             [self.ship, "worktree-drop", branch],
-            capture_output=True, text=True, timeout=30, env=proc_env, check=False,
+            capture_output=True, text=True, timeout=30, env=self._ship_env(), check=False,
         )
 
     def close(self) -> None:
