@@ -8,6 +8,8 @@ use simple `{{ path.to.value }}` substitution against earlier results.
 from __future__ import annotations
 
 import re
+import hashlib
+import json
 import warnings
 from pathlib import Path
 from typing import Any, Callable
@@ -15,7 +17,7 @@ from typing import Any, Callable
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
-from .spec import JobKind, JobResult, JobState
+from .spec import JobKind, JobResult, JobState, Mount
 
 _PLACEHOLDER = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
 
@@ -398,13 +400,67 @@ class WorkflowRunner:
     a fan-out step, rather than implied by the graph.
     """
 
-    def __init__(self, fleet, workflow: Workflow, *, predicates: dict[str, Predicate] | None = None):
+    def __init__(self, fleet, workflow: Workflow, *, predicates: dict[str, Predicate] | None = None,
+                 prior_run: str | None = None, resume: bool = False):
         self.fleet = fleet
         self.workflow = workflow
         self.predicates = predicates or {}
         self.results: dict[str, JobResult] = {}
         self.outcomes: list[StageOutcome] = []
         self._worktree_tip: str | None = None
+        self._worktree_tip_run: str | None = None
+        self._completed: set[str] = set()
+        self._prior_run: str | None = prior_run
+        self._restored_outcomes: dict[str, StageOutcome] = {}
+        self._fingerprint = hashlib.sha256(json.dumps(
+            workflow.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        if prior_run:
+            self._restore(prior_run, resume=resume)
+
+    def _restore(self, prior_run: str, *, resume: bool) -> None:
+        events = self.fleet.ledger.events(
+            run_id=prior_run, types=["workflow.checkpoint"], limit=100000
+        )
+        matches = [e for e in events if e.payload.get("fingerprint") == self._fingerprint]
+        if not matches:
+            raise ValueError(
+                f"run {prior_run!r} has no compatible checkpoint for workflow "
+                f"{self.workflow.name!r}"
+            )
+        state = matches[-1].payload
+        self.results = {
+            name: JobResult.model_validate(value)
+            for name, value in state.get("results", {}).items()
+        }
+        self._completed = set(state.get("completed", [])) if resume else set()
+        self._restored_outcomes = {
+            name: StageOutcome.model_validate(value)
+            for name, value in state.get("outcomes", {}).items()
+        } if resume else {}
+        self._worktree_tip = state.get("worktree_tip")
+        self._worktree_tip_run = state.get("worktree_tip_run") or prior_run
+        self.fleet.ledger.append(
+            "workflow.restored",
+            {"from_run": prior_run, "resume": resume,
+             "completed": sorted(self._completed)},
+            run_id=self.fleet.run_id,
+        )
+
+    def _checkpoint(self, completed: set[str], outcomes: dict[str, StageOutcome]) -> None:
+        self.fleet.ledger.append(
+            "workflow.checkpoint",
+            {
+                "workflow": self.workflow.name,
+                "fingerprint": self._fingerprint,
+                "completed": sorted(completed),
+                "results": {k: v.model_dump(mode="json") for k, v in self.results.items()},
+                "outcomes": {k: v.model_dump(mode="json") for k, v in outcomes.items()},
+                "worktree_tip": self._worktree_tip,
+                "worktree_tip_run": self._worktree_tip_run,
+            },
+            run_id=self.fleet.run_id,
+        )
 
     def _context(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         steps = {
@@ -426,8 +482,15 @@ class WorkflowRunner:
 
         chainable = len(items) == 1 and isolate
         base = self._worktree_tip if chainable else None
+        base_run = self._worktree_tip_run if chainable else None
 
         records = []
+        inherited_mounts = []
+        if self._prior_run:
+            inherited_mounts = [Mount(
+                source=str(self.fleet.config.results_path / self._prior_run),
+                target="/previous-results", mode="ro",
+            )]
         for index, item in enumerate(items):
             item_ctx = {**ctx, "item": item, "index": index}
             name = label if len(items) == 1 else f"{label}-{index}"
@@ -444,13 +507,16 @@ class WorkflowRunner:
                     n=1, name_prefix=name, labels=labels,
                     model=model, effort=effort, gpus=gpus,
                     timeout_s=step.timeout_s, isolate=isolate, worktree_base=base,
+                    worktree_base_run_id=base_run,
+                    mounts=inherited_mounts,
                 )
             else:
                 records.append(
                     self.fleet.run_command(
                         [render(part, item_ctx) for part in step.command],
                         name=name, gpus=gpus, timeout_s=step.timeout_s,
-                        isolate=isolate, worktree_base=base, labels=labels,
+                        isolate=isolate, worktree_base=base,
+                        worktree_base_run_id=base_run, mounts=inherited_mounts, labels=labels,
                     )
                 )
         return [r.spec.id for r in records], (label if chainable else None)
@@ -462,9 +528,20 @@ class WorkflowRunner:
         result = self.results.get(result_key)
         if result is not None and result.state == JobState.SUCCEEDED:
             old_tip = self._worktree_tip
+            old_tip_run = self._worktree_tip_run
             self._worktree_tip = chain_label
-            if old_tip is not None:
+            self._worktree_tip_run = self.fleet.run_id
+            if old_tip is not None and old_tip_run in (None, self.fleet.run_id):
                 self.fleet.drop_worktree(old_tip)
+
+    def _outcomes_succeeded(self, names: list[str], outcomes: dict[str, StageOutcome]) -> bool:
+        ids = [job_id for name in names for job_id in outcomes[name].job_ids]
+        return bool(ids) and all(
+            (record := self.fleet.scheduler._jobs.get(job_id)) is not None
+            and record.result is not None
+            and record.result.state is JobState.SUCCEEDED
+            for job_id in ids
+        )
 
     def _record(self, step_name: str, job_ids: list[str], report) -> None:
         """Record a step's results from a finished report.
@@ -498,13 +575,21 @@ class WorkflowRunner:
             )
 
         by_name: dict[str, Step | Loop] = {st.name: st for st in self.workflow.stages}
-        outcomes: dict[str, StageOutcome] = {}
+        outcomes: dict[str, StageOutcome] = dict(self._restored_outcomes)
+        completed = set(self._completed)
 
         cyclic = {tuple(group) for group in self.workflow.cycles()}
 
         for wave in self.workflow.levels():
+            if set(wave) <= completed:
+                continue
             if tuple(wave) in cyclic:
                 outcomes.update(self._run_cycle(wave, by_name))
+                if not self._outcomes_succeeded(wave, outcomes):
+                    self._checkpoint(completed, outcomes)
+                    break
+                completed.update(wave)
+                self._checkpoint(completed, outcomes)
                 continue
 
             stages = [by_name[name] for name in wave]
@@ -523,6 +608,12 @@ class WorkflowRunner:
 
             for loop in loops:
                 outcomes[loop.name] = self._run_loop(loop)
+
+            if not self._outcomes_succeeded(wave, outcomes):
+                self._checkpoint(completed, outcomes)
+                break
+            completed.update(wave)
+            self._checkpoint(completed, outcomes)
 
         self.outcomes = [outcomes[st.name] for st in self.workflow.stages if st.name in outcomes]
         return self.outcomes

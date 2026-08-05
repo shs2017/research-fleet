@@ -7,6 +7,7 @@ the normal validation path and receives a budget scope bounded by its parent.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import threading
 import time
@@ -383,7 +384,7 @@ class Scheduler:
         backend = get_backend(spec.agent.backend)
 
         for key in set(backend.required_env()) | set(self.config.agent.passthrough_env):
-            env.setdefault(key, "")
+            env.setdefault(key, os.environ.get(key, ""))
 
         parent_scope = rec.budget_scope
         parent_node = self.budget.get(parent_scope)
@@ -513,6 +514,9 @@ class Scheduler:
             if event is None:
                 return
             if event.usage is not None:
+                if (not event.usage.model and backend.name == "codex-cli"
+                        and rec.spec.agent is not None):
+                    event.usage.model = rec.spec.agent.model or backend.default_model()
                 with self._lock:
                     rec.usage = rec.usage.merge(event.usage)
             if event.type == "result":
@@ -521,6 +525,10 @@ class Scheduler:
                 reported = event.payload.get("duration_ms")
                 if reported:
                     rec.agent_seconds = float(reported) / 1000.0
+            elif event.type == "message" and event.text:
+                # Codex emits its final answer as an item.completed agent_message,
+                # followed by a usage-only turn.completed event.
+                rec.output = event.text
             self.ledger.append(
                 f"agent.{event.type}", event.to_ledger(),
                 run_id=self.run_id, job_id=spec_id,

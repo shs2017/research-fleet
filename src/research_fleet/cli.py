@@ -195,7 +195,8 @@ def run(
         on_event=_live_printer(verbose), run_id=run_id,
     ) as fleet:
         _cancel_on_interrupt(fleet)
-        est = fleet.quote(model, effort=effort or fleet.config.budget.default_effort)
+        chosen_model = fleet.agent_model(model, backend)
+        est = fleet.quote(chosen_model, effort=effort or fleet.config.budget.default_effort)
         share, note = _gpu_share(gpus, agents, fleet.scheduler.slots.device_count)
         cpu_share, cpu_note = _cpu_share(cpus, agents)
         console.print(
@@ -254,6 +255,12 @@ def workflow(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
     plan: bool = typer.Option(False, "--plan", help="Validate and print the stages, run nothing."),
+    resume_from: Optional[str] = typer.Option(
+        None, "--resume", help="Continue from the last compatible checkpoint in this run."
+    ),
+    base_run: Optional[str] = typer.Option(
+        None, "--from-run", help="Reuse a run's outputs/files but execute all stages again."
+    ),
 ):
     """Run a multi-step pipeline, for example a coder and reviewer loop."""
     from .workflow import Loop, Step, Workflow
@@ -306,7 +313,7 @@ def workflow(
         _cancel_on_interrupt(fleet)
         console.print(f"[bold]run {fleet.run_id}[/bold]  workflow {wf.name}")
         try:
-            report = fleet.run_workflow(wf)
+            report = fleet.run_workflow(wf, resume_from=resume_from, base_run=base_run)
         except CredentialsUnavailable as exc:
             _credentials_error(exc)
         console.print()

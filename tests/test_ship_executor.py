@@ -172,3 +172,9 @@ def test_parallel_isolated_jobs_get_distinct_branches(fake_ship):
         flags = log.read_text().splitlines()
         branches.add(flags[flags.index("--worktree") + 1])
     assert len(branches) == 2, "each job needs its own branch to be reviewable"
+
+
+def test_openai_api_key_satisfies_the_credential_preflight(fake_ship, monkeypatch):
+    executor, _ = fake_ship
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only-key")
+    assert executor.credentials_present(Policy()) is True

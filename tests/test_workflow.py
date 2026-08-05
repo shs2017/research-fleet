@@ -432,6 +432,74 @@ def test_a_workflow_can_be_loaded_from_a_path(tmp_path):
         fleet.close()
 
 
+def test_workflow_can_resume_completed_waves_in_a_new_run(tmp_path):
+    workflow = {"name": "resumable", "stages": [
+        {"name": "first", "task": "one", "gpus": 0},
+        {"name": "second", "task": "use {{ steps.first.output }}", "gpus": 0},
+    ]}
+    first_exec = ScriptedExecutor()
+    first = _fleet(tmp_path, first_exec)
+    try:
+        first_report = first.run_workflow(workflow)
+        prior_run = first.run_id
+        assert len(first_report.outcomes) == 2
+    finally:
+        first.close()
+
+    resumed_exec = ScriptedExecutor()
+    resumed = _fleet(tmp_path, resumed_exec)
+    try:
+        report = resumed.run_workflow(workflow, resume_from=prior_run)
+        assert resumed.run_id != prior_run
+        assert resumed_exec.calls == []
+        assert [o.stage for o in report.outcomes] == ["first", "second"]
+        restored = resumed.ledger.events(
+            run_id=resumed.run_id, types=["workflow.restored"]
+        )[-1]
+        assert restored.payload["from_run"] == prior_run
+    finally:
+        resumed.close()
+
+
+def test_from_run_restores_context_but_reruns_all_stages(tmp_path):
+    workflow = {"name": "based", "stages": [
+        {"name": "first", "task": "one", "gpus": 0},
+    ]}
+    first = _fleet(tmp_path, ScriptedExecutor())
+    try:
+        first.run_workflow(workflow)
+        prior_run = first.run_id
+    finally:
+        first.close()
+
+    based_exec = ScriptedExecutor()
+    based = _fleet(tmp_path, based_exec)
+    try:
+        based.run_workflow(workflow, base_run=prior_run)
+        assert based_exec.calls == ["first"]
+    finally:
+        based.close()
+
+
+def test_resume_rejects_a_changed_workflow(tmp_path):
+    first = _fleet(tmp_path, ScriptedExecutor())
+    try:
+        first.run_workflow({"stages": [{"name": "a", "task": "old", "gpus": 0}]})
+        prior_run = first.run_id
+    finally:
+        first.close()
+
+    resumed = _fleet(tmp_path, ScriptedExecutor())
+    try:
+        with pytest.raises(ValueError, match="no compatible checkpoint"):
+            resumed.run_workflow(
+                {"stages": [{"name": "a", "task": "changed", "gpus": 0}]},
+                resume_from=prior_run,
+            )
+    finally:
+        resumed.close()
+
+
 # ------------------------------------------------------------------- the graph
 
 

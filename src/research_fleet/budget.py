@@ -25,7 +25,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-PRICES_AS_OF = "2026-06-24"
+PRICES_AS_OF = "2026-08-05"
 
 MTOK = 1_000_000
 
@@ -72,6 +72,14 @@ MODEL_COSTS: dict[str, ModelCost] = {
         ModelCost("claude-sonnet-5", 3.00, 15.00, 1_000_000, 128_000),
         ModelCost("claude-sonnet-4-6", 3.00, 15.00, 1_000_000, 128_000),
         ModelCost("claude-haiku-4-5", 1.00, 5.00, 200_000, 64_000),
+        ModelCost("gpt-5.3-codex", 1.75, 14.00, 400_000, 128_000),
+        ModelCost("gpt-5.6-sol", 5.00, 30.00, 1_050_000, 128_000),
+        ModelCost("gpt-5.6", 5.00, 30.00, 1_050_000, 128_000),
+        ModelCost("gpt-5.6-terra", 2.50, 15.00, 1_050_000, 128_000),
+        ModelCost("gpt-5.6-luna", 1.00, 6.00, 1_050_000, 128_000),
+        ModelCost("gpt-5.4", 2.50, 15.00, 1_050_000, 128_000),
+        ModelCost("gpt-5.4-mini", 0.75, 4.50, 400_000, 128_000),
+        ModelCost("gpt-5.4-nano", 0.20, 1.25, 400_000, 128_000),
     ]
 }
 
@@ -81,6 +89,7 @@ ALIASES = {
     "haiku": "claude-haiku-4-5",
     "fable": "claude-fable-5",
     "default": "claude-opus-5",
+    "codex": "gpt-5.3-codex",
 }
 
 # Relative output volume by reasoning effort, normalised to `high` = 1.0. Effort mostly

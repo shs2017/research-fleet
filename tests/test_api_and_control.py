@@ -103,6 +103,15 @@ def test_quote_and_cost_menu_come_from_config(tmp_path):
         fleet.close()
 
 
+def test_codex_backend_does_not_inherit_a_claude_default_model(tmp_path):
+    fleet = _fleet(tmp_path)
+    try:
+        assert fleet.agent_model(None, "codex-cli") == "gpt-5.3-codex"
+        assert fleet.agent_model("gpt-5.6-terra", "codex-cli") == "gpt-5.6-terra"
+    finally:
+        fleet.close()
+
+
 def test_trace_returns_one_jobs_events_in_order(tmp_path):
     fleet = _fleet(tmp_path)
     try:

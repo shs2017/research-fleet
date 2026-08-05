@@ -37,10 +37,22 @@ def test_unknown_backend_names_the_alternatives():
 
 
 def test_codex_builds_a_command_with_the_brief_prepended(codex):
-    argv = codex.build_command(AgentConfig(task="find the bug", model="gpt-5-codex"), brief="BUDGET")
+    argv = codex.build_command(AgentConfig(
+        task="find the bug", model="gpt-5.3-codex", effort="xhigh",
+        system_prompt="PROJECT RULES",
+    ), brief="BUDGET")
     assert argv[0] == "codex" and argv[1] == "exec"
     assert argv[-1].startswith("BUDGET") and "find the bug" in argv[-1]
     assert "--model" in argv
+    assert argv[argv.index("-c") + 1] == 'model_reasoning_effort="xhigh"'
+    assert "PROJECT RULES" in argv[-1]
+
+
+def test_codex_has_a_priced_backend_default(codex):
+    from research_fleet.budget import cost_for
+
+    assert codex.default_model() == "gpt-5.3-codex"
+    assert cost_for(codex.default_model()).output_per_mtok == pytest.approx(14.0)
 
 
 def test_codex_parses_agent_message(codex):
@@ -51,6 +63,28 @@ def test_codex_parses_agent_message(codex):
 def test_codex_parses_reasoning_as_thinking(codex):
     ev = codex.parse_line(json.dumps({"msg": {"type": "agent_reasoning", "text": "hmm"}}))
     assert ev.type == "thinking" and ev.text == "hmm"
+
+
+def test_codex_parses_current_item_and_turn_events(codex):
+    message = codex.parse_line(json.dumps({
+        "type": "item.completed",
+        "item": {"id": "item_1", "type": "agent_message", "text": "finished"},
+    }))
+    assert message.type == "message" and message.text == "finished"
+
+    command = codex.parse_line(json.dumps({
+        "type": "item.completed",
+        "item": {"id": "item_2", "type": "command_execution", "exit_code": 0},
+    }))
+    assert command.type == "tool_result" and not command.is_error
+
+    turn = codex.parse_line(json.dumps({
+        "type": "turn.completed",
+        "usage": {"input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 20},
+    }))
+    assert turn.type == "result"
+    assert turn.usage.input_tokens == 60
+    assert turn.usage.cache_read_tokens == 40
 
 
 def test_codex_parses_tool_call_and_result(codex):
@@ -87,10 +121,10 @@ def test_codex_maps_openai_shaped_usage(codex):
     assert ev.usage.output_tokens == 50
 
 
-def test_codex_leaves_unpriced_models_uncosted(codex):
+def test_codex_leaves_unknown_models_uncosted(codex):
     """A model absent from the price table must not be silently billed as something else."""
     ev = codex.parse_line(
-        json.dumps({"msg": {"type": "agent_message", "message": "x", "model": "gpt-5-codex",
+        json.dumps({"msg": {"type": "agent_message", "message": "x", "model": "private-model",
                             "usage": {"input_tokens": 10}}})
     )
     assert ev.usage.model == ""

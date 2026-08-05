@@ -114,6 +114,11 @@ class JobSpec(BaseModel):
                     "live tree's HEAD. That job's pending changes are committed first, so this "
                     "one picks up where it left off while still getting its own reviewable branch.",
     )
+    worktree_base_run_id: str | None = Field(
+        None,
+        description="Run that owns worktree_base. Empty means this job's run; set when "
+                    "continuing an isolated workflow from an earlier run.",
+    )
     depends_on: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict, description="Sweep coordinates; recorded verbatim in the ledger.")
     labels: dict[str, str] = Field(default_factory=dict)

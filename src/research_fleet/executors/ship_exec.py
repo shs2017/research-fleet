@@ -140,6 +140,13 @@ class ShipExecutor:
 
     def credentials_present(self, policy: Policy, image: str = "") -> bool | None:
         """Return whether credentials exist, or None when this cannot be determined."""
+        # API-key authentication needs no research-ship credential volume. This is
+        # especially important for Codex: older ship versions only probe/mount the
+        # Claude login volume, which must not reject a perfectly valid OpenAI key.
+        if any(os.environ.get(key) for key in (
+            "OPENAI_API_KEY", "CODEX_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+        )):
+            return True
         volume = self.credential_volume(policy, image)
         if volume is None:
             return None
@@ -178,7 +185,8 @@ class ShipExecutor:
         if spec.isolate:
             flags += ["--worktree", f"fleet/{spec.run_id}-{spec.name}"[:80]]
             if spec.worktree_base:
-                flags += ["--worktree-base", f"fleet/{spec.run_id}-{spec.worktree_base}"[:80]]
+                base_run = spec.worktree_base_run_id or spec.run_id
+                flags += ["--worktree-base", f"fleet/{base_run}-{spec.worktree_base}"[:80]]
 
         if placement.gpu_ids:
             flags += ["--gpus", f'"device={",".join(placement.gpu_ids)}"']

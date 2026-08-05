@@ -107,12 +107,23 @@ fleet run "..." --agents 4 --gpus 1             # a whole GPU each, so they queu
 fleet run "..." --agents 16 --executor slurm    # submit to a Slurm cluster
 fleet run "..." --agents 16 --executor ray      # or a Ray cluster
 
+# Codex has the same model, effort, trace, token, and budget controls
+fleet run "..." --backend codex-cli --model gpt-5.3-codex --effort high
+
 # a plain sweep, no LLM, no token cost
 fleet sweep python train.py --lr {lr} --depth {depth} -g lr=1e-3,3e-4 -g depth=6,12
 
 # a multi-step pipeline, for example a coder and reviewer loop
 fleet workflow examples/code-review-loop.yaml
 ```
+
+For Codex, install `@openai/codex` in the research-ship image and provide
+`OPENAI_API_KEY` (or `CODEX_API_KEY`). OpenAI credentials are forwarded by name and
+never written to the ledger. If `--backend codex-cli` is selected without `--model`,
+fleet uses the Codex backend default instead of accidentally passing the configured
+Claude default. Reasoning effort is passed through to Codex's
+`model_reasoning_effort`; usage, cached input, reasoning, tool events, and final answers
+are normalized into the same ledger and budget reports as Claude Code.
 
 **Agents share the GPUs by default** so that `--agents 4` actually runs four at once.
 On a single-GPU host each gets 0.25 of the device and still sees it; `fleet` prints the
@@ -200,6 +211,22 @@ stages:
 fleet workflow examples/code-review-loop.yaml --plan     # validate and show the stages
 fleet workflow examples/code-review-loop.yaml --max-usd 10
 ```
+
+Workflow progress is checkpointed after every completed wave. A new invocation is
+independent by default. If the process dies, a model exhausts its token allowance, or a
+stage fails, continue from the last completed wave in a new run:
+
+```bash
+fleet workflow examples/code-review-loop.yaml --resume run_abc123
+```
+
+The workflow definition must match the checkpoint, preventing an accidental resume with
+different tasks or dependencies. Completed step outputs are restored for templates, and
+an isolated workflow continues from the previous run's last worktree branch. Prior
+artifacts are mounted read-only at `/previous-results`; new artifacts remain under the new
+run. To deliberately build on a prior run but execute every stage again, use
+`--from-run run_abc123` instead. In Python, pass `resume_from="run_abc123"` or
+`base_run="run_abc123"` to `run_workflow()`.
 
 `{{ steps.<name>.output }}` carries a step's answer into a later prompt, which is what
 lets the reviewer's objection reach the next implementation round. `{{ iteration }}` and

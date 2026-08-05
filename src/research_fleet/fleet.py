@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from .budget import Quote, cost_menu, quote
+from .backends import get_backend
 from .config import FleetConfig, load_config
 from .executors import build_executor
 from .ledger import Ledger, Redactor
@@ -208,6 +209,7 @@ class Fleet:
         env: dict[str, str] | None = None,
         isolate: bool | None = None,
         worktree_base: str | None = None,
+        worktree_base_run_id: str | None = None,
         labels: dict[str, str] | None = None,
         name_prefix: str = "agent",
     ) -> list[JobRecord]:
@@ -221,6 +223,8 @@ class Fleet:
         rather than starting fresh from the live tree's HEAD.
         """
         self._require_credentials()
+        selected_backend = backend or self.config.agent.name
+        selected_model = self.agent_model(model, selected_backend)
         specs = []
         for i in range(n):
             specs.append(
@@ -229,8 +233,8 @@ class Fleet:
                     name=f"{name_prefix}-{i}" if n > 1 else name_prefix,
                     image=image or self.config.image,
                     agent=AgentConfig(
-                        backend=backend or self.config.agent.name,
-                        model=model or self.config.budget.default_model,
+                        backend=selected_backend,
+                        model=selected_model,
                         task=task,
                         system_prompt=system_prompt,
                         # Passed to the harness as well as recorded as a label: the
@@ -245,11 +249,23 @@ class Fleet:
                     env=dict(env or {}),
                     isolate=self.config.isolate_agents if isolate is None else isolate,
                     worktree_base=worktree_base,
+                    worktree_base_run_id=worktree_base_run_id,
                     labels={"effort": effort or self.config.budget.default_effort,
                             **(labels or {})},
                 )
             )
         return [self.submit(s) for s in specs]
+
+    def agent_model(self, model: str | None = None, backend: str | None = None) -> str:
+        """Resolve a model without ever sending one provider's default to another."""
+        if model:
+            return model
+        selected = backend or self.config.agent.name
+        configured = self.config.budget.default_model
+        mismatched = (selected == "codex-cli" and configured.startswith("claude-")) or (
+            selected == "claude-cli" and configured.startswith(("gpt-", "codex-"))
+        )
+        return get_backend(selected).default_model() if mismatched else configured
 
     def run_sweep(
         self,
@@ -285,8 +301,10 @@ class Fleet:
         image: str | None = None,
         timeout_s: int = 3600,
         env: dict[str, str] | None = None,
+        mounts: Sequence[Mount] | None = None,
         isolate: bool | None = None,
         worktree_base: str | None = None,
+        worktree_base_run_id: str | None = None,
         labels: dict[str, str] | None = None,
     ) -> JobRecord:
         return self.submit(
@@ -297,8 +315,10 @@ class Fleet:
                 resources=Resources(gpus=gpus, cpus=cpus if cpus is not None else _default_cpus()),
                 timeout_s=timeout_s,
                 env=dict(env or {}),
+                mounts=list(mounts or []),
                 isolate=bool(isolate),
                 worktree_base=worktree_base,
+                worktree_base_run_id=worktree_base_run_id,
                 labels=dict(labels or {}),
             )
         )
@@ -308,6 +328,8 @@ class Fleet:
         workflow: "Workflow | dict | str | Path",
         *,
         predicates: dict[str, Any] | None = None,
+        resume_from: str | None = None,
+        base_run: str | None = None,
     ) -> "WorkflowReport":
         """Run a multi-step pipeline defined in YAML, a dict, or Python.
 
@@ -326,7 +348,13 @@ class Fleet:
             {"name": workflow.name, "stages": [st.name for st in workflow.stages]},
             run_id=self.run_id,
         )
-        runner = WorkflowRunner(self, workflow, predicates=predicates)
+        if resume_from and base_run:
+            raise ValueError("use either resume_from or base_run, not both")
+        runner = WorkflowRunner(
+            self, workflow, predicates=predicates,
+            prior_run=resume_from or base_run,
+            resume=resume_from is not None,
+        )
         outcomes = runner.run()
         self.ledger.append(
             "workflow.finished",
