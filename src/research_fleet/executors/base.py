@@ -58,5 +58,13 @@ class Executor(Protocol):
         """Optional. Raise if nothing could possibly run, before anything is submitted."""
         ...
 
+    def drop_worktree(self, branch: str) -> None:
+        """Optional. Discard an isolated job's worktree/branch once nothing will use
+        it as a --worktree-base anymore. Only the caller knows that -- a branch can
+        have more than one consumer (parallel siblings sharing a base), so this is
+        never called automatically by the executor itself. A no-op if unsupported or
+        the branch is already gone."""
+        ...
+
     def close(self) -> None:
         ...

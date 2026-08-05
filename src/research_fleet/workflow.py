@@ -34,7 +34,7 @@ from typing import Any, Callable
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
-from .spec import JobKind, JobResult
+from .spec import JobKind, JobResult, JobState
 
 # ----------------------------------------------------------------- templating
 
@@ -406,6 +406,11 @@ class WorkflowRunner:
         self.predicates = predicates or {}
         self.results: dict[str, JobResult] = {}
         self.outcomes: list[StageOutcome] = []
+        # The most recent isolated, single-job step, so the next chained step can
+        # pick up its file changes instead of starting from the live tree's HEAD.
+        # Only ever advanced past a step that ran as exactly one isolated job and
+        # succeeded -- a fan-out or a failed step leaves no single branch to trust.
+        self._worktree_tip: str | None = None
 
     # --------------------------------------------------------------- helpers
 
@@ -418,15 +423,24 @@ class WorkflowRunner:
 
     def _defaults(self, step: Step) -> dict[str, Any]:
         wf = self.workflow
+        isolate = step.isolate if step.isolate is not None else wf.isolate
+        if isolate is None:
+            isolate = self.fleet.config.isolate_agents
         return {
             "model": step.model or wf.model,
             "effort": step.effort or wf.effort,
             "gpus": step.gpus if step.gpus != 1.0 else (wf.gpus if wf.gpus is not None else step.gpus),
-            "isolate": step.isolate if step.isolate is not None else wf.isolate,
+            "isolate": isolate,
         }
 
-    def _submit(self, step: Step, label: str, extra_ctx: dict[str, Any]) -> list[str]:
-        """Submit one step, expanding a fan-out into several jobs."""
+    def _submit(self, step: Step, label: str, extra_ctx: dict[str, Any]) -> tuple[list[str], str | None]:
+        """Submit one step, expanding a fan-out into several jobs.
+
+        Returns the submitted job ids, plus a chain label the caller can advance
+        `self._worktree_tip` to once the step succeeds. That label is only set when
+        the step ran as exactly one isolated job: a fan-out has no single branch to
+        hand to whatever comes next, and an unisolated step has no branch at all.
+        """
         ctx = self._context(extra_ctx)
         opts = self._defaults(step)
 
@@ -435,6 +449,9 @@ class WorkflowRunner:
             items = list(step.for_each)
         else:
             items = list(range(step.copies))
+
+        chainable = len(items) == 1 and opts["isolate"]
+        base = self._worktree_tip if chainable else None
 
         records = []
         for index, item in enumerate(items):
@@ -454,17 +471,39 @@ class WorkflowRunner:
                     render(step.task, item_ctx),
                     n=1, name_prefix=name, labels=labels,
                     model=opts["model"], effort=opts["effort"], gpus=opts["gpus"],
-                    timeout_s=step.timeout_s, isolate=opts["isolate"],
+                    timeout_s=step.timeout_s, isolate=opts["isolate"], worktree_base=base,
                 )
             else:
                 records.append(
                     self.fleet.run_command(
                         [render(part, item_ctx) for part in step.command],
                         name=name, gpus=opts["gpus"], timeout_s=step.timeout_s,
-                        isolate=opts["isolate"], labels=labels,
+                        isolate=opts["isolate"], worktree_base=base, labels=labels,
                     )
                 )
-        return [r.spec.id for r in records]
+        return [r.spec.id for r in records], (label if chainable else None)
+
+    def _advance_tip(self, chain_label: str | None, result_key: str) -> None:
+        """Move the chain forward past `result_key`, but only once it has actually
+        succeeded -- continuing from a failed or missing job would hand the next
+        step a branch that either doesn't exist or isn't trustworthy.
+
+        This is the only place the tip moves, and it only runs when `result_key`
+        was the single, unambiguous successor of the current tip (see `_submit`) --
+        so by construction nothing else could still be relying on the branch it
+        displaces, and it's safe to drop right here. A wave with several parallel
+        siblings sharing one base never reaches this with a chain_label at all
+        (each is a fan-out or the wave held more than one step), so that base is
+        deliberately left alone for `ship worktrees prune` instead.
+        """
+        if chain_label is None:
+            return
+        result = self.results.get(result_key)
+        if result is not None and result.state == JobState.SUCCEEDED:
+            old_tip = self._worktree_tip
+            self._worktree_tip = chain_label
+            if old_tip is not None:
+                self.fleet.drop_worktree(old_tip)
 
     def _record(self, step_name: str, job_ids: list[str], report) -> None:
         """Record a step's results from a finished report.
@@ -521,9 +560,14 @@ class WorkflowRunner:
             submitted = {st.name: self._submit(st, st.name, {"iteration": 1}) for st in steps}
             if submitted:
                 report = self.fleet.wait()
-                for name, job_ids in submitted.items():
+                for name, (job_ids, _chain_label) in submitted.items():
                     self._record(name, job_ids, report)
                     outcomes[name] = StageOutcome(stage=name, job_ids=job_ids)
+                # Only advance the chain when the wave held exactly one node: several
+                # parallel siblings would each have their own idea of "what's next".
+                if len(steps) == 1:
+                    only = steps[0].name
+                    self._advance_tip(submitted[only][1], only)
 
             for loop in loops:
                 outcomes[loop.name] = self._run_loop(loop)
@@ -548,11 +592,12 @@ class WorkflowRunner:
                     outcomes[name].job_ids += inner.job_ids
                     continue
                 label = f"{name}-{iteration}" if iteration > 1 else name
-                job_ids = self._submit(stage, label, {"iteration": iteration})
+                job_ids, chain_label = self._submit(stage, label, {"iteration": iteration})
                 outcomes[name].job_ids += job_ids
                 # Recorded under the bare name, so `{{ steps.review.output }}` always
                 # means the current round.
                 self._collect(name, job_ids)
+                self._advance_tip(chain_label, name)
 
             met = [n for n, cond in stops if cond.met(self.results, default_step=n)]
             predicate = self.predicates.get(group[0])
@@ -571,11 +616,12 @@ class WorkflowRunner:
             outcome.iterations = iteration
             for step in loop.steps:
                 label = f"{loop.name}-{step.name}-{iteration}"
-                job_ids = self._submit(step, label, {"iteration": iteration})
+                job_ids, chain_label = self._submit(step, label, {"iteration": iteration})
                 outcome.job_ids += job_ids
                 # Collected under the plain step name so `{{ steps.review.output }}`
                 # always refers to the current iteration.
                 self._collect(step.name, job_ids)
+                self._advance_tip(chain_label, step.name)
 
             if predicate is not None and predicate(self.results):
                 outcome.stopped_early = True

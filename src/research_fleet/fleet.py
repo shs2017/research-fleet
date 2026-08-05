@@ -13,6 +13,7 @@ entry points can never drift apart in behaviour.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Sequence
@@ -23,10 +24,23 @@ from .executors import build_executor
 from .ledger import Ledger, Redactor
 from .scheduler import JobRecord, Scheduler
 from .spec import AgentConfig, JobKind, JobResult, JobSpec, Mount, Resources
-from .sweep import build_sweep
+from .sweep import build_sweep, expand_grid
 
 if TYPE_CHECKING:
     from .workflow import Workflow
+
+
+def _default_cpus(n: int = 1) -> float:
+    """A per-job CPU request that fits the host, split across `n` jobs meant to run
+    at once.
+
+    Docker rejects `--cpus` outright when it exceeds the host's core count (unlike
+    GPUs, there is no queueing fallback), so callers that do not pass `cpus`
+    explicitly must still end up with a value the host can satisfy rather than
+    `Resources`' fixed default.
+    """
+    total = os.cpu_count() or 1
+    return max(0.01, total / max(1, n))
 
 
 @dataclass
@@ -59,6 +73,23 @@ class RunReport:
             j["id"] for j in self.status.get("jobs", []) if j["state"] == "awaiting_approval"
         ]
 
+    @property
+    def worktrees(self) -> list[tuple[str, str]]:
+        """(path, branch) for isolated jobs whose worktree still exists on disk.
+
+        A chained job's predecessor is deliberately pruned once its changes are
+        folded forward (see ship's --worktree-base), so filtering on existence -
+        rather than listing every isolated job - naturally surfaces just the
+        current tips instead of paths that no longer exist.
+        """
+        seen: set[str] = set()
+        out: list[tuple[str, str]] = []
+        for r in self.succeeded:
+            if r.worktree_path and r.worktree_path not in seen and Path(r.worktree_path).exists():
+                seen.add(r.worktree_path)
+                out.append((r.worktree_path, r.worktree_branch or "?"))
+        return out
+
     def summary(self) -> str:
         lines = [
             f"run {self.run_id}: {len(self.succeeded)} succeeded, {len(self.failed)} failed",
@@ -73,6 +104,13 @@ class RunReport:
         for jid, res in self.results.items():
             dur = f"{res.duration_s:.1f}s" if res.duration_s else "-"
             lines.append(f"  {jid}  {res.state.value:<10} {dur:>8}  {res.error or ''}".rstrip())
+        wts = self.worktrees
+        if wts:
+            lines.append("")
+            lines.append("isolated work landed in (not your working tree):")
+            for path, branch in wts:
+                lines.append(f"  {path}  (branch {branch})")
+            lines.append(f"bring it in with, e.g.: git merge {wts[-1][1]}")
         return "\n".join(lines)
 
 
@@ -142,6 +180,15 @@ class Fleet:
     def submit(self, spec: JobSpec) -> JobRecord:
         return self.scheduler.submit(spec)
 
+    def drop_worktree(self, branch: str) -> None:
+        """Discard an isolated job's worktree/branch. Only call this once nothing
+        will use it as a --worktree-base anymore -- a branch can have more than one
+        consumer, so it is never dropped automatically. No-op on executors that
+        don't support isolation (e.g. dry-run, slurm)."""
+        drop = getattr(self.executor, "drop_worktree", None)
+        if callable(drop):
+            drop(branch)
+
     def run_agents(
         self,
         task: str,
@@ -151,6 +198,7 @@ class Fleet:
         backend: str | None = None,
         effort: str | None = None,
         gpus: float = 1.0,
+        cpus: float | None = None,
         image: str | None = None,
         timeout_s: int = 3600,
         max_turns: int | None = None,
@@ -159,6 +207,7 @@ class Fleet:
         mounts: Sequence[Mount] | None = None,
         env: dict[str, str] | None = None,
         isolate: bool | None = None,
+        worktree_base: str | None = None,
         labels: dict[str, str] | None = None,
         name_prefix: str = "agent",
     ) -> list[JobRecord]:
@@ -166,6 +215,10 @@ class Fleet:
 
         Running several on one task is the point: they explore different
         approaches, and you compare their results and their traces afterwards.
+
+        `worktree_base` only matters when isolated: it names another isolated job in
+        this run whose branch this one should continue from (see `JobSpec.worktree_base`),
+        rather than starting fresh from the live tree's HEAD.
         """
         self._require_credentials()
         specs = []
@@ -183,11 +236,12 @@ class Fleet:
                         max_turns=max_turns,
                         allowed_tools=list(allowed_tools) if allowed_tools else None,
                     ),
-                    resources=Resources(gpus=gpus),
+                    resources=Resources(gpus=gpus, cpus=cpus if cpus is not None else _default_cpus(n)),
                     timeout_s=timeout_s,
                     mounts=list(mounts or []),
                     env=dict(env or {}),
                     isolate=self.config.isolate_agents if isolate is None else isolate,
+                    worktree_base=worktree_base,
                     labels={"effort": effort or self.config.budget.default_effort,
                             **(labels or {})},
                 )
@@ -201,15 +255,17 @@ class Fleet:
         *,
         points: Sequence[dict[str, Any]] | None = None,
         gpus: float = 1.0,
+        cpus: float | None = None,
         image: str | None = None,
         timeout_s: int = 3600,
         env: dict[str, str] | None = None,
         name_prefix: str = "sweep",
     ) -> list[JobRecord]:
+        n = len(points) if points is not None else len(expand_grid(grid or {}))
         specs = build_sweep(
             command, grid, points=points,
             image=image or self.config.image,
-            resources=Resources(gpus=gpus),
+            resources=Resources(gpus=gpus, cpus=cpus if cpus is not None else _default_cpus(n)),
             name_prefix=name_prefix,
             timeout_s=timeout_s,
             env=env,
@@ -222,10 +278,12 @@ class Fleet:
         *,
         name: str = "cmd",
         gpus: float = 1.0,
+        cpus: float | None = None,
         image: str | None = None,
         timeout_s: int = 3600,
         env: dict[str, str] | None = None,
         isolate: bool | None = None,
+        worktree_base: str | None = None,
         labels: dict[str, str] | None = None,
     ) -> JobRecord:
         return self.submit(
@@ -233,10 +291,11 @@ class Fleet:
                 name=name,
                 command=list(command),
                 image=image or self.config.image,
-                resources=Resources(gpus=gpus),
+                resources=Resources(gpus=gpus, cpus=cpus if cpus is not None else _default_cpus()),
                 timeout_s=timeout_s,
                 env=dict(env or {}),
                 isolate=bool(isolate),
+                worktree_base=worktree_base,
                 labels=dict(labels or {}),
             )
         )

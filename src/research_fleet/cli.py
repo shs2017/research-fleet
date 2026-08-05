@@ -73,6 +73,25 @@ def _gpu_share(requested: Optional[float], agents: int, devices: int) -> tuple[f
     return share, f"{share:.2f} GPU each on {devices} device(s), all {agents} run together"
 
 
+def _cpu_share(requested: Optional[float], agents: int) -> tuple[float, str]:
+    """Choose how many CPUs each agent reserves, and explain the choice.
+
+    Docker rejects a container outright if `--cpus` exceeds the host's core count
+    (`range of CPUs is from 0.01 to N`), so an unset request is derived from what
+    the host actually has rather than a fixed guess that breaks on small hosts.
+    """
+    total = os.cpu_count() or 1
+    if requested is not None:
+        if requested > total:
+            return requested, (
+                f"[yellow]note: --cpus {requested} exceeds the {total} core(s) on this host; "
+                f"docker will refuse it. Try --cpus {total / agents:.2f}.[/yellow]"
+            )
+        return requested, ""
+    share = max(0.01, total / agents)
+    return share, f"{share:.2f} CPU(s) each on {total} core(s)"
+
+
 def _overrides(workspace=None, image=None, executor=None, max_usd=None) -> dict:
     """Map the flags shared by `run` and `sweep` onto config overrides."""
     out: dict = {"workspace": workspace, "image": image}
@@ -146,6 +165,10 @@ def run(
         None, "--gpus",
         help="GPUs per agent. Default: share the devices so every agent runs at once.",
     ),
+    cpus: Optional[float] = typer.Option(
+        None, "--cpus",
+        help="CPUs per agent. Default: share the host's cores so every agent runs at once.",
+    ),
     workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
     image: Optional[str] = typer.Option(None, "--image"),
     timeout: int = typer.Option(3600, "--timeout", help="Per-agent wall clock, seconds."),
@@ -171,6 +194,7 @@ def run(
     try:
         est = fleet.quote(model, effort=effort or fleet.config.budget.default_effort)
         share, note = _gpu_share(gpus, agents, fleet.scheduler.slots.device_count)
+        cpu_share, cpu_note = _cpu_share(cpus, agents)
         console.print(
             f"[bold]run {fleet.run_id}[/bold]  {agents} agent(s)  "
             f"est. ${est.est_cost_usd * agents:.2f} ({est.source})  "
@@ -178,9 +202,11 @@ def run(
         )
         if note:
             console.print(f"[dim]{note}[/dim]" if not note.startswith("[") else note)
+        if cpu_note:
+            console.print(f"[dim]{cpu_note}[/dim]" if not cpu_note.startswith("[") else cpu_note)
         fleet.run_agents(
             task, n=agents, model=model, backend=backend, effort=effort,
-            gpus=share, timeout_s=timeout,
+            gpus=share, cpus=cpu_share, timeout_s=timeout,
         )
         report = fleet.wait()
         console.print()

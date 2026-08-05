@@ -106,6 +106,12 @@ class JobSpec(BaseModel):
         False,
         description="Run against a git worktree on its own branch instead of the live tree.",
     )
+    worktree_base: str | None = Field(
+        None,
+        description="Name of another isolated job in this run to branch from instead of the "
+                    "live tree's HEAD. That job's pending changes are committed first, so this "
+                    "one picks up where it left off while still getting its own reviewable branch.",
+    )
     depends_on: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict, description="Sweep coordinates; recorded verbatim in the ledger.")
     labels: dict[str, str] = Field(default_factory=dict)
@@ -144,6 +150,12 @@ class JobResult(BaseModel):
     container_id: str | None = None
     metrics: dict[str, float] = Field(default_factory=dict)
     artifacts: list[str] = Field(default_factory=list)
+    worktree_path: str | None = Field(
+        None, description="Where an isolated job's files actually landed, if it isolated."
+    )
+    worktree_branch: str | None = Field(
+        None, description="The branch that path is checked out on."
+    )
     usage: dict[str, Any] = Field(default_factory=dict, description="Token/cost accounting for agent jobs.")
     output: str = Field(
         "", description="The job's answer: an agent's final message, or a command's last output."

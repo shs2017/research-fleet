@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import collections
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -32,6 +33,12 @@ from .base import LineHandler, Placement
 
 class ShipUnavailable(RuntimeError):
     pass
+
+
+# What `resolve_worktree()` in `ship` prints on stderr once it isolates a job, so a
+# result can say where the work actually landed instead of that line vanishing with
+# the rest of `ship docker-args`' stderr.
+_WORKTREE_RE = re.compile(r"^\[ship\] isolated in worktree (\S+) on branch (\S+)$", re.MULTILINE)
 
 
 def _explain(code: int | None, stderr_tail) -> str:
@@ -180,6 +187,11 @@ class ShipExecutor:
         # agents on one question each land on their own reviewable branch.
         if spec.isolate:
             flags += ["--worktree", f"fleet/{spec.run_id}-{spec.name}"[:80]]
+            if spec.worktree_base:
+                # Same derivation as above, applied to the job this one continues from,
+                # so a chain of steps (plan -> implement -> review) keeps each other's
+                # file edits without sharing a single branch.
+                flags += ["--worktree-base", f"fleet/{spec.run_id}-{spec.worktree_base}"[:80]]
 
         if placement.gpu_ids:
             # Quoted form is what Docker's --gpus parser expects for a device list.
@@ -206,7 +218,7 @@ class ShipExecutor:
         flags += ["--label", f"fleet.job={spec.id}", "--label", f"fleet.run={spec.run_id}"]
         return flags
 
-    def build_argv(
+    def _resolve_docker_args(
         self,
         spec: JobSpec,
         *,
@@ -215,24 +227,18 @@ class ShipExecutor:
         placement: Placement,
         policy: Policy,
         name: str,
-    ) -> list[str]:
-        """Ask research-ship for the container argv, then layer the fleet's limits on."""
+    ) -> subprocess.CompletedProcess:
+        """Run `ship docker-args`, unchecked, so callers can inspect stderr too --
+        that's where an isolated job's worktree location is reported."""
         cmd = [self.ship, "docker-args", *self._ship_flags(spec, env, placement, policy, name), "--", *argv]
         proc_env = dict(os.environ)
         if self.project_dir:
             proc_env["SHIP_PROJECT_DIR"] = self.project_dir
         if policy.network.allowed_hosts:
             proc_env["FIREWALL_EXTRA_DOMAINS"] = " ".join(policy.network.allowed_hosts)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=proc_env)
 
-        try:
-            out = subprocess.run(
-                cmd, capture_output=True, text=True, check=True, timeout=60, env=proc_env
-            ).stdout
-        except subprocess.CalledProcessError as exc:
-            raise ShipUnavailable(
-                f"`ship docker-args` failed ({exc.returncode}): {exc.stderr.strip()}"
-            ) from exc
-
+    def _finish_argv(self, spec: JobSpec, policy: Policy, out: str) -> list[str]:
         tokens = out.splitlines()
         if len(tokens) < 2 or tokens[0] != "docker":
             raise ShipUnavailable(f"unexpected output from ship docker-args: {out[:200]!r}")
@@ -246,6 +252,26 @@ class ShipExecutor:
             *policy.container.docker_args(),
         ]
         return [self.docker, "run", *limits, *tokens[2:]]
+
+    def build_argv(
+        self,
+        spec: JobSpec,
+        *,
+        argv: list[str],
+        env: dict[str, str],
+        placement: Placement,
+        policy: Policy,
+        name: str,
+    ) -> list[str]:
+        """Ask research-ship for the container argv, then layer the fleet's limits on."""
+        proc = self._resolve_docker_args(
+            spec, argv=argv, env=env, placement=placement, policy=policy, name=name
+        )
+        if proc.returncode != 0:
+            raise ShipUnavailable(
+                f"`ship docker-args` failed ({proc.returncode}): {proc.stderr.strip()}"
+            )
+        return self._finish_argv(spec, policy, proc.stdout)
 
     # ------------------------------------------------------------------- run
 
@@ -267,14 +293,24 @@ class ShipExecutor:
         )
 
         try:
-            docker_argv = self.build_argv(
+            resolve_proc = self._resolve_docker_args(
                 spec, argv=argv, env=env, placement=placement, policy=policy, name=name
             )
+            if resolve_proc.returncode != 0:
+                raise ShipUnavailable(
+                    f"`ship docker-args` failed ({resolve_proc.returncode}): {resolve_proc.stderr.strip()}"
+                )
+            docker_argv = self._finish_argv(spec, policy, resolve_proc.stdout)
         except ShipUnavailable as exc:
             result.state = JobState.FAILED
             result.error = str(exc)
             result.ended_at = time.time()
             return result
+
+        if spec.isolate:
+            match = _WORKTREE_RE.search(resolve_proc.stderr)
+            if match:
+                result.worktree_path, result.worktree_branch = match.group(1), match.group(2)
 
         # Secret-bearing vars reach the daemon through the subprocess environment,
         # never through the command line.
@@ -368,6 +404,19 @@ class ShipExecutor:
                 pass
             return True
         return False
+
+    def drop_worktree(self, branch: str) -> None:
+        """Ask ship to discard an isolated job's worktree/branch. Fire-and-forget:
+        the branch's content is either already folded into something else's history
+        or was never needed again, so a failure here just leaves disk unreclaimed
+        rather than losing anything."""
+        proc_env = dict(os.environ)
+        if self.project_dir:
+            proc_env["SHIP_PROJECT_DIR"] = self.project_dir
+        subprocess.run(
+            [self.ship, "worktree-drop", branch],
+            capture_output=True, text=True, timeout=30, env=proc_env, check=False,
+        )
 
     def close(self) -> None:
         with self._lock:
