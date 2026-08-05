@@ -210,6 +210,7 @@ stages:
 ```bash
 fleet workflow examples/code-review-loop.yaml --plan     # validate and show the stages
 fleet workflow examples/code-review-loop.yaml --max-usd 10
+fleet workflow examples/code-review-loop.yaml --detach
 ```
 
 Workflow progress is checkpointed after every completed wave. A new invocation is
@@ -227,6 +228,15 @@ artifacts are mounted read-only at `/previous-results`; new artifacts remain und
 run. To deliberately build on a prior run but execute every stage again, use
 `--from-run run_abc123` instead. In Python, pass `resume_from="run_abc123"` or
 `base_run="run_abc123"` to `run_workflow()`.
+
+Detached workflows use the same checkpointing and inheritance options. The generated
+run id can be watched and inspected exactly like a detached agent run:
+
+```bash
+fleet workflow workflow.yaml --resume run_abc123 --detach
+fleet watch run_new456
+fleet ls run_new456
+```
 
 `{{ steps.<name>.output }}` carries a step's answer into a later prompt, which is what
 lets the reviewer's objection reach the next implementation round. `{{ iteration }}` and

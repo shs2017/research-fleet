@@ -261,6 +261,10 @@ def workflow(
     base_run: Optional[str] = typer.Option(
         None, "--from-run", help="Reuse a run's outputs/files but execute all stages again."
     ),
+    detach: bool = typer.Option(
+        False, "--detach", "-d", help="Return immediately; run the workflow in the background."
+    ),
+    run_id: Optional[str] = typer.Option(None, "--run-id", hidden=True),
 ):
     """Run a multi-step pipeline, for example a coder and reviewer loop."""
     from .workflow import Loop, Step, Workflow
@@ -306,9 +310,14 @@ def workflow(
                     console.print(f"    {name} ({stage.kind.value}){fan}{after}")
         return
 
+    if detach:
+        _detach_and_return(config)
+        return
+
     with _fleet(
         config, **_overrides(workspace, None, executor, max_usd),
         on_event=_live_printer(verbose),
+        run_id=run_id,
     ) as fleet:
         _cancel_on_interrupt(fleet)
         console.print(f"[bold]run {fleet.run_id}[/bold]  workflow {wf.name}")

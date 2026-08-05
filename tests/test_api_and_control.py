@@ -112,6 +112,37 @@ def test_codex_backend_does_not_inherit_a_claude_default_model(tmp_path):
         fleet.close()
 
 
+def test_detached_workflow_relaunches_with_a_stable_run_id(tmp_path, monkeypatch):
+    import sys
+
+    from research_fleet import cli
+
+    config = tmp_path / "fleet.yaml"
+    config.write_text(f"root: {tmp_path / 'state'}\n")
+    launched = {}
+
+    class Process:
+        def __init__(self, argv, **kwargs):
+            launched["argv"] = argv
+            launched["kwargs"] = kwargs
+
+    monkeypatch.setattr("subprocess.Popen", Process)
+    monkeypatch.setattr(sys, "argv", [
+        "fleet", "workflow", "workflow.yaml", "--resume", "run_old", "--detach",
+    ])
+
+    cli._detach_and_return(str(config))
+
+    argv = launched["argv"]
+    assert argv[:3] == ["fleet", "workflow", "workflow.yaml"]
+    assert "--detach" not in argv
+    assert argv[argv.index("--resume") + 1] == "run_old"
+    run_id = argv[argv.index("--run-id") + 1]
+    assert run_id.startswith("run_")
+    assert launched["kwargs"]["start_new_session"] is True
+    assert (tmp_path / "state" / "logs" / f"{run_id}.log").exists()
+
+
 def test_trace_returns_one_jobs_events_in_order(tmp_path):
     fleet = _fleet(tmp_path)
     try:
