@@ -193,19 +193,6 @@ def _agent_spec(**kw) -> JobSpec:
     return JobSpec(**base)
 
 
-def test_policy_blocks_excess_recursion_depth():
-    p = Policy(max_agent_depth=1)
-    assert p.check(_agent_spec(), depth=2).verdict == "deny"
-    assert p.check(_agent_spec(), depth=1).verdict == "allow"
-
-
-def test_policy_blocks_fanout():
-    p = Policy(max_children_per_agent=2)
-    spec = _agent_spec(parent_job_id="job_parent")
-    assert p.check(spec, sibling_count=2).verdict == "deny"
-    assert p.check(spec, sibling_count=1).verdict == "allow"
-
-
 def test_policy_blocks_dangerous_mounts(tmp_path):
     p = Policy(allowed_mount_roots=[str(tmp_path)])
     spec = JobSpec(name="c", command=["true"], mounts=[Mount(source="/etc", target="/etc")])

@@ -6,7 +6,7 @@ A fleet run is a DAG of `JobSpec`s. Two kinds exist:
   * `agent`  : run an LLM coding agent in a container; it may submit further jobs
 
 Both share the same resource, isolation and audit surface, which is what makes
-"agent that launches a child job" work without a second scheduler.
+commands and agents share one scheduling and audit path.
 """
 
 from __future__ import annotations

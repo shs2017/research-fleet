@@ -1,14 +1,12 @@
 """Schedule jobs across GPU slots with policy, budgets, and an audit trail.
 
-Agents submit child jobs through per-job spool directories. Every child returns through
-the normal validation path and receives a budget scope bounded by its parent.
+Every workflow job follows the same policy, budget, scheduling, and ledger path.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import threading
 import time
 import warnings
@@ -151,8 +149,6 @@ class Scheduler:
         self._pool = ThreadPoolExecutor(
             max_workers=self.policy.max_concurrent_jobs, thread_name_prefix="fleet-job"
         )
-        self._spool_root = config.root_path / "spool"
-        self._spool_root.mkdir(parents=True, exist_ok=True)
         self._stop = threading.Event()
         self._watcher: threading.Thread | None = None
 
@@ -352,35 +348,13 @@ class Scheduler:
             placement = Placement(node="local", gpu_ids=gpu_ids)
             self._set_state(rec, JobState.RUNNING, {"gpu_ids": list(gpu_ids), "argv_preview": argv[:2]})
 
-            spool_stop = threading.Event()
-            spool_thread: threading.Thread | None = None
-            if spec.kind is JobKind.AGENT:
-                spool_dir = self._spool_root / spec.id
-
-                def drain_spool_live() -> None:
-                    while not spool_stop.wait(0.25):
-                        self._drain_spool(rec, spool_dir)
-
-                spool_thread = threading.Thread(
-                    target=drain_spool_live,
-                    name=f"fleet-spool-{spec.id}",
-                    daemon=True,
-                )
-                spool_thread.start()
-
-            try:
-                result = self.executor.run(
-                    spec, argv=argv, env=env, placement=placement,
-                    policy=self.policy,
-                    on_line=self._make_line_handler(
-                        rec, get_backend(spec.agent.backend) if spec.agent else None
-                    ),
-                )
-            finally:
-                if spool_thread is not None:
-                    spool_stop.set()
-                    spool_thread.join(timeout=2.0)
-                    self._drain_spool(rec, self._spool_root / spec.id)
+            result = self.executor.run(
+                spec, argv=argv, env=env, placement=placement,
+                policy=self.policy,
+                on_line=self._make_line_handler(
+                    rec, get_backend(spec.agent.backend) if spec.agent else None
+                ),
+            )
 
             result.usage = rec.usage.to_dict()
             result.output = rec.output or "\n".join(rec.tail)
@@ -498,8 +472,7 @@ class Scheduler:
             return self._isolation
 
     def _prepare(self, rec: JobRecord) -> tuple[list[str], dict[str, str]]:
-        """Build the argv and env for a job, mounting its results and (for agent
-        jobs) its spool directory, and opening its child budget scope."""
+        """Build the argv and environment and mount the job's results directory."""
         spec = rec.spec
         env = dict(self.config.env)
         env.update(spec.env)
@@ -532,10 +505,15 @@ class Scheduler:
 
         parent_scope = rec.budget_scope
         parent_node = self.budget.get(parent_scope)
-        frac = self.config.budget.max_child_grant_fraction
-        grant_usd = min(self.policy.max_usd_per_job, parent_node.remaining_usd * frac + rec.reserved_usd)
+        grant_usd = min(
+            self.policy.max_usd_per_job,
+            parent_node.remaining_usd * 0.5 + rec.reserved_usd,
+        )
         grant_tokens = int(
-            min(self.policy.max_tokens_per_job, parent_node.remaining_tokens * frac + rec.reserved_tokens)
+            min(
+                self.policy.max_tokens_per_job,
+                parent_node.remaining_tokens * 0.5 + rec.reserved_tokens,
+            )
         )
         child_scope = f"{spec.id}"
         # Move the reservation into the child scope instead of charging it twice.
@@ -554,23 +532,15 @@ class Scheduler:
         rec.owns_scope = True
         node = self.budget.get(child_scope)
 
-        # Keep the spool outside /workspace so it cannot shadow project files.
-        spool_dir = self._spool_root / spec.id
-        spool_dir.mkdir(parents=True, exist_ok=True)
-        spec.mounts.append(Mount(source=str(spool_dir), target="/spool", mode="rw"))
-        env["FLEET_SUBMIT_DIR"] = "/spool"
         env["FLEET_BUDGET_USD"] = f"{node.remaining_usd:.4f}"
         env["FLEET_BUDGET_TOKENS"] = str(node.remaining_tokens)
-        env["FLEET_DEPTH"] = str(rec.depth)
-        env["FLEET_MAX_DEPTH"] = str(self.policy.max_agent_depth)
 
         brief = self._agent_brief(rec, node.remaining_usd, node.remaining_tokens)
         return backend.build_command(spec.agent, brief=brief), env
 
     def _agent_brief(self, rec: JobRecord, remaining_usd: float, remaining_tokens: int) -> str:
-        """Everything the agent needs to spend and delegate responsibly."""
-        can_delegate = rec.depth < self.policy.max_agent_depth
-        parts = [
+        """Standing run information included with an agent prompt."""
+        return "\n".join([
             render_cost_brief(
                 remaining_usd,
                 remaining_tokens,
@@ -582,56 +552,7 @@ class Scheduler:
                 chained_from=rec.spec.worktree_base,
             ),
             sharedprompt.render(self._shared_prompt()),
-        ]
-        if can_delegate:
-            parts.append(
-                "\n".join(
-                    [
-                        "",
-                        "## Delegating work",
-                        f"You may launch up to {self.policy.max_children_per_agent} sub-jobs "
-                        f"(you are at depth {rec.depth} of {self.policy.max_agent_depth}).",
-                        "",
-                        "To launch one, write a JSON file into `$FLEET_SUBMIT_DIR`:",
-                        "",
-                        "```bash",
-                        'cat > "$FLEET_SUBMIT_DIR/try-baseline.json" <<\'EOF\'',
-                        json.dumps(
-                            {
-                                "kind": "agent",
-                                "name": "try-baseline",
-                                "agent": {
-                                    "backend": "claude-cli",
-                                    "model": "claude-haiku-4-5",
-                                    "task": "Run the baseline config and report val loss.",
-                                },
-                                "resources": {"gpus": 1},
-                                "labels": {"effort": "low", "process": "agent_short"},
-                            },
-                            indent=2,
-                        ),
-                        "EOF",
-                        "```",
-                        "",
-                        "Or, for a plain training run, use `\"kind\": \"command\"` with a "
-                        "`\"command\": [...]` array instead of an `agent` block.",
-                        "",
-                        "Each sub-job is checked against the same policy and debits the budget "
-                        "above before it starts. A launch that would overspend is rejected with a "
-                        "reason written back to `$FLEET_SUBMIT_DIR/<name>.rejected.json`: read it "
-                        "and pick a cheaper model or lower effort rather than retrying blindly.",
-                        "Write results to `$FLEET_RESULTS_DIR`; anything else is discarded when "
-                        "the container exits.",
-                    ]
-                )
-            )
-        else:
-            parts.append(
-                f"\n## Delegating work\nYou are at the maximum depth "
-                f"({self.policy.max_agent_depth}) and cannot launch sub-agents. "
-                "Complete this task directly."
-            )
-        return "\n".join(parts)
+        ])
 
     def _make_line_handler(self, rec: JobRecord, backend) -> Callable[[str, str], None]:
         spec_id = rec.spec.id
@@ -699,51 +620,6 @@ class Scheduler:
                 self._on_event(type_, payload)
             except Exception:
                 pass
-
-    def _drain_spool(self, parent: JobRecord, spool_dir: Path) -> list[JobRecord]:
-        """Ingest child job requests an agent wrote to its spool directory."""
-        submitted: list[JobRecord] = []
-        for path in sorted(spool_dir.glob("*.json")):
-            if path.name.endswith(".rejected.json"):
-                continue
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                self._reject(path, f"unreadable submission: {exc}")
-                continue
-            try:
-                payload.pop("id", None)
-                payload.pop("run_id", None)
-                payload.pop("parent_job_id", None)
-                # Child jobs cannot replace the operator-selected image.
-                payload["image"] = self.config.image
-                child = JobSpec(**payload)
-            except Exception as exc:
-                self._reject(path, f"invalid job spec: {exc}")
-                continue
-
-            self.ledger.append(
-                "agent.job_requested",
-                {"parent": parent.spec.id, "source_file": path.name,
-                 "spec": child.model_dump(mode="json")},
-                run_id=self.run_id, job_id=parent.spec.id,
-            )
-            rec = self.submit(child, parent=parent)
-            if rec.state is JobState.DENIED:
-                self._reject(path, rec.result.error if rec.result else "denied by policy")
-            else:
-                path.unlink(missing_ok=True)
-            submitted.append(rec)
-        return submitted
-
-    def _reject(self, path: Path, reason: str) -> None:
-        out = path.with_suffix(".rejected.json")
-        try:
-            out.write_text(json.dumps({"rejected": True, "reason": reason}, indent=2), encoding="utf-8")
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        self.ledger.append("agent.job_rejected", {"file": path.name, "reason": reason}, run_id=self.run_id)
 
     def _maybe_close_scope(self, rec: JobRecord) -> None:
         """Return an agent's unused grant to its parent: but only once every
@@ -893,4 +769,3 @@ class Scheduler:
         self._stop.set()
         self.executor.close()
         self._pool.shutdown(wait=True, cancel_futures=True)
-        shutil.rmtree(self._spool_root, ignore_errors=True)

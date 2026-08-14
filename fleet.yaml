@@ -17,5 +17,3 @@ budget:
 
 policy:
   max_concurrent_jobs: 8
-  max_agent_depth: 2
-  max_children_per_agent: 8

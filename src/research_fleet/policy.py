@@ -7,8 +7,6 @@ against a plan (`fleet plan --explain`) to see what would be blocked.
 
 Layers, roughly outermost to innermost:
 
-  * **Fanout & depth**: an agent that can spawn agents can recurse forever;
-    `max_agent_depth` and `max_children_per_agent` bound the tree.
   * **Budget**: enforced in `budget.BudgetTracker`, invoked from here so a
     denial reads the same as any other.
   * **Resources**: per-job ceilings, so one job can't request the whole cluster.
@@ -84,8 +82,6 @@ class ContainerPolicy(BaseModel):
 class Policy(BaseModel):
     """The full safeguard surface. Serialised into the ledger at run start."""
 
-    max_agent_depth: int = Field(2, ge=0, description="0 = agents may not spawn agents at all.")
-    max_children_per_agent: int = Field(8, ge=0)
     max_concurrent_jobs: int = Field(16, ge=1)
 
     max_gpus_per_job: float = Field(8.0, gt=0)
@@ -201,13 +197,6 @@ class Policy(BaseModel):
         return Decision("allow", reasons, mutations)
 
     def _limit_error(self, spec, depth: int, sibling_count: int) -> str | None:
-        if depth > self.max_agent_depth:
-            return f"agent depth {depth} exceeds max_agent_depth={self.max_agent_depth}"
-        if spec.parent_job_id and sibling_count >= self.max_children_per_agent:
-            return (
-                f"parent {spec.parent_job_id} already has {sibling_count} children "
-                f"(max_children_per_agent={self.max_children_per_agent})"
-            )
         if spec.resources.gpus > self.max_gpus_per_job:
             return f"requested {spec.resources.gpus} GPUs > max_gpus_per_job={self.max_gpus_per_job}"
         if spec.resources.memory_gb > self.max_memory_gb_per_job:

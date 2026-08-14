@@ -38,8 +38,6 @@ class BudgetConfig(BaseModel):
         default_factory=lambda: ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
     )
     default_effort: str = "high"
-    # Fraction of an agent's remaining balance it may grant to any single child.
-    max_child_grant_fraction: float = Field(0.5, gt=0.0, le=1.0)
     model_costs: dict[str, dict[str, float]] = Field(
         default_factory=dict,
         description="Override or add price-table entries; keys match ModelCost fields.",
@@ -105,7 +103,7 @@ class FleetConfig(BaseModel):
         for name, fields in self.budget.model_costs.items():
             register_model_cost(ModelCost(model=name, **fields))
 
-    # Both are resolved to absolute paths: everything under `root` (results, spool)
+    # Both are resolved to absolute paths: everything under `root` becomes a
     # becomes a Docker bind-mount source, and the daemon rejects a relative one.
     # A relative `root:` in a project's fleet.yaml is otherwise only caught when the
     # first container fails to start.

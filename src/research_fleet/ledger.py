@@ -8,7 +8,7 @@ properties are the point:
   2. **Tamper-evident.** Each event carries `prev_hash` and `hash`, forming a
      chain from the genesis record. `verify()` walks the chain and reports the
      first index where it breaks, so a silently edited log is detectable.
-  3. **Queryable.** A SQLite index mirrors the JSONL for `fleet ls` / `fleet
+  3. **Queryable.** A SQLite index mirrors the JSONL for `fleet jobs` / `fleet
      show` without parsing megabytes of transcript. The JSONL is the source of
      truth; the index is disposable and can be rebuilt with `reindex()`.
 

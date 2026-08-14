@@ -1,14 +1,11 @@
 """`fleet`: the command line entry point.
 
-Also the interface agents use from inside their containers: `fleet submit`
-detects `$FLEET_SUBMIT_DIR` and writes a spool file instead of talking to the
-scheduler directly, so the same command works on both sides of the container
-boundary.
+It intentionally exposes workflows and direct runs rather than the scheduler's
+internal job-spec API.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import time
@@ -25,7 +22,6 @@ from .budget import cost_menu
 from .config import load_config
 from .fleet import CredentialsUnavailable, Fleet
 from .ledger import Ledger
-from .spec import JobSpec, new_id
 from . import sharedprompt
 
 app = typer.Typer(
@@ -372,39 +368,6 @@ def workflow(
 
 
 @app.command()
-def submit(
-    file: Optional[str] = typer.Option(None, "--file", "-f", help="Path to a JSON job spec."),
-    name: Optional[str] = typer.Option(None, "--name"),
-    config: Optional[str] = typer.Option(None, "--config", "-c"),
-):
-    """Submit a job spec.
-
-    Inside an agent container this writes to $FLEET_SUBMIT_DIR, where the
-    scheduler picks it up and applies policy and budget checks. Outside, it
-    submits directly.
-    """
-    raw = Path(file).read_text(encoding="utf-8") if file else sys.stdin.read()
-    payload = json.loads(raw)
-
-    spool = os.environ.get("FLEET_SUBMIT_DIR")
-    if spool:
-        target = Path(spool) / f"{name or payload.get('name') or new_id('req')}.json"
-        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        console.print(f"queued for scheduler review: {target.name}")
-        console.print(
-            "[dim]Policy and budget are applied by the scheduler; if it is rejected "
-            "you will find <name>.rejected.json alongside it.[/dim]"
-        )
-        return
-
-    with _fleet(config) as fleet:
-        rec = fleet.submit(JobSpec(**payload))
-        console.print(f"{rec.spec.id}  {rec.state.value}")
-        report = fleet.wait()
-        console.print(report.summary())
-
-
-@app.command()
 def uninstall(
     prefix: str = typer.Argument("", help="Prefix it was installed under. Default ~/.local."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask."),
@@ -492,30 +455,10 @@ def _detach_and_return(config: Optional[str]) -> None:
         )
     (log_dir / f"{run_id}.pid").write_text(f"{process.pid}\n", encoding="utf-8")
     console.print(f"[bold]run {run_id}[/bold] started in the background")
-    console.print(f"  fleet watch {run_id}      follow it")
-    console.print(f"  fleet ls {run_id}         job states")
+    console.print(f"  fleet log {run_id} -f     follow it")
+    console.print(f"  fleet jobs {run_id}       job states")
     console.print(f"  fleet kill {run_id}       stop it")
     console.print(f"[dim]  log: {log_path}[/dim]")
-
-
-@app.command()
-def watch(
-    run_id: str = typer.Argument(..., help="Run to follow.", autocompletion=_complete_runs),
-    config: Optional[str] = typer.Option(None, "--config", "-c"),
-):
-    """Follow a detached run's output."""
-    cfg = load_config(config)
-    log_path = cfg.root_path / "logs" / f"{run_id}.log"
-    if not log_path.exists():
-        console.print(f"[red]no log for {run_id}[/red] at {log_path}")
-        raise typer.Exit(1)
-    try:
-        _follow_run_log(
-            log_path, cfg.root_path, run_id,
-            pid_path=log_path.with_suffix(".pid"),
-        )
-    except KeyboardInterrupt:
-        pass
 
 
 def _follow_run_log(
@@ -529,7 +472,7 @@ def _follow_run_log(
     """Stream a detached log and stop once its ledger run is terminal.
 
     ``tail -f`` never exits when the scheduler closes and its output can be block
-    buffered when ``fleet watch`` is called by another process.  Reading here lets us
+    buffered when followed by another process. Reading here lets us
     flush every append, survive a truncated/replaced log, and use the ledger as the
     authoritative completion signal.
     """
@@ -757,36 +700,69 @@ def runs(config: Optional[str] = typer.Option(None, "--config", "-c")):
         console.print(table)
 
 
-@app.command("ls")
-def list_jobs(
+@app.command()
+def jobs(
     run_id: Optional[str] = typer.Argument(None, autocompletion=_complete_runs),
+    state: str = typer.Option(
+        "all", "--state", "-s",
+        help="all | current | failed | succeeded | pending",
+        autocompletion=_choices("all", "current", "failed", "succeeded", "pending"),
+    ),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
 ):
-    """List jobs, optionally filtered to one run."""
+    """List old or current jobs, optionally filtered by run and state."""
+    groups = {
+        "all": None,
+        "current": {"pending", "queued", "awaiting_approval", "running"},
+        "failed": {"failed", "denied", "cancelled"},
+        "succeeded": {"succeeded"},
+        "pending": {"awaiting_approval"},
+    }
+    if state not in groups:
+        raise typer.BadParameter("use all, current, failed, succeeded, or pending", param_hint="--state")
     cfg = load_config(config)
     with Ledger(cfg.root_path) as ledger:
-        table = Table(title=f"jobs{f' in {run_id}' if run_id else ''}")
-        for col in ("job_id", "name", "kind", "state", "parent"):
+        rows = ledger.jobs(run_id)
+        if groups[state] is not None:
+            rows = [row for row in rows if row["state"] in groups[state]]
+        table = Table(title=f"{state} jobs{f' in {run_id}' if run_id else ''}")
+        for col in ("job_id", "name", "kind", "state"):
             table.add_column(col)
-        for j in ledger.jobs(run_id):
+        for j in rows:
             colour = {"succeeded": "green", "failed": "red", "denied": "red"}.get(
                 j["state"], "yellow"
             )
             table.add_row(j["job_id"], j["name"], j["kind"],
-                          f"[{colour}]{j['state']}[/{colour}]", j["parent"] or "-")
+                          f"[{colour}]{j['state']}[/{colour}]")
         console.print(table)
 
 
 @app.command()
-def trace(
-    job_id: str = typer.Argument(..., help="Job to replay.", autocompletion=_complete_jobs),
+def log(
+    target: str = typer.Argument(..., help="Run or job ID to show."),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Follow until it finishes."),
     types: Optional[str] = typer.Option(None, "--types", help="Comma-separated event types to include."),
     limit: int = typer.Option(500, "--limit"),
     raw: bool = typer.Option(False, "--raw", help="Emit JSONL instead of prose."),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
 ):
-    """Replay one job's full reasoning and tool trace from the ledger."""
+    """Show a run log or a job's agent/tool history."""
     cfg = load_config(config)
+    if target.startswith("run_"):
+        log_path = cfg.root_path / "logs" / f"{target}.log"
+        if not log_path.exists():
+            console.print(f"[red]no detached log for {target}[/red] at {log_path}")
+            raise typer.Exit(1)
+        if follow:
+            try:
+                _follow_run_log(log_path, cfg.root_path, target, pid_path=log_path.with_suffix(".pid"))
+            except KeyboardInterrupt:
+                pass
+        else:
+            console.print(log_path.read_text(encoding="utf-8", errors="replace"), end="")
+        return
+
+    job_id = target
     wanted = types.split(",") if types else None
     with Ledger(cfg.root_path) as ledger:
         events = ledger.events(job_id=job_id, types=wanted, limit=limit)
@@ -799,12 +775,12 @@ def trace(
         subtitle = " · ".join(filter(None, [job.get("name"), job.get("state")]))
         console.print(Panel.fit(
             f"[bold]{job_id}[/bold]\n[dim]{subtitle or 'event history'}[/dim]",
-            title="Fleet trace", border_style="cyan",
+            title="Fleet log", border_style="cyan",
         ))
-    for ev in events:
+    def render_event(ev) -> None:
             if raw:
                 print(ev.to_json())
-                continue
+                return
             ts = time.strftime("%H:%M:%S", time.localtime(ev.ts))
             if ev.type == "job.output":
                 stream = ev.payload.get("stream", "stdout")
@@ -837,6 +813,27 @@ def trace(
                     f"[dim]{ts}[/dim] [{state_style}]● {ev.type}[/{state_style}] "
                     f"[dim]{str(ev.payload)[:300]}[/dim]"
                 )
+
+    seen: set[int] = set()
+    try:
+        while True:
+            for ev in events:
+                if ev.seq not in seen:
+                    render_event(ev)
+                    seen.add(ev.seq)
+            if not follow:
+                return
+            with Ledger(cfg.root_path) as ledger:
+                rows = {row["job_id"]: row for row in ledger.jobs()}
+                events = ledger.events(job_id=job_id, types=wanted, limit=limit)
+            if rows.get(job_id, {}).get("state") in {"succeeded", "failed", "denied", "cancelled"}:
+                for ev in events:
+                    if ev.seq not in seen:
+                        render_event(ev)
+                return
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        return
 
 
 @audit_app.command("verify")
@@ -880,28 +877,6 @@ def audit_reindex(config: Optional[str] = typer.Option(None, "--config", "-c")):
     with Ledger(cfg.root_path) as ledger:
         n = ledger.reindex()
     console.print(f"reindexed {n} events")
-
-
-@app.command()
-def pending(config: Optional[str] = typer.Option(None, "--config", "-c")):
-    """List jobs parked waiting for operator approval, and why.
-
-    Approval is in-process: a parked job belongs to a live scheduler, so grant it
-    with `fleet.approve(job_id)` from the Python session that submitted it. There
-    is no cross-process approval command. If the scheduler exits, resubmit the job.
-    """
-    cfg = load_config(config)
-    with Ledger(cfg.root_path) as ledger:
-        rows = [j for j in ledger.jobs() if j["state"] == "awaiting_approval"]
-        if not rows:
-            console.print("nothing awaiting approval")
-        for j in rows:
-            reasons = [
-                e.payload.get("reasons", [])
-                for e in ledger.events(job_id=j["job_id"], types=["job.awaiting_approval"])
-            ]
-            flat = [r for group in reasons for r in group]
-            console.print(f"[yellow]{j['job_id']}[/yellow]  {j['name']}  {'; '.join(flat)}")
 
 
 @app.command()

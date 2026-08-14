@@ -208,6 +208,41 @@ def test_completion_lists_commands_options_runs_and_jobs(tmp_path, monkeypatch):
     assert "init" in plain
 
 
+def test_jobs_filters_states_and_log_replays_a_job(tmp_path):
+    from typer.testing import CliRunner
+
+    from research_fleet import cli
+
+    config = tmp_path / "fleet.yaml"
+    root = tmp_path / "state"
+    config.write_text(f"root: {root}\n")
+    with Ledger(root) as ledger:
+        done = JobSpec(id="job_done", run_id="run_one", name="done", command=["true"])
+        live = JobSpec(id="job_live", run_id="run_one", name="live", command=["true"])
+        ledger.upsert_job(done, "succeeded")
+        ledger.upsert_job(live, "running")
+        ledger.append("job.submitted", {"name": "done"}, run_id="run_one", job_id="job_done")
+        ledger.append("job.succeeded", {}, run_id="run_one", job_id="job_done")
+
+    runner = CliRunner()
+    succeeded = runner.invoke(cli.app, ["jobs", "run_one", "--state", "succeeded", "-c", str(config)])
+    assert succeeded.exit_code == 0
+    assert "job_done" in succeeded.stdout and "job_live" not in succeeded.stdout
+
+    current = runner.invoke(cli.app, ["jobs", "run_one", "--state", "current", "-c", str(config)])
+    assert current.exit_code == 0
+    assert "job_live" in current.stdout and "job_done" not in current.stdout
+
+    history = runner.invoke(cli.app, ["log", "job_done", "-c", str(config)])
+    assert history.exit_code == 0
+    assert "Fleet log" in history.stdout
+    assert "job.succeeded" in history.stdout
+
+    followed = runner.invoke(cli.app, ["log", "job_done", "-f", "-c", str(config)])
+    assert followed.exit_code == 0
+    assert "job.succeeded" in followed.stdout
+
+
 def test_trace_returns_one_jobs_events_in_order(tmp_path):
     fleet = _fleet(tmp_path)
     try:

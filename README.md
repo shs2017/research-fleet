@@ -38,8 +38,9 @@ Inspect it:
 
 ```bash
 fleet runs
-fleet ls RUN_ID
-fleet trace JOB_ID
+fleet jobs RUN_ID
+fleet log JOB_ID
+fleet log JOB_ID -f
 fleet usage
 ```
 
@@ -94,5 +95,5 @@ See [docs/workflows.md](docs/workflows.md) for the YAML reference and
 - Research Ship provides the reproducible container environment, credentials,
   project workspace, and networking behavior.
 - An append-only ledger records events, costs, results, and provider session IDs.
-- `fleet trace` presents agent messages, tool activity, lifecycle events, and
+- `fleet log` presents agent messages, tool activity, lifecycle events, and
   usage as a readable job history.

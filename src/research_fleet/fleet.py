@@ -102,7 +102,7 @@ class RunReport:
             lines.append(
                 f"blocked: {len(self.awaiting_approval)} job(s) need approval: "
                 f"call fleet.approve({self.awaiting_approval[0]!r}) then wait() again, "
-                "or run `fleet pending` to see why"
+                "or run `fleet jobs --state pending` to see why"
             )
         for jid, res in self.results.items():
             dur = f"{res.duration_s:.1f}s" if res.duration_s else "-"
