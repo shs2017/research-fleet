@@ -18,6 +18,7 @@ from typing import Optional
 import typer
 from rich.console import Console
 from rich.json import JSON
+from rich.panel import Panel
 from rich.table import Table
 
 from .budget import cost_menu
@@ -25,7 +26,6 @@ from .config import load_config
 from .fleet import CredentialsUnavailable, Fleet
 from .ledger import Ledger
 from .spec import JobSpec, new_id
-from .sweep import parse_grid_args
 from . import sharedprompt
 
 app = typer.Typer(
@@ -81,7 +81,7 @@ def _choices(*values: str):
 
 _BACKENDS = _choices("claude-cli", "codex-cli")
 _EFFORTS = _choices("low", "medium", "high", "xhigh", "max")
-_EXECUTORS = _choices("ship", "slurm", "ray", "dry-run")
+_EXECUTORS = _choices("ship", "dry-run")
 
 
 def _fleet(config: Optional[str], **overrides) -> Fleet:
@@ -145,7 +145,7 @@ def _cpu_share(requested: Optional[float], agents: int) -> tuple[float, str]:
 
 
 def _overrides(workspace=None, image=None, executor=None, max_usd=None) -> dict:
-    """Map the flags shared by `run` and `sweep` onto config overrides."""
+    """Map run flags onto config overrides."""
     out: dict = {"workspace": workspace, "image": image}
     if executor:
         out["executor"] = {"kind": executor}
@@ -230,7 +230,7 @@ def run(
     timeout: int = typer.Option(3600, "--timeout", help="Per-agent wall clock, seconds."),
     max_usd: Optional[float] = typer.Option(None, "--max-usd", help="Budget ceiling for the whole run."),
     executor: Optional[str] = typer.Option(
-        None, "--executor", help="ship | slurm | ray | dry-run", autocompletion=_EXECUTORS
+        None, "--executor", help="ship | dry-run", autocompletion=_EXECUTORS
     ),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
@@ -284,37 +284,13 @@ def run(
 
 
 @app.command()
-def sweep(
-    command: list[str] = typer.Argument(..., help="Command to run; use {param} placeholders."),
-    grid: list[str] = typer.Option([], "--grid", "-g", help="Repeatable: lr=1e-3,3e-4"),
-    gpus: float = typer.Option(1.0, "--gpus"),
-    workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
-    image: Optional[str] = typer.Option(None, "--image"),
-    timeout: int = typer.Option(3600, "--timeout"),
-    executor: Optional[str] = typer.Option(None, "--executor", autocompletion=_EXECUTORS),
-    config: Optional[str] = typer.Option(None, "--config", "-c"),
-    verbose: bool = typer.Option(False, "--verbose", "-v"),
-):
-    """Run a hyperparameter sweep across the available GPUs. No LLM involved."""
-    with _fleet(
-        config, **_overrides(workspace, image, executor), on_event=_live_printer(verbose),
-    ) as fleet:
-        _cancel_on_interrupt(fleet)
-        parsed = parse_grid_args(grid)
-        recs = fleet.run_sweep(command, parsed, gpus=gpus, timeout_s=timeout)
-        console.print(f"[bold]run {fleet.run_id}[/bold]  {len(recs)} points")
-        report = fleet.wait()
-        console.print(report.summary())
-        raise typer.Exit(0 if not report.failed else 1)
-
-
 @app.command()
 def workflow(
     file: Path = typer.Argument(..., help="Workflow YAML.", exists=True, dir_okay=False),
     workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
     max_usd: Optional[float] = typer.Option(None, "--max-usd"),
     executor: Optional[str] = typer.Option(
-        None, "--executor", help="ship | slurm | ray | dry-run", autocompletion=_EXECUTORS
+        None, "--executor", help="ship | dry-run", autocompletion=_EXECUTORS
     ),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
@@ -634,12 +610,10 @@ def kill(
     root: Optional[str] = typer.Option(None, "--root", help="State directory the run used."),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
 ):
-    """Stop a run's containers and cluster jobs, from any shell.
+    """Stop a run's containers from any shell.
 
-    Works across processes: containers carry a `fleet.run` label and Slurm jobs are
-    named after the job id, so this does not need the scheduler that started them.
+    This works across processes because containers carry a `fleet.run` label.
     """
-    import shutil
     import subprocess
 
     cfg = load_config(config, root=root)
@@ -662,23 +636,8 @@ def kill(
                 subprocess.run(["docker", "stop", "-t", "10", *containers],
                                capture_output=True, text=True, check=False)
 
-            # Slurm jobs are not containers. `scancel` exits 0 even when the name
-            # matches nothing, so this is reported as signalled rather than confirmed.
-            unfinished = [
-                j["job_id"] for j in ledger.jobs(target)
-                if j["state"] not in {"succeeded", "failed", "cancelled", "denied"}
-            ]
-            signalled = 0
-            if shutil.which("scancel") and unfinished:
-                for job_id in unfinished:
-                    subprocess.run(["scancel", "--name", f"fleet-{job_id}"],
-                                   capture_output=True, text=True, check=False)
-                signalled = len(unfinished)
-
             marked = ledger.mark_cancelled(target, "killed by operator")
             parts = [f"{len(containers)} container(s) stopped"]
-            if signalled:
-                parts.append(f"{signalled} slurm name(s) signalled")
             parts.append(f"{len(marked)} job(s) marked cancelled")
             console.print(f"[yellow]{target}[/yellow]: " + ", ".join(parts))
             if not containers and marked:
@@ -831,7 +790,19 @@ def trace(
     cfg = load_config(config)
     wanted = types.split(",") if types else None
     with Ledger(cfg.root_path) as ledger:
-        for ev in ledger.events(job_id=job_id, types=wanted, limit=limit):
+        events = ledger.events(job_id=job_id, types=wanted, limit=limit)
+        jobs = {job["job_id"]: job for job in ledger.jobs()}
+    if not events:
+        console.print(f"[yellow]No events found for {job_id}[/yellow]")
+        raise typer.Exit(1)
+    if not raw:
+        job = jobs.get(job_id, {})
+        subtitle = " · ".join(filter(None, [job.get("name"), job.get("state")]))
+        console.print(Panel.fit(
+            f"[bold]{job_id}[/bold]\n[dim]{subtitle or 'event history'}[/dim]",
+            title="Fleet trace", border_style="cyan",
+        ))
+    for ev in events:
             if raw:
                 print(ev.to_json())
                 continue
@@ -841,13 +812,16 @@ def trace(
                 style = "red" if stream == "stderr" else "white"
                 console.print(f"[dim]{ts}[/dim] [{style}]{ev.payload.get('line', '')}[/{style}]")
             elif ev.type == "agent.message":
-                console.print(f"[dim]{ts}[/dim] [bold]agent[/bold]: {ev.payload.get('text', '')}")
+                console.print(Panel(
+                    ev.payload.get("text", ""), title=f"[dim]{ts}[/dim] agent",
+                    title_align="left", border_style="blue", padding=(0, 1),
+                ))
             elif ev.type == "agent.tool_use":
-                console.print(f"[dim]{ts}[/dim] [cyan]tool[/cyan] {ev.payload.get('tool')}")
-                console.print(JSON.from_data(ev.payload.get("payload", {})), style="dim")
+                console.print(f"[dim]{ts}[/dim] [cyan]◆ tool[/cyan] [bold]{ev.payload.get('tool')}[/bold]")
+                console.print(JSON.from_data(ev.payload.get("payload", {})), style="dim", soft_wrap=True)
             elif ev.type == "agent.tool_result":
-                console.print(f"[dim]{ts}[/dim] [magenta]result[/magenta]")
-                console.print(JSON.from_data(ev.payload.get("payload", {})), style="dim")
+                console.print(f"[dim]{ts}[/dim] [magenta]◇ result[/magenta]")
+                console.print(JSON.from_data(ev.payload.get("payload", {})), style="dim", soft_wrap=True)
             elif ev.type == "budget.committed":
                 usage = ev.payload.get("usage", {})
                 console.print(
@@ -856,7 +830,14 @@ def trace(
                     f"({usage.get('total_tokens', 0):,} tokens)"
                 )
             else:
-                console.print(f"[dim]{ts} {ev.type}[/dim] {str(ev.payload)[:300]}")
+                state_style = {
+                    "job.succeeded": "green", "job.failed": "red",
+                    "job.denied": "red", "job.running": "cyan",
+                }.get(ev.type, "dim")
+                console.print(
+                    f"[dim]{ts}[/dim] [{state_style}]● {ev.type}[/{state_style}] "
+                    f"[dim]{str(ev.payload)[:300]}[/dim]"
+                )
 
 
 @audit_app.command("verify")
@@ -908,7 +889,7 @@ def pending(config: Optional[str] = typer.Option(None, "--config", "-c")):
 
     Approval itself is in-process: a parked job belongs to a live scheduler, so
     grant it with `fleet.approve(job_id)` from the session that submitted it (or
-    via the MCP server). There is deliberately no cross-process approve command:
+    from the Python session that submitted it. There is no cross-process approve command:
     a job whose scheduler has exited cannot be resumed, only resubmitted.
     """
     cfg = load_config(config)
@@ -930,14 +911,6 @@ def policy(config: Optional[str] = typer.Option(None, "--config", "-c")):
     """Print the effective safeguard policy."""
     cfg = load_config(config)
     console.print(JSON.from_data(cfg.policy.model_dump(mode="json")))
-
-
-@app.command()
-def mcp(config: Optional[str] = typer.Option(None, "--config", "-c")):
-    """Serve the fleet as an MCP server so Claude Code / Codex can drive it."""
-    from .mcp_server import serve
-
-    serve(config)
 
 
 def main() -> None:

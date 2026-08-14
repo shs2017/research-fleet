@@ -1,6 +1,6 @@
 """The public API surface and the scheduler's control paths.
 
-Covers what a caller touches directly (grid parsing, RunReport, quotes, traces) and the
+Covers what a caller touches directly (RunReport, quotes, traces) and the
 state transitions that only happen when something goes wrong: approval, denial, failed
 dependencies, and cancellation.
 """
@@ -11,9 +11,8 @@ import re
 
 import pytest
 
-from research_fleet import Fleet, JobSpec, Ledger, Resources
+from research_fleet import Fleet, JobSpec, Ledger, Mount, Resources
 from research_fleet.spec import AgentConfig, JobKind, JobState
-from research_fleet.sweep import build_sweep, expand_grid, parse_grid_args
 
 
 def _fleet(tmp_path, **overrides):
@@ -25,46 +24,14 @@ def _fleet(tmp_path, **overrides):
     )
 
 
-# ---------------------------------------------------------------- grid parsing
-
-
-def test_grid_args_coerce_to_the_narrowest_type():
-    grid = parse_grid_args(["depth=6,12", "lr=1e-3,3e-4", "name=base,tuned"])
-    assert grid["depth"] == [6, 12]                    # ints stay ints
-    assert grid["lr"] == [1e-3, 3e-4]                  # floats stay floats
-    assert grid["name"] == ["base", "tuned"]           # strings stay strings
-
-
-def test_grid_args_tolerate_whitespace_and_single_values():
-    assert parse_grid_args([" lr = 1e-3 "]) == {"lr": [1e-3]}
-
-
-def test_grid_args_reject_a_missing_equals():
-    with pytest.raises(ValueError, match="name=v1,v2"):
-        parse_grid_args(["justakey"])
-
-
-def test_empty_grid_yields_one_point():
-    assert expand_grid({}) == [{}]
-
-
-def test_sweep_from_explicit_points_skips_the_product():
-    specs = build_sweep(["train", "--lr", "{lr}"], points=[{"lr": 0.1}, {"lr": 0.2}])
-    assert [s.command[-1] for s in specs] == ["0.1", "0.2"]
-
-
-def test_sweep_names_stay_within_docker_limits():
-    specs = build_sweep(["x"], {"averyverylongparametername": list(range(3))})
-    assert all(len(s.name) <= 120 for s in specs)
-
-
 # ------------------------------------------------------------------ RunReport
 
 
 def test_run_report_summarises_counts_cost_and_failures(tmp_path):
     fleet = _fleet(tmp_path, budget={"max_usd": 5.0})
     try:
-        fleet.run_sweep(["true"], {"x": [1, 2]}, gpus=0)
+        fleet.run_command(["true"], name="one", gpus=0)
+        fleet.run_command(["true"], name="two", gpus=0)
         fleet.submit(JobSpec(name="bad", command=["sh", "-c", "rm -rf /"], resources=Resources(gpus=0)))
         report = fleet.wait(timeout=60)
 
@@ -81,9 +48,13 @@ def test_run_report_summarises_counts_cost_and_failures(tmp_path):
 
 
 def test_run_report_flags_jobs_waiting_on_a_human(tmp_path):
-    fleet = _fleet(tmp_path, policy={"network": {"mode": "unrestricted"}})
+    fleet = _fleet(tmp_path, policy={
+        "fail_closed": False, "allowed_mount_roots": [str(tmp_path)]
+    })
     try:
-        fleet.run_command(["true"], name="gated", gpus=0)
+        fleet.run_command(["true"], name="gated", gpus=0, mounts=[
+            Mount(source=str(tmp_path.parent), target="/outside", mode="rw")
+        ])
         report = fleet.wait(timeout=30)
         assert len(report.awaiting_approval) == 1
         assert "need approval" in report.summary()
@@ -253,9 +224,13 @@ def test_trace_returns_one_jobs_events_in_order(tmp_path):
 
 
 def test_approving_a_gated_job_lets_it_run(tmp_path):
-    fleet = _fleet(tmp_path, policy={"network": {"mode": "unrestricted"}})
+    fleet = _fleet(tmp_path, policy={
+        "fail_closed": False, "allowed_mount_roots": [str(tmp_path)]
+    })
     try:
-        rec = fleet.run_command(["true"], name="gated", gpus=0)
+        rec = fleet.run_command(["true"], name="gated", gpus=0, mounts=[
+            Mount(source=str(tmp_path.parent), target="/outside", mode="rw")
+        ])
         fleet.wait(timeout=30)
         assert rec.state is JobState.AWAITING_APPROVAL
 
@@ -268,9 +243,13 @@ def test_approving_a_gated_job_lets_it_run(tmp_path):
 
 
 def test_denying_a_gated_job_records_the_reason(tmp_path):
-    fleet = _fleet(tmp_path, policy={"network": {"mode": "unrestricted"}})
+    fleet = _fleet(tmp_path, policy={
+        "fail_closed": False, "allowed_mount_roots": [str(tmp_path)]
+    })
     try:
-        rec = fleet.run_command(["true"], name="gated", gpus=0)
+        rec = fleet.run_command(["true"], name="gated", gpus=0, mounts=[
+            Mount(source=str(tmp_path.parent), target="/outside", mode="rw")
+        ])
         fleet.wait(timeout=30)
         assert fleet.deny(rec.spec.id, "not today") is True
         assert rec.state is JobState.DENIED
@@ -349,7 +328,8 @@ def test_cancel_all_marks_outstanding_jobs_cancelled(tmp_path):
 def test_runs_and_jobs_projections_are_queryable(tmp_path):
     fleet = _fleet(tmp_path)
     try:
-        fleet.run_sweep(["true"], {"x": [1, 2]}, gpus=0)
+        fleet.run_command(["true"], name="one", gpus=0)
+        fleet.run_command(["true"], name="two", gpus=0)
         fleet.wait(timeout=60)
         run_id = fleet.run_id
     finally:

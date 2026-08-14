@@ -1,115 +1,21 @@
-# research-fleet configuration.
-#
-# Precedence: built-in defaults < ~/.config/research-fleet/config.yaml <
-# this file < FLEET_* env vars < CLI flags.
-# Env override syntax: FLEET_EXECUTOR__KIND=ray
-#
-# Container configuration (base image, CUDA, torch, model cache, mounts) is NOT
-# here: it lives in this project's .ship.conf and is owned by research-ship.
-
-# The ledger, results and the cross-run usage table live here. Point several projects
-# at one root to see their combined spend in `fleet usage`.
+# Project overrides. Omitted values use safe built-in defaults.
 root: ~/.research-fleet
 workspace: .
-# Give every agent job its own git worktree and branch, so an agent's mistakes cost a
-# branch rather than your working tree. Needs the workspace to be a git repository.
 isolate_agents: false
-# Empty = use whatever image research-ship resolves for this project.
-image: ""
 
 executor:
-  # ship:     single host; research-ship owns the container, fleet owns placement.
-  # slurm:    Slurm owns placement; containers are Apptainer, or none at all.
-  # ray:      multi-node; Ray owns placement, research-ship still owns the container.
-  # dry-run:  validate and record what would run, start nothing.
-  kind: ship
-  ship_binary: ship
-  # Project whose .ship.conf and image to use. Defaults to `workspace`.
-  project_dir: null
-  ray_address: auto
-  slurm:
-    partition: null
-    account: null
-    qos: null
-    slots: 8                    # srun processes held open at once; the rest queue
-    container_image: null       # path to an Apptainer .sif, or null for none
-    container_binary: apptainer
-    extra_args: []              # extra srun flags
+  kind: ship                 # ship | dry-run
 
 agent:
-  name: claude-cli          # claude-cli | codex-cli
-  passthrough_env:          # forwarded by name only; values never enter the ledger
-    - ANTHROPIC_API_KEY
-    - CLAUDE_CODE_OAUTH_TOKEN
-    - ANTHROPIC_BASE_URL
-    # Used automatically when agent.name (or --backend) is codex-cli.
-    - OPENAI_API_KEY
-    - CODEX_API_KEY
-    - OPENAI_BASE_URL
+  name: claude-cli           # claude-cli | codex-cli
 
 budget:
-  max_usd: 50.0             # ceiling for an entire run, sub-agents included
+  max_usd: 50
   max_tokens: 100000000
   default_model: claude-opus-5
   default_effort: high
-  # What a spawning agent may choose from; shown to it with prices attached.
-  delegation_models:
-    - claude-haiku-4-5
-    - claude-sonnet-5
-    - claude-opus-5
-  # Largest share of its own remaining balance an agent may grant one child.
-  max_child_grant_fraction: 0.5
-  # Add or override price-table entries (USD per million tokens).
-  model_costs: {}
-  #  my-local-model:
-  #    input_per_mtok: 0.0
-  #    output_per_mtok: 0.0
 
 policy:
-  # Agent recursion. 0 disables sub-agents entirely.
+  max_concurrent_jobs: 8
   max_agent_depth: 2
   max_children_per_agent: 8
-  max_concurrent_jobs: 8
-
-  max_gpus_per_job: 8
-  max_memory_gb_per_job: 256
-  max_timeout_s: 86400
-
-  max_usd_per_job: 25.0
-  max_tokens_per_job: 20000000
-
-  # Extra mounts a job may request. Empty = derived from workspace + results dir.
-  # research-ship's own mounts (/workspace, /cache, the venv) are not affected.
-  allowed_mount_roots: []
-  deny_mount_paths:
-    - /
-    - /etc
-    - /root
-    - /var/run/docker.sock
-    - ~/.ssh
-    - ~/.aws
-    - ~/.kube
-
-  # Small on purpose: research-ship already supplies the non-root user, the narrow
-  # sudo grant, and the volume-scoped caches. Only scheduling limits live here.
-  container:
-    pids_limit: 4096
-    security_opt: []
-    extra_docker_args: []
-
-  network:
-    # none         -> --network none
-    # limited      -> research-ship's default-deny egress allowlist
-    # unrestricted -> normal outbound access
-    mode: limited
-    # Appended to the ship allowlist (which already covers the Anthropic API,
-    # PyPI/PyTorch, HuggingFace, GitHub/npm, and W&B).
-    allowed_hosts: []
-
-  # Jobs matching these gates park in AWAITING_APPROVAL instead of running.
-  require_approval_for:
-    - "net:unrestricted"
-    - "mount:rw-outside-workspace"
-
-  redact_secrets: true
-  fail_closed: true

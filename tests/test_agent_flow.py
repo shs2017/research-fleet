@@ -168,7 +168,7 @@ def test_agent_usage_is_billed_and_rolled_up(tmp_path):
 def test_agent_spawned_child_runs_and_records_provenance(tmp_path):
     child = {
         "kind": "command",
-        "name": "child-sweep",
+        "name": "child-job",
         "command": ["python", "train.py", "--lr", "3e-4"],
         "resources": {"gpus": 1},
     }
@@ -179,9 +179,9 @@ def test_agent_spawned_child_runs_and_records_provenance(tmp_path):
         report = fleet.wait(timeout=60)
 
         names = {r.spec.name for r in fleet.scheduler._jobs.values()}
-        assert "child-sweep" in names
+        assert "child-job" in names
 
-        child_rec = next(r for r in fleet.scheduler._jobs.values() if r.spec.name == "child-sweep")
+        child_rec = next(r for r in fleet.scheduler._jobs.values() if r.spec.name == "child-job")
         parent_rec = next(r for r in fleet.scheduler._jobs.values() if r.spec.name == "agent")
         assert child_rec.spec.parent_job_id == parent_rec.spec.id
         assert child_rec.depth == 1

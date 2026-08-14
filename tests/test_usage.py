@@ -272,7 +272,8 @@ def test_usage_survives_losing_the_index(tmp_path):
     """The JSONL is the source of truth, so a deleted index costs nothing."""
     fleet = _fleet(tmp_path)
     try:
-        fleet.run_sweep(["true"], {"x": [1, 2, 3]}, gpus=0)
+        for i in range(3):
+            fleet.run_command(["true"], name=f"job-{i}", gpus=0)
         fleet.wait(timeout=60)
         run_id = fleet.run_id
     finally:
@@ -296,7 +297,8 @@ def test_usage_survives_losing_the_index(tmp_path):
 def test_reindex_also_restores_the_jobs_table(tmp_path):
     fleet = _fleet(tmp_path)
     try:
-        fleet.run_sweep(["true"], {"x": [1, 2]}, gpus=0)
+        fleet.run_command(["true"], name="one", gpus=0)
+        fleet.run_command(["true"], name="two", gpus=0)
         fleet.wait(timeout=60)
         run_id = fleet.run_id
     finally:

@@ -12,9 +12,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ray = ["ray[default]>=2.30"]
-mcp = ["mcp>=1.2"]
-sdk = ["claude-agent-sdk>=0.1"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [project.scripts]

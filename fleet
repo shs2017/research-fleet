@@ -56,7 +56,7 @@ case "${1:-help}" in
         # --force upgrades in place instead of failing; --reinstall rebuilds from the
         # checkout, so editing the source and reinstalling cannot leave stale code
         # behind (uv otherwise reuses a cached build of the same path).
-        if ! out=$(uv tool install --force --reinstall "${REPO}[ray,mcp]" 2>&1); then
+        if ! out=$(uv tool install --force --reinstall "${REPO}" 2>&1); then
             echo "${out}" >&2
             exit 1
         fi

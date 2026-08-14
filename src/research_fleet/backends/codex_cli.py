@@ -31,7 +31,10 @@ class CodexCLIBackend:
     def build_command(self, agent: AgentConfig, *, brief: str = "") -> list[str]:
         context = "\n\n".join(p for p in (brief, agent.system_prompt) if p)
         prompt = agent.task if not context else f"{context}\n\n---\n\n{agent.task}"
-        argv = [self.binary, "exec", "--json"]
+        argv = [self.binary, "exec"]
+        if agent.session_id:
+            argv += ["resume"]
+        argv += ["--json"]
         if agent.model:
             argv += ["--model", agent.model]
         if agent.effort:
@@ -42,6 +45,8 @@ class CodexCLIBackend:
         # redundant and blocks legitimate workspace writes.
         argv += ["--dangerously-bypass-approvals-and-sandbox"]
         argv += list(agent.extra_args)
+        if agent.session_id:
+            argv += [agent.session_id]
         argv += [prompt]
         return argv
 
@@ -83,6 +88,11 @@ class CodexCLIBackend:
         msg = item or (obj.get("msg") if isinstance(obj.get("msg"), dict) else obj)
         kind = msg.get("type") or obj.get("type") or ""
         usage = self._usage_from(msg) or self._usage_from(obj)
+
+        if obj.get("type") in {"thread.started", "session.started"}:
+            session_id = obj.get("thread_id") or obj.get("session_id") or msg.get("id")
+            return AgentEvent(type="system", session_id=str(session_id) if session_id else None,
+                              payload=obj)
 
         if kind in {"agent_message", "assistant_message", "message"}:
             return AgentEvent(type="message", text=str(msg.get("message") or msg.get("text") or ""), usage=usage)

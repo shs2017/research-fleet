@@ -32,6 +32,7 @@ class ScriptedExecutor:
         self.systems: list[str] = []        # the system prompt each agent received
         self.isolated: list[bool] = []
         self.spans: dict[str, tuple[float, float]] = {}   # name -> (start, end)
+        self.sessions: list[str | None] = []
         self._lock = threading.Lock()
 
     def _output_for(self, name: str) -> str:
@@ -59,6 +60,10 @@ class ScriptedExecutor:
             self.tasks.append(prompt)
             flag = "--append-system-prompt"
             self.systems.append(argv[argv.index(flag) + 1] if flag in argv else "")
+            resume = argv[argv.index("--resume") + 1] if "--resume" in argv else None
+            self.sessions.append(resume)
+            session_id = resume or f"session-{spec.name}"
+            on_line("stdout", json.dumps({"type": "system", "session_id": session_id}))
             on_line("stdout", json.dumps({
                 "type": "assistant",
                 "message": {"model": "claude-sonnet-5", "content": [{"type": "text", "text": "working"}],
@@ -96,6 +101,81 @@ def _fleet(tmp_path, executor, **overrides):
 def test_render_substitutes_nested_values():
     ctx = {"steps": {"code": {"output": "did the thing"}}, "item": 7}
     assert render("saw: {{ steps.code.output }} / {{ item }}", ctx) == "saw: did the thing / 7"
+
+
+def test_named_actors_resume_only_their_own_conversations(tmp_path):
+    executor = ScriptedExecutor()
+    fleet = _fleet(tmp_path, executor)
+    workflow = Workflow.from_dict({
+        "name": "alternating",
+        "gpus": 0,
+        "actors": {
+            "researcher": {"persistent": True, "model": "claude-sonnet-5"},
+            "judge": {"persistent": True, "model": "claude-sonnet-5"},
+        },
+        "stages": [
+            {"name": "research_1", "actor": "researcher", "task": "first"},
+            {"name": "judge_1", "actor": "judge", "task": "judge first"},
+            {"name": "research_2", "actor": "researcher", "task": "adversarial"},
+            {"name": "judge_2", "actor": "judge", "task": "judge second"},
+        ],
+    })
+    try:
+        fleet.run_workflow(workflow)
+    finally:
+        fleet.close()
+
+    assert executor.tasks == ["first", "judge first", "adversarial", "judge second"]
+    assert executor.sessions == [
+        None,
+        None,
+        "session-research_1",
+        "session-judge_1",
+    ]
+
+
+def test_nonpersistent_actor_always_starts_fresh(tmp_path):
+    executor = ScriptedExecutor()
+    fleet = _fleet(tmp_path, executor)
+    workflow = Workflow.from_dict({
+        "name": "fresh",
+        "gpus": 0,
+        "actors": {"researcher": {"persistent": False}},
+        "stages": [
+            {"name": "one", "actor": "researcher", "task": "first"},
+            {"name": "two", "actor": "researcher", "task": "second"},
+        ],
+    })
+    try:
+        fleet.run_workflow(workflow)
+    finally:
+        fleet.close()
+    assert executor.sessions == [None, None]
+
+
+def test_unknown_actor_is_rejected():
+    with pytest.raises(ValueError, match="unknown actor"):
+        Workflow.from_dict({
+            "actors": {"known": {}},
+            "stages": [{"name": "step", "actor": "missing", "task": "work"}],
+        })
+
+
+def test_persistent_actor_cannot_run_two_parallel_stages(tmp_path):
+    executor = ScriptedExecutor()
+    fleet = _fleet(tmp_path, executor)
+    workflow = Workflow.from_dict({
+        "actors": {"researcher": {"persistent": True}},
+        "graph": {
+            "left": {"actor": "researcher", "task": "left"},
+            "right": {"actor": "researcher", "task": "right"},
+        },
+    })
+    try:
+        with pytest.raises(ValueError, match="cannot run concurrent"):
+            fleet.run_workflow(workflow)
+    finally:
+        fleet.close()
 
 
 def test_render_leaves_unknown_placeholders_untouched():

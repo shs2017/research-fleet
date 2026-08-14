@@ -76,6 +76,10 @@ class Step(BaseModel):
     timeout_s: int = 3600
     isolate: bool | None = None
     needs: list[str] = Field(default_factory=list)
+    actor: str | None = Field(
+        None,
+        description="Named workflow actor whose provider conversation runs this agent step.",
+    )
 
     until: Condition | None = Field(
         None, description="Stop repeating once this holds of the node's own output."
@@ -91,6 +95,8 @@ class Step(BaseModel):
             raise ValueError(f"step {self.name!r}: agent steps need a `task` or `task_file`")
         if self.kind is JobKind.COMMAND and not self.command:
             raise ValueError(f"step {self.name!r}: command steps need a `command`")
+        if self.kind is JobKind.COMMAND and self.actor is not None:
+            raise ValueError(f"step {self.name!r}: command steps cannot name an actor")
         if self.for_each and self.copies > 1:
             raise ValueError(f"step {self.name!r}: use either `for_each` or `copies`, not both")
         return self
@@ -116,12 +122,23 @@ class Loop(BaseModel):
         return self
 
 
+class Actor(BaseModel):
+    """A logical agent identity reused by any number of workflow stages."""
+
+    persistent: bool = True
+    backend: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    system_prompt: str | None = None
+
+
 class Workflow(BaseModel):
     model_config = {"extra": "forbid"}
 
     name: str = "workflow"
     description: str = ""
     stages: list[Step | Loop] = Field(default_factory=list)
+    actors: dict[str, Actor] = Field(default_factory=dict)
 
     model: str | None = None
     effort: str | None = None
@@ -145,6 +162,16 @@ class Workflow(BaseModel):
             for need in stage.needs:
                 if need not in known:
                     raise ValueError(f"stage {stage.name!r} needs {need!r}, which is not a stage")
+            steps = stage.steps if isinstance(stage, Loop) else [stage]
+            for step in steps:
+                if step.actor is not None and step.actor not in self.actors:
+                    raise ValueError(
+                        f"step {step.name!r} uses unknown actor {step.actor!r}"
+                    )
+                if step.actor is not None and (step.for_each or step.copies > 1):
+                    raise ValueError(
+                        f"step {step.name!r}: actor steps cannot fan out; give each copy its own actor"
+                    )
         return self
 
     def graph(self) -> dict[str, set[str]]:
@@ -413,6 +440,8 @@ class WorkflowRunner:
         self._completed: set[str] = set()
         self._prior_run: str | None = prior_run
         self._restored_outcomes: dict[str, StageOutcome] = {}
+        self._actor_sessions: dict[str, str] = {}
+        self._actors_started: set[str] = set()
         self._fingerprint = hashlib.sha256(json.dumps(
             workflow.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
         ).encode()).hexdigest()
@@ -455,6 +484,8 @@ class WorkflowRunner:
         } if resume else {}
         self._worktree_tip = state.get("worktree_tip")
         self._worktree_tip_run = state.get("worktree_tip_run") or prior_run
+        self._actor_sessions = dict(state.get("actor_sessions", {})) if resume else {}
+        self._actors_started = set(state.get("actors_started", [])) if resume else set()
         self.fleet.ledger.append(
             "workflow.restored",
             {"from_run": prior_run, "resume": resume,
@@ -473,6 +504,8 @@ class WorkflowRunner:
                 "outcomes": {k: v.model_dump(mode="json") for k, v in outcomes.items()},
                 "worktree_tip": self._worktree_tip,
                 "worktree_tip_run": self._worktree_tip_run,
+                "actor_sessions": dict(self._actor_sessions),
+                "actors_started": sorted(self._actors_started),
             },
             run_id=self.fleet.run_id,
         )
@@ -543,6 +576,15 @@ class WorkflowRunner:
         ctx = self._context(extra_ctx)
         model = step.model or self.workflow.model
         effort = step.effort or self.workflow.effort
+        actor = self.workflow.actors.get(step.actor) if step.actor else None
+        if actor is not None:
+            model = actor.model or model
+            effort = actor.effort or effort
+            if actor.persistent and step.actor in self._actors_started \
+                    and step.actor not in self._actor_sessions:
+                raise RuntimeError(
+                    f"persistent actor {step.actor!r} produced no resumable session id"
+                )
         gpus = self.workflow.gpus if step.gpus == 1.0 and self.workflow.gpus is not None else step.gpus
         isolate = step.isolate if step.isolate is not None else self.workflow.isolate
         if isolate is None:
@@ -569,7 +611,11 @@ class WorkflowRunner:
                 records += self.fleet.run_agents(
                     render(step.task, item_ctx),
                     n=1, name_prefix=name, labels=labels,
-                    model=model, effort=effort, gpus=gpus,
+                    model=model, backend=actor.backend if actor else None,
+                    effort=effort, system_prompt=actor.system_prompt if actor else None,
+                    session_id=(self._actor_sessions.get(step.actor)
+                                if actor is not None and actor.persistent else None),
+                    gpus=gpus,
                     timeout_s=step.timeout_s, isolate=isolate, worktree_base=base,
                     worktree_base_run_id=base_run,
                     mounts=inherited_mounts,
@@ -620,6 +666,23 @@ class WorkflowRunner:
             if index == 0:
                 self.results[step_name] = result
             self.results[f"{step_name}-{index}"] = result
+        step = self._step_named(step_name)
+        if step is not None and step.actor is not None:
+            actor = self.workflow.actors[step.actor]
+            first = self.results.get(step_name)
+            self._actors_started.add(step.actor)
+            if actor.persistent and first is not None and first.session_id:
+                self._actor_sessions[step.actor] = first.session_id
+
+    def _step_named(self, name: str) -> Step | None:
+        for stage in self.workflow.stages:
+            if isinstance(stage, Step) and stage.name == name:
+                return stage
+            if isinstance(stage, Loop):
+                for step in stage.steps:
+                    if step.name == name:
+                        return step
+        return None
 
     def _collect(self, step_name: str, job_ids: list[str]) -> None:
         self._record(step_name, job_ids, self.fleet.wait())
@@ -659,6 +722,18 @@ class WorkflowRunner:
             stages = [by_name[name] for name in wave]
             steps = [st for st in stages if isinstance(st, Step)]
             loops = [st for st in stages if isinstance(st, Loop)]
+
+            persistent_actors = [
+                step.actor for step in steps
+                if step.actor is not None and self.workflow.actors[step.actor].persistent
+            ]
+            duplicates = sorted({name for name in persistent_actors
+                                 if persistent_actors.count(name) > 1})
+            if duplicates:
+                raise ValueError(
+                    "persistent actors cannot run concurrent stages in one wave: "
+                    + ", ".join(duplicates)
+                )
 
             submitted = {st.name: self._submit(st, st.name, {"iteration": 1}) for st in steps}
             if submitted:

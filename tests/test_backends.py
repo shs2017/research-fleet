@@ -49,6 +49,17 @@ def test_codex_builds_a_command_with_the_brief_prepended(codex):
     assert "PROJECT RULES" in argv[-1]
 
 
+def test_codex_resumes_an_explicit_session(codex):
+    argv = codex.build_command(AgentConfig(task="next", session_id="thread-123"))
+    assert argv[:3] == ["codex", "exec", "resume"]
+    assert argv[-2:] == ["thread-123", "next"]
+
+
+def test_codex_captures_started_thread(codex):
+    event = codex.parse_line(json.dumps({"type": "thread.started", "thread_id": "thread-123"}))
+    assert event.type == "system" and event.session_id == "thread-123"
+
+
 def test_codex_has_a_priced_backend_default(codex):
     from research_fleet.budget import cost_for
 
@@ -157,6 +168,16 @@ def test_claude_prefers_the_final_result_usage(claude):
     assert ev.usage.input_tokens == 10
     # The harness's own figure is retained so drift from our table is detectable.
     assert ev.payload["reported_cost_usd"] == 0.5
+
+
+def test_claude_resumes_an_explicit_session(claude):
+    argv = claude.build_command(AgentConfig(task="next", session_id="session-123"))
+    assert argv[argv.index("--resume") + 1] == "session-123"
+
+
+def test_claude_captures_started_session(claude):
+    event = claude.parse_line(json.dumps({"type": "system", "session_id": "session-123"}))
+    assert event.type == "system" and event.session_id == "session-123"
 
 
 def test_claude_surfaces_thinking_blocks(claude):

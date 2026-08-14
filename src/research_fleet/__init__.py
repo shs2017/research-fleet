@@ -1,10 +1,9 @@
 """research-fleet: auditable, containerized, multi-GPU agent fleet.
 
-Three entry points, one implementation:
+Two entry points, one implementation:
 
     CLI     fleet run "..." --agents 4
     Python  from research_fleet import Fleet
-    MCP     fleet mcp   (so Claude Code / Codex can drive it as a tool)
 """
 
 from .budget import (  # noqa: F401
@@ -20,11 +19,10 @@ from .budget import (  # noqa: F401
 from .config import FleetConfig, load_config  # noqa: F401
 from .fleet import Fleet, RunReport, WorkflowReport  # noqa: F401
 from .ledger import Ledger, Redactor  # noqa: F401
-from .policy import ContainerPolicy, NetworkPolicy, Policy  # noqa: F401
+from .policy import ContainerPolicy, Policy  # noqa: F401
 from .scheduler import Scheduler  # noqa: F401
 from .spec import AgentConfig, JobKind, JobResult, JobSpec, JobState, Mount, Resources  # noqa: F401
-from .sweep import build_sweep, expand_grid  # noqa: F401
-from .workflow import Condition, Loop, Step, Workflow, WorkflowRunner  # noqa: F401
+from .workflow import Actor, Condition, Loop, Step, Workflow, WorkflowRunner  # noqa: F401
 
 __version__ = "0.1.0"
 
@@ -35,7 +33,6 @@ __all__ = [
     "Ledger", "Redactor", "Scheduler",
     "BudgetTracker", "BudgetExceeded", "ModelCost", "Usage", "Quote",
     "MODEL_COSTS", "quote", "cost_menu",
-    "build_sweep", "expand_grid",
-    "Workflow", "Step", "Loop", "Condition", "WorkflowRunner", "WorkflowReport",
+    "Workflow", "Actor", "Step", "Loop", "Condition", "WorkflowRunner", "WorkflowReport",
     "__version__",
 ]

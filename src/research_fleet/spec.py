@@ -2,11 +2,11 @@
 
 A fleet run is a DAG of `JobSpec`s. Two kinds exist:
 
-  * `command`: run a process in a container (a training run, an eval, a sweep point)
+  * `command`: run a process in a container (for example, training or evaluation)
   * `agent`  : run an LLM coding agent in a container; it may submit further jobs
 
 Both share the same resource, isolation and audit surface, which is what makes
-"agent that launches its own sweep" work without a second scheduler.
+"agent that launches a child job" work without a second scheduler.
 """
 
 from __future__ import annotations
@@ -75,6 +75,10 @@ class AgentConfig(BaseModel):
     model: str | None = Field(None, description="Backend-specific model id. None = backend default.")
     task: str = Field(..., description="The prompt / research question given to the agent.")
     system_prompt: str | None = None
+    session_id: str | None = Field(
+        None,
+        description="Provider conversation to resume. None starts a fresh conversation.",
+    )
     # Validated here rather than left to the harness: `claude --effort <bad>` only warns
     # and silently falls back to the default, so a typo would quietly cost you the
     # reasoning depth you asked for. Not every backend supports it (codex-cli ignores it).
@@ -120,7 +124,7 @@ class JobSpec(BaseModel):
                     "continuing an isolated workflow from an earlier run.",
     )
     depends_on: list[str] = Field(default_factory=list)
-    params: dict[str, Any] = Field(default_factory=dict, description="Sweep coordinates; recorded verbatim in the ledger.")
+    params: dict[str, Any] = Field(default_factory=dict, description="Caller metadata recorded verbatim in the ledger.")
     labels: dict[str, str] = Field(default_factory=dict)
 
     timeout_s: int = Field(3600, gt=0)
@@ -177,6 +181,9 @@ class JobResult(BaseModel):
         None,
         description="Time the harness reported working, excluding container start and "
                     "teardown. None for command jobs.",
+    )
+    session_id: str | None = Field(
+        None, description="Provider conversation created or resumed by this agent job."
     )
 
     @property

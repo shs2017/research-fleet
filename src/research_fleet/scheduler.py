@@ -103,6 +103,7 @@ class JobRecord:
     results_dir: Path | None = None
     stream_log: TextIO | None = None    # open handle on <results>/stream.log
     agent_error: str | None = None      # the harness reported a failure of its own
+    session_id: str | None = None       # provider conversation for actor continuations
 
 
 class Scheduler:
@@ -384,6 +385,9 @@ class Scheduler:
             result.usage = rec.usage.to_dict()
             result.output = rec.output or "\n".join(rec.tail)
             result.agent_seconds = rec.agent_seconds
+            result.session_id = rec.session_id or (
+                spec.agent.session_id if spec.agent is not None else None
+            )
             result.results_dir = str(rec.results_dir) if rec.results_dir else None
 
             # An agent harness can fail while still exiting 0. Trusting the exit code
@@ -665,6 +669,8 @@ class Scheduler:
                     event.usage.model = rec.spec.agent.model or backend.default_model()
                 with self._lock:
                     rec.usage = rec.usage.merge(event.usage)
+            if event.session_id:
+                rec.session_id = event.session_id
             if event.type == "result":
                 # The ledger gets the clipped `text`; the job's output gets the whole
                 # answer, since a later workflow stage is handed it verbatim.

@@ -69,25 +69,6 @@ def test_gpu_uuids_are_passed_through_as_a_device_list(fake_ship):
     assert "fleet-j" in flags
 
 
-def test_network_modes_map_onto_the_ship_firewall(fake_ship):
-    executor, log = fake_ship
-
-    def flags_for(mode: str) -> list[str]:
-        p = Policy()
-        p.network.mode = mode
-        executor.build_argv(
-            _spec(), argv=["true"], env={}, policy=p,
-            placement=Placement(gpu_ids=()), name="n",
-        )
-        return log.read_text().splitlines()
-
-    assert "--firewall" in flags_for("limited")
-    assert "--no-firewall" in flags_for("unrestricted")
-
-    none_flags = flags_for("none")
-    assert "--network" in none_flags and "none" in none_flags
-
-
 def test_secrets_are_requested_by_name_not_by_value(fake_ship):
     executor, log = fake_ship
     executor.build_argv(

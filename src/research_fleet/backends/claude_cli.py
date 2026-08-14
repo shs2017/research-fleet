@@ -61,6 +61,8 @@ class ClaudeCLIBackend:
             # and `policy` plus `--worktree` bound what that container can reach.
             "--dangerously-skip-permissions",
         ]
+        if agent.session_id:
+            argv += ["--resume", agent.session_id]
         argv += ["--model", agent.model or self.default_model()]
         if system:
             argv += ["--append-system-prompt", system]
@@ -113,7 +115,12 @@ class ClaudeCLIBackend:
         kind = obj.get("type")
 
         if kind == "system":
-            return AgentEvent(type="system", payload={k: v for k, v in obj.items() if k != "type"})
+            session_id = obj.get("session_id")
+            return AgentEvent(
+                type="system",
+                session_id=str(session_id) if session_id else None,
+                payload={k: v for k, v in obj.items() if k != "type"},
+            )
 
         if kind == "assistant":
             msg = obj.get("message") or {}

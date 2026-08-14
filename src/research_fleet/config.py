@@ -9,7 +9,7 @@ Precedence, lowest to highest:
       < explicit kwargs / CLI flags
 
 Everything is a plain pydantic model, so the same object is what you get from
-`fleet.yaml`, from `FleetConfig(...)` in Python, and from the MCP tool call.
+`fleet.yaml` and from `FleetConfig(...)` in Python.
 """
 
 from __future__ import annotations
@@ -46,30 +46,14 @@ class BudgetConfig(BaseModel):
     )
 
 
-class SlurmConfig(BaseModel):
-    """Slurm placement. Slurm picks the node and binds the GPUs, so the fleet does not."""
-
-    partition: str | None = None
-    account: str | None = None
-    qos: str | None = None
-    slots: int = Field(8, ge=1, description="How many srun processes to hold open; the rest queue.")
-    container_image: str | None = Field(
-        None, description="Path to an Apptainer .sif. Empty runs directly in the allocation."
-    )
-    container_binary: str = "apptainer"
-    extra_args: list[str] = Field(default_factory=list, description="Extra srun flags.")
-
-
 class ExecutorConfig(BaseModel):
-    kind: Literal["ship", "ray", "slurm", "dry-run"] = "ship"
+    kind: Literal["ship", "dry-run"] = "ship"
     ship_binary: str = Field("ship", description="The research-ship launcher, on PATH.")
     project_dir: str | None = Field(
         None,
         description="Project whose .ship.conf and image to use. Defaults to `workspace`.",
     )
     docker_binary: str = "docker"
-    ray_address: str | None = Field(None, description="'auto' to attach to a running cluster.")
-    slurm: SlurmConfig = Field(default_factory=SlurmConfig)
 
 
 class AgentBackendConfig(BaseModel):
@@ -152,7 +136,7 @@ def _load_yaml(path: Path) -> dict:
 
 
 def _env_overrides() -> dict:
-    """FLEET_EXECUTOR__KIND=ray  ->  {"executor": {"kind": "ray"}}"""
+    """FLEET_EXECUTOR__KIND=dry-run -> nested executor configuration."""
     out: dict = {}
     for key, raw in os.environ.items():
         if not key.startswith("FLEET_") or key == "FLEET_CONFIG":

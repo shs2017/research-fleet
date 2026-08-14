@@ -7,8 +7,7 @@
         report = fleet.wait()
         print(report.summary())
 
-Everything the CLI and the MCP server do goes through this class, so the three
-entry points can never drift apart in behaviour.
+The CLI is a thin wrapper around this class.
 """
 
 from __future__ import annotations
@@ -25,7 +24,6 @@ from .executors import build_executor
 from .ledger import Ledger, Redactor
 from .scheduler import JobRecord, Scheduler
 from .spec import AgentConfig, JobKind, JobResult, JobSpec, Mount, Resources
-from .sweep import build_sweep, expand_grid
 
 if TYPE_CHECKING:
     from .workflow import Workflow
@@ -185,7 +183,7 @@ class Fleet:
         """Discard an isolated job's worktree/branch. Only call this once nothing
         will use it as a --worktree-base anymore -- a branch can have more than one
         consumer, so it is never dropped automatically. No-op on executors that
-        don't support isolation (e.g. dry-run, slurm)."""
+        don't support isolation (for example, dry-run)."""
         drop = getattr(self.executor, "drop_worktree", None)
         if callable(drop):
             drop(branch)
@@ -211,6 +209,7 @@ class Fleet:
         worktree_base: str | None = None,
         worktree_base_run_id: str | None = None,
         resume_from: str | None = None,
+        session_id: str | None = None,
         labels: dict[str, str] | None = None,
         name_prefix: str = "agent",
     ) -> list[JobRecord]:
@@ -240,6 +239,7 @@ class Fleet:
                         model=selected_model,
                         task=task,
                         system_prompt=system_prompt,
+                        session_id=session_id,
                         # Passed to the harness as well as recorded as a label: the
                         # label drives cost estimation, this drives the actual run.
                         effort=effort or self.config.budget.default_effort,
@@ -269,30 +269,6 @@ class Fleet:
             selected == "claude-cli" and configured.startswith(("gpt-", "codex-"))
         )
         return get_backend(selected).default_model() if mismatched else configured
-
-    def run_sweep(
-        self,
-        command: Sequence[str],
-        grid: dict[str, Sequence[Any]] | None = None,
-        *,
-        points: Sequence[dict[str, Any]] | None = None,
-        gpus: float = 1.0,
-        cpus: float | None = None,
-        image: str | None = None,
-        timeout_s: int = 3600,
-        env: dict[str, str] | None = None,
-        name_prefix: str = "sweep",
-    ) -> list[JobRecord]:
-        n = len(points) if points is not None else len(expand_grid(grid or {}))
-        specs = build_sweep(
-            command, grid, points=points,
-            image=image or self.config.image,
-            resources=Resources(gpus=gpus, cpus=cpus if cpus is not None else _default_cpus(n)),
-            name_prefix=name_prefix,
-            timeout_s=timeout_s,
-            env=env,
-        )
-        return [self.submit(s) for s in specs]
 
     def run_command(
         self,

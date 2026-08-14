@@ -193,14 +193,6 @@ class ShipExecutor:
         else:
             flags += ["--gpus", "0"]
 
-        mode = policy.network.mode
-        if mode == "none":
-            flags += ["--network", "none", "--no-firewall"]
-        elif mode == "limited":
-            flags += ["--firewall"]
-        else:
-            flags += ["--no-firewall"]
-
         for m in spec.mounts:
             flags += ["--mount", m.to_docker_arg()]
         for key, value in env.items():
@@ -222,10 +214,9 @@ class ShipExecutor:
         """Run `ship docker-args`, unchecked, so callers can inspect stderr too --
         that's where an isolated job's worktree location is reported."""
         cmd = [self.ship, "docker-args", *self._ship_flags(spec, env, placement, policy, name), "--", *argv]
-        proc_env = self._ship_env()
-        if policy.network.allowed_hosts:
-            proc_env["FIREWALL_EXTRA_DOMAINS"] = " ".join(policy.network.allowed_hosts)
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=proc_env)
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=60, env=self._ship_env()
+        )
 
     def _finish_argv(self, spec: JobSpec, policy: Policy, out: str) -> list[str]:
         tokens = out.splitlines()

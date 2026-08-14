@@ -16,8 +16,6 @@ from research_fleet import (
     Policy,
     Redactor,
     Resources,
-    build_sweep,
-    expand_grid,
 )
 from research_fleet.budget import (
     BudgetExceeded,
@@ -244,13 +242,6 @@ def test_policy_denies_over_budget_estimate():
     assert "max_usd_per_job" in d.reasons[0]
 
 
-def test_policy_requires_approval_for_unrestricted_network():
-    p = Policy()
-    p.network.mode = "unrestricted"
-    d = p.check(JobSpec(name="c", command=["true"]))
-    assert d.verdict == "require_approval"
-
-
 def test_container_policy_stays_out_of_the_ship_contract():
     """Fleet must not re-impose isolation research-ship already owns.
 
@@ -282,20 +273,6 @@ def test_slot_pool_packs_fractional_jobs():
     b = pool.acquire(0.5)
     assert a == b == ("GPU-a",)          # both packed onto the same device
     assert pool.acquire(0.5, timeout=0.2) is None
-
-
-# ---------------------------------------------------------------------- sweep
-
-
-def test_grid_expansion_and_substitution():
-    points = expand_grid({"lr": [1e-3, 3e-4], "depth": [6, 12]})
-    assert len(points) == 4
-
-    specs = build_sweep(["python", "train.py", "--lr", "{lr}", "--depth", "{depth}"],
-                        {"lr": [1e-3], "depth": [6, 12]})
-    assert len(specs) == 2
-    assert specs[0].command[3] == "0.001"
-    assert specs[1].params == {"lr": 1e-3, "depth": 12}
 
 
 # -------------------------------------------------------------------- backends
@@ -380,7 +357,8 @@ def test_dry_run_end_to_end(tmp_path):
         budget={"max_usd": 5.0},
     )
     try:
-        fleet.run_sweep(["python", "train.py", "--lr", "{lr}"], {"lr": [1e-3, 3e-4]}, gpus=0)
+        fleet.run_command(["python", "train.py", "--lr", "0.001"], name="lr-1", gpus=0)
+        fleet.run_command(["python", "train.py", "--lr", "0.0003"], name="lr-2", gpus=0)
         report = fleet.wait(timeout=60)
 
         assert len(report.succeeded) == 2
@@ -414,7 +392,7 @@ def test_denied_job_never_runs_and_is_recorded(tmp_path):
 
 
 def test_env_vars_override_config_with_double_underscore_nesting(tmp_path, monkeypatch):
-    """FLEET_EXECUTOR__KIND=ray must reach executor.kind."""
+    """Nested environment settings must reach executor.kind."""
     monkeypatch.setenv("FLEET_EXECUTOR__KIND", "dry-run")
     monkeypatch.setenv("FLEET_BUDGET__MAX_USD", "7.5")
     monkeypatch.setenv("FLEET_WORKSPACE", str(tmp_path))
@@ -533,12 +511,6 @@ def test_policy_merges_its_tool_denylist_into_the_job(tmp_path):
     d = p.check(spec)
     assert d.verdict == "allow"
     assert d.mutations["agent_disallowed_tools"] == ["Bash", "WebFetch"]
-
-
-def test_policy_gate_can_be_disabled_by_emptying_require_approval_for():
-    p = Policy(require_approval_for=[])
-    p.network.mode = "unrestricted"
-    assert p.check(JobSpec(name="c", command=["true"])).verdict == "allow"
 
 
 # ------------------------------------------------- concurrent ledger writers

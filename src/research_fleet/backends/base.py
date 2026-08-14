@@ -35,6 +35,7 @@ class AgentEvent:
     usage: Usage | None = None
     is_error: bool = False
     full_text: str = ""
+    session_id: str | None = None
     """The untruncated `text`, where a backend caps what it puts in `text`.
 
     `text` is what the ledger and the live display carry, so backends clip it to keep
@@ -53,6 +54,8 @@ class AgentEvent:
             d["usage"] = self.usage.to_dict()
         if self.is_error:
             d["is_error"] = True
+        if self.session_id:
+            d["session_id"] = self.session_id
         return d
 
 

@@ -16,8 +16,6 @@ Layers, roughly outermost to innermost:
     docker socket, no writable mounts outside declared workspaces.
   * **Container hardening**: dropped capabilities, no-new-privileges, pid
     limits, non-root user, optional read-only rootfs.
-  * **Network**: default-deny egress with an allowlist, because an agent with
-    a shell and open internet is an exfiltration path.
   * **Commands & tools**: pattern denylist for command jobs, tool allowlist
     for agent jobs.
   * **Approval gates**: anything matching `require_approval_for` parks in
@@ -51,28 +49,6 @@ class Decision:
 
     def to_dict(self) -> dict[str, Any]:
         return {"verdict": self.verdict, "reasons": list(self.reasons), "mutations": dict(self.mutations)}
-
-
-class NetworkPolicy(BaseModel):
-    """Egress control, implemented by the research-ship firewall.
-
-      * `none`        : no network at all (`--network none`)
-      * `limited`     : research-ship's default-deny iptables allowlist, plus
-                         `allowed_hosts` appended via FIREWALL_EXTRA_DOMAINS
-      * `unrestricted`: normal outbound access
-
-    `limited` is a real allowlist resolved to IPs inside the container, not a
-    label. Two caveats inherited from the ship: CDN addresses rotate, so a
-    long run can start failing and needs the firewall re-applied; and an
-    allowlisted domain can still be used to move data out: this restricts
-    *where* traffic goes, not *what* it carries.
-    """
-
-    mode: Literal["none", "limited", "unrestricted"] = "limited"
-    allowed_hosts: list[str] = Field(
-        default_factory=list,
-        description="Extra domains appended to research-ship's built-in allowlist.",
-    )
 
 
 class ContainerPolicy(BaseModel):
@@ -129,7 +105,6 @@ class Policy(BaseModel):
     )
 
     container: ContainerPolicy = Field(default_factory=ContainerPolicy)
-    network: NetworkPolicy = Field(default_factory=NetworkPolicy)
 
     deny_command_patterns: list[str] = Field(
         default_factory=lambda: [
@@ -144,7 +119,7 @@ class Policy(BaseModel):
     )
     agent_default_disallowed_tools: list[str] = Field(default_factory=list)
     require_approval_for: list[str] = Field(
-        default_factory=lambda: ["net:unrestricted", "mount:rw-outside-workspace"],
+        default_factory=lambda: ["mount:rw-outside-workspace"],
         description="Labels emitted by the checks below; matching jobs park for human approval.",
     )
 
@@ -192,9 +167,6 @@ class Policy(BaseModel):
             if merged != spec.agent.disallowed_tools:
                 mutations["agent_disallowed_tools"] = merged
                 reasons.append(f"tool denylist merged from policy: {merged}")
-
-        if self.network.mode == "unrestricted":
-            gates.append("net:unrestricted")
 
         if estimate is not None:
             if estimate.est_cost_usd > self.max_usd_per_job:
