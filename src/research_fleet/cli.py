@@ -416,7 +416,8 @@ def cost(
     table = Table(title=f"Estimated cost per {process.replace('_', ' ')}")
     for col in ("model", "effort", "est. cost", "est. tokens", "$/Mtok in", "$/Mtok out"):
         table.add_column(col)
-    for row in cost_menu(cfg.budget.delegation_models, process=process):
+    models = list(dict.fromkeys([cfg.budget.default_model, *cfg.budget.delegation_models]))
+    for row in cost_menu(models, process=process):
         table.add_row(
             row["model"], row["effort"], f"${row['est_cost_usd']:.3f}",
             f"{row['est_total_tokens']:,}",

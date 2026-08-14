@@ -76,6 +76,14 @@ def test_quote_and_cost_menu_come_from_config(tmp_path):
         fleet.close()
 
 
+def test_cost_menu_includes_a_non_claude_default_model(tmp_path):
+    fleet = _fleet(tmp_path, budget={"default_model": "gpt-5.6-sol"})
+    try:
+        assert "gpt-5.6-sol" in {row["model"] for row in fleet.cost_menu()}
+    finally:
+        fleet.close()
+
+
 def test_codex_backend_does_not_inherit_a_claude_default_model(tmp_path):
     fleet = _fleet(tmp_path)
     try:

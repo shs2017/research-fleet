@@ -406,7 +406,10 @@ class Fleet:
         )
 
     def cost_menu(self) -> list[dict[str, Any]]:
-        return cost_menu(self.config.budget.delegation_models)
+        models = list(dict.fromkeys([
+            self.config.budget.default_model, *self.config.budget.delegation_models
+        ]))
+        return cost_menu(models)
 
     def usage(
         self,
