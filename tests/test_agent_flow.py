@@ -9,6 +9,7 @@ policy → budget → ledger path for spawned work without spending money.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -72,6 +73,27 @@ class StubAgentExecutor:
 
     def close(self) -> None:
         return None
+
+
+class LiveSpoolExecutor(StubAgentExecutor):
+    """Keeps the parent alive until its child starts."""
+
+    def __init__(self, child: dict):
+        super().__init__(children=[child])
+        self.child_started = threading.Event()
+
+    def run(self, spec, *, argv, env, placement, policy, on_line) -> JobResult:
+        if spec.kind is JobKind.AGENT:
+            spool = next(Path(m.source) for m in spec.mounts if m.target == "/spool")
+            (spool / "live-child.json").write_text(json.dumps(self.children[0]), encoding="utf-8")
+            assert self.child_started.wait(5), "child was not submitted while parent remained alive"
+        else:
+            self.child_started.set()
+        now = time.time()
+        return JobResult(
+            job_id=spec.id, state=JobState.SUCCEEDED, exit_code=0,
+            started_at=now, ended_at=now, gpu_ids=list(placement.gpu_ids),
+        )
 
 
 def _fleet(tmp_path, executor, **overrides) -> Fleet:
@@ -172,6 +194,27 @@ def test_agent_spawned_child_runs_and_records_provenance(tmp_path):
         assert len(report.succeeded) == 2
         ok, msg = fleet.verify_audit()
         assert ok, msg
+    finally:
+        fleet.close()
+
+
+def test_agent_spool_is_drained_while_parent_is_still_running(tmp_path):
+    child = {
+        "kind": "command", "name": "live-child", "command": ["true"],
+        "resources": {"gpus": 1},
+    }
+    stub = LiveSpoolExecutor(child)
+    fleet = _fleet(tmp_path, stub, budget={"max_usd": 30.0})
+    try:
+        fleet.run_agents("adapt after the experiment", n=1, gpus=1)
+        report = fleet.wait(timeout=30)
+        assert stub.child_started.is_set()
+        succeeded_ids = {result.job_id for result in report.succeeded}
+        succeeded_names = {
+            record.spec.name for record in fleet.scheduler._jobs.values()
+            if record.spec.id in succeeded_ids
+        }
+        assert succeeded_names >= {"agent", "live-child"}
     finally:
         fleet.close()
 

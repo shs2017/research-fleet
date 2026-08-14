@@ -7,6 +7,8 @@ dependencies, and cancellation.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from research_fleet import Fleet, JobSpec, Ledger, Resources
@@ -125,6 +127,7 @@ def test_detached_workflow_relaunches_with_a_stable_run_id(tmp_path, monkeypatch
         def __init__(self, argv, **kwargs):
             launched["argv"] = argv
             launched["kwargs"] = kwargs
+            self.pid = 12345
 
     monkeypatch.setattr("subprocess.Popen", Process)
     monkeypatch.setattr(sys, "argv", [
@@ -141,6 +144,97 @@ def test_detached_workflow_relaunches_with_a_stable_run_id(tmp_path, monkeypatch
     assert run_id.startswith("run_")
     assert launched["kwargs"]["start_new_session"] is True
     assert (tmp_path / "state" / "logs" / f"{run_id}.log").exists()
+    assert (tmp_path / "state" / "logs" / f"{run_id}.pid").read_text() == "12345\n"
+
+
+def test_watch_streams_log_and_exits_when_run_is_terminal(tmp_path, capsys):
+    from research_fleet import cli
+
+    root = tmp_path / "state"
+    log_path = root / "logs" / "run_watch.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("first line\n")
+    with Ledger(root) as ledger:
+        spec = JobSpec(id="job_watch", run_id="run_watch", command=["true"])
+        ledger.upsert_job(spec, "succeeded")
+
+    cli._follow_run_log(log_path, root, "run_watch", poll_interval=0)
+
+    assert capsys.readouterr().out == "first line\n"
+
+
+def test_watch_handles_a_truncated_log(tmp_path, monkeypatch, capsys):
+    from research_fleet import cli
+
+    root = tmp_path / "state"
+    log_path = root / "logs" / "run_watch.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("old contents\n")
+    with Ledger(root) as ledger:
+        spec = JobSpec(id="job_watch", run_id="run_watch", command=["true"])
+        ledger.upsert_job(spec, "running")
+
+    polls = 0
+
+    def advance(_delay):
+        nonlocal polls
+        polls += 1
+        if polls == 1:
+            log_path.write_text("new\n")
+            with Ledger(root) as ledger:
+                ledger.upsert_job(spec, "succeeded")
+
+    monkeypatch.setattr(cli.time, "sleep", advance)
+    cli._follow_run_log(log_path, root, "run_watch", poll_interval=0)
+
+    assert capsys.readouterr().out == "old contents\nnew\n"
+
+
+def test_watch_exits_when_detached_scheduler_dies_before_creating_jobs(tmp_path, capsys):
+    from research_fleet import cli
+
+    root = tmp_path / "state"
+    log_path = root / "logs" / "run_watch.log"
+    pid_path = root / "logs" / "run_watch.pid"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("startup traceback\n")
+    pid_path.write_text("999999999\n")
+
+    cli._follow_run_log(log_path, root, "run_watch", pid_path=pid_path, poll_interval=0)
+
+    assert capsys.readouterr().out == "startup traceback\n"
+
+
+def test_completion_lists_commands_options_runs_and_jobs(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from typer.testing import CliRunner
+
+    from research_fleet import cli
+    from research_fleet.ledger import Ledger
+    from research_fleet.spec import JobSpec
+
+    config = tmp_path / "fleet.yaml"
+    root = tmp_path / "state"
+    config.write_text(f"root: {root}\n")
+    monkeypatch.setenv("FLEET_CONFIG", str(config))
+    with Ledger(root) as ledger:
+        spec = JobSpec(id="job_complete123", run_id="run_complete123", command=["true"])
+        ledger.upsert_job(spec, "succeeded")
+        ledger.append("run.started", {}, run_id=spec.run_id)
+
+    ctx = SimpleNamespace(params={"config": str(config)})
+    assert cli._complete_runs(ctx, "run_comp") == ["run_complete123"]
+    assert cli._complete_jobs(ctx, "job_comp") == ["job_complete123"]
+    assert cli._BACKENDS("co") == ["codex-cli"]
+
+    help_result = CliRunner().invoke(cli.app, ["--help"], prog_name="fleet")
+    # Rich colours option names, splitting them with escape codes mid-string, so a
+    # plain substring search passes or fails on whether colour happens to be on.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", help_result.stdout)
+    assert "--install-completion" in plain
+    assert "--show-completion" in plain
+    assert "init" in plain
 
 
 def test_trace_returns_one_jobs_events_in_order(tmp_path):

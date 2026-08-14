@@ -27,6 +27,26 @@ tool_env() {
     export UV_TOOL_DIR="${prefix}/share/research-fleet/tools"
 }
 
+install_completion() {
+    local binary="$1"
+    local shell_name
+    shell_name="$(basename "${SHELL:-}")"
+    case "${shell_name}" in
+        bash|zsh|fish|powershell|pwsh)
+            if "${binary}" --install-completion "${shell_name}"; then
+                echo "Installed ${shell_name} completion for fleet"
+            else
+                echo "NOTE: fleet was installed, but ${shell_name} completion setup failed." >&2
+                echo "Run 'fleet --install-completion ${shell_name}' to retry." >&2
+            fi
+            ;;
+        *)
+            echo "NOTE: could not detect a supported shell from SHELL=${SHELL:-unset}." >&2
+            echo "Run 'fleet --install-completion' to choose completion manually." >&2
+            ;;
+    esac
+}
+
 case "${1:-help}" in
     install)
         need_uv
@@ -41,6 +61,7 @@ case "${1:-help}" in
             exit 1
         fi
         echo "Installed fleet to ${UV_TOOL_BIN_DIR}/fleet"
+        install_completion "${UV_TOOL_BIN_DIR}/fleet"
         echo "This checkout is no longer needed; fleet runs from its own environment."
         case ":${PATH}:" in
             *":${UV_TOOL_BIN_DIR}:"*) ;;

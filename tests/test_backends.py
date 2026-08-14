@@ -12,6 +12,7 @@ import json
 import pytest
 
 from research_fleet.backends import get_backend
+from research_fleet.backends.base import LEDGER_TEXT_LIMIT
 from research_fleet.spec import AgentConfig
 
 
@@ -240,3 +241,88 @@ def test_agents_can_actually_edit_files(claude):
 def test_codex_agents_can_also_edit_files(codex):
     argv = codex.build_command(AgentConfig(task="fix the bug"))
     assert any("dangerously-bypass" in a for a in argv)
+
+
+# ------------------------------------------------------- final answer length
+
+
+def test_claude_keeps_the_whole_final_answer(claude):
+    """A long final message is the job's deliverable and is handed to the next
+    workflow stage verbatim, so clipping it silently truncates the handoff. The
+    ledger copy stays bounded; `full_text` does not."""
+    answer = "F1: " + ("x" * 20000)
+    ev = claude.parse_line(json.dumps({"type": "result", "subtype": "success", "result": answer}))
+    assert ev.full_text == answer
+    assert len(ev.text) == LEDGER_TEXT_LIMIT
+    assert "text" in ev.to_ledger() and len(ev.to_ledger()["text"]) == LEDGER_TEXT_LIMIT
+
+
+def test_codex_keeps_the_whole_final_answer(codex):
+    answer = "F1: " + ("x" * 20000)
+    ev = codex.parse_line(json.dumps({"msg": {"type": "task_complete", "last_agent_message": answer}}))
+    assert ev.full_text == answer
+    assert len(ev.text) == LEDGER_TEXT_LIMIT
+
+
+def test_a_short_answer_needs_no_clipping(claude):
+    ev = claude.parse_line(json.dumps({"type": "result", "result": "done"}))
+    assert ev.text == ev.full_text == "done"
+
+
+# ------------------------------------------------- a harness that exits 0 having failed
+
+
+def test_claude_a_refused_prompt_is_an_error_despite_exit_zero(claude):
+    """The CLI answers `subtype: success, is_error: false` even when it rejected the
+    prompt outright, putting the refusal in the result text. Zero turns and zero tokens
+    means the model was never called -- which is a failure, not a short answer."""
+    ev = claude.parse_line(json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "num_turns": 0, "duration_ms": 17,
+        "result": "Goal condition is limited to 4000 characters (got 4184)",
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    }))
+    assert ev.is_error, "a stage that never called the model was reported as success"
+    assert "4000 characters" in ev.full_text
+
+
+def test_claude_a_real_answer_is_not_flagged(claude):
+    ev = claude.parse_line(json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "num_turns": 12, "result": "F1: ...",
+        "usage": {"input_tokens": 900, "output_tokens": 400},
+    }))
+    assert not ev.is_error
+
+
+def test_claude_a_terse_but_genuine_run_is_not_flagged(claude):
+    """One turn and few tokens is a short answer, not a refusal."""
+    ev = claude.parse_line(json.dumps({
+        "type": "result", "subtype": "success", "num_turns": 1, "result": "OK",
+        "usage": {"input_tokens": 12, "output_tokens": 1},
+    }))
+    assert not ev.is_error
+
+
+def test_claude_an_explicit_error_is_still_an_error(claude):
+    ev = claude.parse_line(json.dumps({
+        "type": "result", "subtype": "error", "is_error": True, "num_turns": 3,
+        "result": "boom", "usage": {"input_tokens": 5, "output_tokens": 5},
+    }))
+    assert ev.is_error
+
+
+def test_claude_warns_before_running_an_over_long_goal(claude):
+    """Cheaper to catch here than after a container start and a 17ms 'success'."""
+    task = "/goal " + ("x" * 4100)
+    with pytest.warns(UserWarning, match="goal condition"):
+        claude.build_command(AgentConfig(task=task))
+
+
+def test_claude_does_not_warn_about_a_long_ordinary_prompt(claude):
+    """The cap applies to goal conditions, not to prompts generally."""
+    import warnings as w
+    with w.catch_warnings():
+        w.simplefilter("error")
+        claude.build_command(AgentConfig(task="x" * 40000))
+        claude.build_command(AgentConfig(task="/goal " + "x" * 100))

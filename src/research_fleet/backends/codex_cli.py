@@ -16,7 +16,7 @@ import json
 
 from ..budget import MODEL_COSTS, Usage
 from ..spec import AgentConfig
-from .base import AgentEvent, register
+from .base import LEDGER_TEXT_LIMIT, AgentEvent, register
 
 
 class CodexCLIBackend:
@@ -108,9 +108,11 @@ class CodexCLIBackend:
             )
         if kind in {"task_complete", "turn_complete", "turn.completed", "result"} or \
                 obj.get("type") == "turn.completed":
+            answer = str(msg.get("last_agent_message") or msg.get("text") or "")
             return AgentEvent(
                 type="result",
-                text=str(msg.get("last_agent_message") or msg.get("text") or "")[:8000],
+                text=answer[:LEDGER_TEXT_LIMIT],
+                full_text=answer,
                 usage=usage,
                 payload={k: v for k, v in msg.items() if k != "type"},
             )

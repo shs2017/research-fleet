@@ -11,6 +11,7 @@ import os
 import shutil
 import threading
 import time
+import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +24,7 @@ from .executors import Executor, Placement
 from .ledger import Ledger
 from .policy import Decision, Policy
 from .spec import JobKind, JobResult, JobSpec, JobState, Mount, new_id
+from . import isolation, runlayout, sharedprompt
 
 
 class SlotPool:
@@ -100,6 +102,7 @@ class JobRecord:
     children: list[str] = field(default_factory=list)
     results_dir: Path | None = None
     stream_log: TextIO | None = None    # open handle on <results>/stream.log
+    agent_error: str | None = None      # the harness reported a failure of its own
 
 
 class Scheduler:
@@ -120,6 +123,17 @@ class Scheduler:
         self.policy: Policy = config.policy
         self.run_id = run_id or new_id("run")
         self._on_event = on_event
+
+        # The run directory is opened by the first job, not here: `run_workflow` names
+        # the run after its workflow, and a resume points it at an existing attempt,
+        # both of which happen after the scheduler exists. A run that submits nothing
+        # should not leave an empty attempt behind either.
+        self.run_name = "run"
+        self.based_on: str | None = None
+        self._run_dir: Path | None = None
+        self._job_dirs: set[str] = set()
+        self._isolation: bool | None = None
+        self._shared_prompt_text: str | None = None
 
         gpus = executor.available_gpus()
         self.slots = SlotPool(gpus)
@@ -153,6 +167,45 @@ class Scheduler:
             },
             run_id=self.run_id,
         )
+
+    @property
+    def run_dir(self) -> Path:
+        """This run's directory, opening a new numbered attempt on first use."""
+        with self._lock:
+            if self._run_dir is None:
+                self._run_dir = runlayout.allocate_run_dir(
+                    self.config.results_path, self.run_name,
+                    run_id=self.run_id, based_on=self.based_on,
+                )
+                self.ledger.append(
+                    "run.directory", {"path": str(self._run_dir)}, run_id=self.run_id,
+                )
+            return self._run_dir
+
+    def continue_run(self, prior_run_id: str) -> bool:
+        """Write this run's results into the attempt `prior_run_id` used.
+
+        A continuation is the same attempt carrying on, so it belongs in the same
+        directory. Returns False if that run left no directory to continue, in which
+        case this run opens its own rather than failing.
+        """
+        if self._run_dir is not None:
+            return False
+        existing = runlayout.run_dir_for(self.config.results_path, prior_run_id)
+        if existing is None:
+            return False
+        with self._lock:
+            self._run_dir = existing
+            # Deliberately not seeding `_job_dirs` from what is already there: the
+            # stages this run re-executes are the ones that did not finish, and they
+            # need their own names back rather than a `~2` suffix beside the failure.
+        runlayout.note_continuation(existing, self.run_id)
+        self.ledger.append(
+            "run.directory",
+            {"path": str(existing), "continues": prior_run_id},
+            run_id=self.run_id,
+        )
+        return True
 
     def submit(self, spec: JobSpec, *, parent: JobRecord | None = None) -> JobRecord:
         spec.run_id = self.run_id
@@ -298,20 +351,47 @@ class Scheduler:
             placement = Placement(node="local", gpu_ids=gpu_ids)
             self._set_state(rec, JobState.RUNNING, {"gpu_ids": list(gpu_ids), "argv_preview": argv[:2]})
 
-            result = self.executor.run(
-                spec, argv=argv, env=env, placement=placement,
-                policy=self.policy,
-                on_line=self._make_line_handler(
-                    rec, get_backend(spec.agent.backend) if spec.agent else None
-                ),
-            )
-
+            spool_stop = threading.Event()
+            spool_thread: threading.Thread | None = None
             if spec.kind is JobKind.AGENT:
-                self._drain_spool(rec, self._spool_root / spec.id)
+                spool_dir = self._spool_root / spec.id
+
+                def drain_spool_live() -> None:
+                    while not spool_stop.wait(0.25):
+                        self._drain_spool(rec, spool_dir)
+
+                spool_thread = threading.Thread(
+                    target=drain_spool_live,
+                    name=f"fleet-spool-{spec.id}",
+                    daemon=True,
+                )
+                spool_thread.start()
+
+            try:
+                result = self.executor.run(
+                    spec, argv=argv, env=env, placement=placement,
+                    policy=self.policy,
+                    on_line=self._make_line_handler(
+                        rec, get_backend(spec.agent.backend) if spec.agent else None
+                    ),
+                )
+            finally:
+                if spool_thread is not None:
+                    spool_stop.set()
+                    spool_thread.join(timeout=2.0)
+                    self._drain_spool(rec, self._spool_root / spec.id)
 
             result.usage = rec.usage.to_dict()
             result.output = rec.output or "\n".join(rec.tail)
             result.agent_seconds = rec.agent_seconds
+            result.results_dir = str(rec.results_dir) if rec.results_dir else None
+
+            # An agent harness can fail while still exiting 0. Trusting the exit code
+            # alone lets a stage that produced nothing be reported as succeeded, and a
+            # workflow then spends its next stage on the error message.
+            if rec.agent_error and result.state is JobState.SUCCEEDED:
+                result.state = JobState.FAILED
+                result.error = rec.agent_error
 
             if rec.state is JobState.CANCELLED:
                 result.state = JobState.CANCELLED
@@ -328,6 +408,7 @@ class Scheduler:
             rec.result = JobResult(
                 job_id=spec.id, state=JobState.FAILED,
                 error=f"{type(exc).__name__}: {exc}", ended_at=time.time(),
+                results_dir=str(rec.results_dir) if rec.results_dir else None,
             )
             self._settle_budget(rec)
             self._set_state(rec, JobState.FAILED, {"error": str(exc)})
@@ -360,6 +441,58 @@ class Scheduler:
         except OSError:
             pass
 
+    def _shared_prompt(self) -> str:
+        """The project's standing instructions, read once per run.
+
+        Read once rather than per job so that every job in a run gets the same text: a
+        file edited mid-run would otherwise split a workflow's stages across two sets of
+        rules, which is exactly the drift the shared prompt exists to prevent.
+        """
+        with self._lock:
+            if self._shared_prompt_text is None:
+                configured = self.config.agent.shared_prompt
+                text, path = sharedprompt.load(Path(self.config.workspace), configured)
+                self._shared_prompt_text = text
+                if configured and path is None:
+                    warnings.warn(
+                        f"shared_prompt {configured!r} was not found in the workspace; "
+                        "continuing without it",
+                        stacklevel=2,
+                    )
+                self.ledger.append(
+                    "run.shared_prompt",
+                    {"path": path, "chars": len(text), "configured": bool(configured)},
+                    run_id=self.run_id,
+                )
+            return self._shared_prompt_text
+
+    def _isolation_available(self) -> bool:
+        """Provision the isolation repository once per run, on the first job that wants it.
+
+        Done here rather than at construction so that a run using no isolated jobs never
+        writes to the workspace at all. A workspace that cannot host worktrees degrades
+        to running without isolation, with the reason in the ledger: losing a branch is
+        better than losing the run.
+        """
+        with self._lock:
+            if self._isolation is None:
+                usable, detail = isolation.ensure_repo(
+                    Path(self.config.workspace), self.config.root_path
+                )
+                self._isolation = usable
+                self.ledger.append(
+                    "run.isolation",
+                    {"enabled": usable, "detail": detail,
+                     "workspace": str(Path(self.config.workspace).expanduser().resolve())},
+                    run_id=self.run_id,
+                )
+                if not usable:
+                    warnings.warn(
+                        f"isolation is on but unavailable ({detail}); running without it",
+                        stacklevel=2,
+                    )
+            return self._isolation
+
     def _prepare(self, rec: JobRecord) -> tuple[list[str], dict[str, str]]:
         """Build the argv and env for a job, mounting its results and (for agent
         jobs) its spool directory, and opening its child budget scope."""
@@ -369,8 +502,15 @@ class Scheduler:
         env["FLEET_RUN_ID"] = self.run_id
         env["FLEET_JOB_ID"] = spec.id
 
+        if spec.isolate:
+            spec.isolate = self._isolation_available()
+
         # Fleet mounts are trusted because they are added after policy validation.
-        results_dir = self.config.results_path / self.run_id / spec.id
+        with self._lock:
+            dirname = runlayout.job_dir_name(spec.name, self._job_dirs)
+            self._job_dirs.add(dirname)
+        results_dir = self.run_dir / dirname
+        runlayout.reclaim(results_dir)
         results_dir.mkdir(parents=True, exist_ok=True)
         spec.mounts.append(Mount(source=str(results_dir), target="/results", mode="rw"))
         env["FLEET_RESULTS_DIR"] = "/results"
@@ -431,7 +571,13 @@ class Scheduler:
                 remaining_usd,
                 remaining_tokens,
                 models=self.config.budget.delegation_models,
-            )
+            ),
+            runlayout.render_environment_brief(
+                rec.spec.mounts,
+                isolated=rec.spec.isolate,
+                chained_from=rec.spec.worktree_base,
+            ),
+            sharedprompt.render(self._shared_prompt()),
         ]
         if can_delegate:
             parts.append(
@@ -520,8 +666,12 @@ class Scheduler:
                 with self._lock:
                     rec.usage = rec.usage.merge(event.usage)
             if event.type == "result":
-                if event.text:
-                    rec.output = event.text
+                # The ledger gets the clipped `text`; the job's output gets the whole
+                # answer, since a later workflow stage is handed it verbatim.
+                if event.full_text or event.text:
+                    rec.output = event.full_text or event.text
+                if event.is_error:
+                    rec.agent_error = (event.text or "the agent harness reported an error")
                 reported = event.payload.get("duration_ms")
                 if reported:
                     rec.agent_seconds = float(reported) / 1000.0

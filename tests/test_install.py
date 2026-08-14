@@ -34,6 +34,42 @@ def test_help_explains_install_and_uninstall():
     assert "install" in out and "uninstall" in out
 
 
+def test_install_automatically_sets_up_shell_completion(tmp_path):
+    """Use a fake uv so this checks bootstrap behavior without network access."""
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    uv = fake_bin / "uv"
+    uv.write_text("""#!/usr/bin/env bash
+set -e
+if [[ "$1 $2" == "tool install" ]]; then
+    mkdir -p "$UV_TOOL_BIN_DIR"
+    cat > "$UV_TOOL_BIN_DIR/fleet" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "--install-completion" ]]; then
+    mkdir -p "$HOME/.bash_completions"
+    touch "$HOME/.bash_completions/fleet.sh"
+    exit 0
+fi
+EOF
+    chmod +x "$UV_TOOL_BIN_DIR/fleet"
+fi
+""")
+    uv.chmod(0o755)
+
+    prefix = tmp_path / "prefix"
+    home = tmp_path / "home"
+    env = {
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "HOME": str(home),
+        "SHELL": "/bin/bash",
+    }
+    done = _run("install", str(prefix), env=env)
+
+    assert done.returncode == 0, done.stderr
+    assert "Installed bash completion" in done.stdout
+    assert (home / ".bash_completions" / "fleet.sh").exists()
+
+
 @pytest.mark.slow
 def test_install_then_uninstall_roundtrip(tmp_path):
     prefix = tmp_path / "prefix"

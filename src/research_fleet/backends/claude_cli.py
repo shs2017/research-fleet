@@ -10,10 +10,16 @@ from __future__ import annotations
 
 import json
 import shlex
+import warnings
 
 from ..budget import Usage
 from ..spec import AgentConfig
-from .base import AgentEvent, register
+from .base import LEDGER_TEXT_LIMIT, AgentEvent, register
+
+GOAL_PREFIX = "/goal "
+GOAL_LIMIT = 4000
+"""`claude -p "/goal ..."` treats the whole task as a goal condition, which the CLI
+caps at this many characters and refuses beyond it -- while still exiting 0."""
 
 
 class ClaudeCLIBackend:
@@ -32,6 +38,17 @@ class ClaudeCLIBackend:
         # ordinary prose, silently. Keeping the task verbatim preserves that, and the
         # brief is operator context anyway, which is what a system prompt is for.
         prompt = agent.task
+        if prompt.startswith(GOAL_PREFIX) and len(prompt) - len(GOAL_PREFIX) > GOAL_LIMIT:
+            # `/goal` makes the whole task a goal condition, which the CLI caps. It
+            # rejects the prompt while still exiting 0, so without this the first sign
+            # of trouble is a stage that ran for 17ms and produced a one-line "answer".
+            warnings.warn(
+                f"the task begins with `{GOAL_PREFIX.strip()}` and is "
+                f"{len(prompt) - len(GOAL_PREFIX)} characters; the CLI caps a goal "
+                f"condition at {GOAL_LIMIT} and will refuse it. Shorten the prompt, or "
+                f"drop the leading `{GOAL_PREFIX.strip()}`.",
+                stacklevel=2,
+            )
         system = "\n\n".join(p for p in (brief, agent.system_prompt) if p)
         argv = [
             self.binary,
@@ -151,11 +168,22 @@ class ClaudeCLIBackend:
 
         if kind == "result":
             usage = self._usage_from(obj, obj.get("model", ""))
+            result = str(obj.get("result") or "")
+            # The CLI reports `subtype: success, is_error: false, exit 0` even when it
+            # refused the prompt outright -- an over-long `/goal`, for instance -- and
+            # the refusal arrives as the result text. Zero turns with zero tokens means
+            # the model was never called, which no genuine run does, so treat it as the
+            # failure it is rather than letting a stage "succeed" having done nothing.
+            # Explicitly zero, not merely absent: a harness that reports no turn count
+            # gives no evidence either way, and inferring failure from silence would
+            # fail every run that omits the field.
+            never_ran = obj.get("num_turns") == 0 and not (usage and usage.total_tokens)
             return AgentEvent(
                 type="result",
-                text=str(obj.get("result") or "")[:8000],
+                text=result[:LEDGER_TEXT_LIMIT],
+                full_text=result,
                 usage=usage,
-                is_error=bool(obj.get("is_error")),
+                is_error=bool(obj.get("is_error")) or never_ran,
                 payload={
                     "subtype": obj.get("subtype"),
                     "num_turns": obj.get("num_turns"),

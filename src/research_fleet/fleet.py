@@ -210,6 +210,7 @@ class Fleet:
         isolate: bool | None = None,
         worktree_base: str | None = None,
         worktree_base_run_id: str | None = None,
+        resume_from: str | None = None,
         labels: dict[str, str] | None = None,
         name_prefix: str = "agent",
     ) -> list[JobRecord]:
@@ -223,6 +224,8 @@ class Fleet:
         rather than starting fresh from the live tree's HEAD.
         """
         self._require_credentials()
+        if resume_from and not self.scheduler.continue_run(resume_from):
+            raise ValueError(f"run {resume_from!r} has no results directory to continue")
         selected_backend = backend or self.config.agent.name
         selected_model = self.agent_model(model, selected_backend)
         specs = []
@@ -350,6 +353,15 @@ class Fleet:
         )
         if resume_from and base_run:
             raise ValueError("use either resume_from or base_run, not both")
+
+        # Name the attempt directory after the workflow, and put a continuation back
+        # into the attempt it continues. `base_run` re-executes every stage, so it is a
+        # new attempt that merely knows what it was built on.
+        self.scheduler.run_name = workflow.name
+        self.scheduler.based_on = base_run
+        if resume_from and not self.scheduler.continue_run(resume_from):
+            self.scheduler.based_on = resume_from
+
         runner = WorkflowRunner(
             self, workflow, predicates=predicates,
             prior_run=resume_from or base_run,

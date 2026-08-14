@@ -80,6 +80,12 @@ class AgentBackendConfig(BaseModel):
         description="Host env vars forwarded into agent containers. Values are never logged.",
     )
     extra_args: list[str] = Field(default_factory=list)
+    shared_prompt: str = Field(
+        "",
+        description="Standing instructions given to every agent job, on top of the "
+                    "briefs fleet generates. A path relative to the workspace; empty "
+                    "means look for the conventional locations (see SHARED_PROMPT_NAMES).",
+    )
 
 
 class FleetConfig(BaseModel):

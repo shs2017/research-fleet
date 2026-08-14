@@ -20,6 +20,9 @@ from typing import Any, Protocol, runtime_checkable
 from ..budget import Usage
 from ..spec import AgentConfig
 
+LEDGER_TEXT_LIMIT = 8000
+"""How much of one event's text the ledger and live display carry."""
+
 
 @dataclass
 class AgentEvent:
@@ -31,6 +34,14 @@ class AgentEvent:
     payload: dict[str, Any] = field(default_factory=dict)
     usage: Usage | None = None
     is_error: bool = False
+    full_text: str = ""
+    """The untruncated `text`, where a backend caps what it puts in `text`.
+
+    `text` is what the ledger and the live display carry, so backends clip it to keep
+    one event from dominating the trace. A final answer is also the job's deliverable
+    and is handed to later workflow stages verbatim, so it must survive whole: set this
+    to the full string and the scheduler will prefer it for the job's output.
+    """
 
     def to_ledger(self) -> dict[str, Any]:
         d: dict[str, Any] = {"text": self.text} if self.text else {}

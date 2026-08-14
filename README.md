@@ -94,6 +94,28 @@ docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi -L
 Working from a checkout without installing, `./fleet <command>` runs straight from the
 source, which is handy while developing.
 
+### Shell completion
+
+`fleet install` automatically installs completion for the shell named by `$SHELL`.
+Commands, options, workflow paths, run IDs, and job IDs should therefore complete as
+soon as you open a new shell.
+
+To reinstall it manually or select a different shell:
+
+```bash
+fleet --install-completion bash
+```
+
+You can also print a script to source or manage yourself:
+
+```bash
+fleet --show-completion bash
+```
+
+Completion covers commands and options, known values such as executors/backends/effort,
+workflow file paths, persisted run IDs, and job IDs. Run and job suggestions come from
+the configured ledger, including detached runs that only have a log so far.
+
 ## Quick start
 
 ```bash
@@ -221,13 +243,63 @@ stage fails, continue from the last completed wave in a new run:
 fleet workflow examples/code-review-loop.yaml --resume run_abc123
 ```
 
-The workflow definition must match the checkpoint, preventing an accidental resume with
-different tasks or dependencies. Completed step outputs are restored for templates, and
-an isolated workflow continues from the previous run's last worktree branch. Prior
-artifacts are mounted read-only at `/previous-results`; new artifacts remain under the new
-run. To deliberately build on a prior run but execute every stage again, use
-`--from-run run_abc123` instead. In Python, pass `resume_from="run_abc123"` or
-`base_run="run_abc123"` to `run_workflow()`.
+A resume requires the workflow definition to match the checkpoint, since it skips
+completed stages and a changed DAG would half-build the run. Completed step outputs are
+restored for templates, and an isolated workflow continues from the previous run's last
+worktree branch.
+
+To build on an earlier run but execute every stage again, use `--from-run run_abc123`.
+That inherits files and nothing else, so a *revised* workflow is fine — usually the
+point, since building on an attempt tends to mean having changed the prompts in light of
+it. The earlier run is mounted read-only, stage by stage, at `/previous/<stage>`:
+
+```
+/previous/research/findings.md     what the last attempt concluded
+/previous/research/code/           and the code it ran
+/previous/judge/review.md          and how it was critiqued
+```
+
+Runs written under the old flat layout had `job_<id>` directories; their stage names are
+recovered from the ledger, so `/previous/research` works for those too. The whole prior
+run is also at `/previous-results`. In Python, pass `resume_from=` or `base_run=` to
+`run_workflow()`.
+
+### Where results go
+
+Runs are grouped by workflow and numbered, so a pipeline you run repeatedly leaves a
+readable history rather than a heap of uuids:
+
+```
+fleet-logs/results/
+  myc-discovery/
+    001/
+      run.json            # run id, workflow, attempt, what it was based on
+      research/           # named for the stage, not the job id
+        findings.md
+        output.md  stream.log  result.json
+      judge/
+        review.md
+    002/                  # `fleet workflow myc-discovery.yaml` a second time
+      research/
+      judge/
+```
+
+A cycle's repeats and a fan-out's copies are separate directories under the same
+attempt (`review-1`, `review-2`, `probe-0`, `probe-1`), so nothing overwrites anything.
+
+**Attempts do not see each other.** A repeat run opens an empty numbered directory and
+is told nothing about its predecessors: no `/previous-results`, no restored steps.
+Inheritance is opt-in and by run id, which is what makes a second attempt a real
+independent replicate rather than a continuation you did not ask for.
+
+`--resume` is the exception, because a continuation *is* the same attempt carrying on:
+it writes into the directory of the run it resumes and records itself in that
+`run.json`'s `continued_by`. `--from-run` re-executes every stage, so it opens the next
+numbered attempt with `based_on` set and leaves the earlier one untouched.
+
+Runs written before this layout are flat (`results/<run_id>/<job_id>/`) and are still
+found by run id, so `--resume`, `--from-run` and `fleet ls` keep working across the
+change.
 
 Detached workflows use the same checkpointing and inheritance options. The generated
 run id can be watched and inspected exactly like a detached agent run:
@@ -244,6 +316,95 @@ lets the reviewer's objection reach the next implementation round. `{{ iteration
 expression language, and loop conditions are declarative
 (`output_contains`, `output_not_contains`, `succeeded`), so reading the YAML tells you
 when the loop stops.
+
+An answer is not always the whole deliverable. Each job writes to its own `/results`,
+which no other container can see, so a stage that produces files gets them mounted into
+every later stage read-only at `/inputs/<name>` — the same names templating uses.
+Whatever you can reference as `{{ steps.research.output }}`, a later stage can open at
+`/inputs/research/`:
+
+```yaml
+stages:
+  - name: research
+    task: Analyse the data. Write the full write-up to /results/findings.md.
+  - name: judge
+    needs: [research]
+    task: |
+      Review the findings. The write-up and its code are at
+      /inputs/research/findings.md and /inputs/research/code/.
+```
+
+Read-only is deliberate: a reviewing stage should not be able to edit the evidence it is
+reviewing. The correspondence with templating is exact, including its aliases: a
+fanned-out step's copies are at `/inputs/<name>-0`, `/inputs/<name>-1`, and so on, and
+because `<name>` is itself an alias for copy 0, a single-copy step shows up under both
+names.
+
+Agents are told this. Every agent job's system prompt gets a short section naming the
+directories it actually has, including each `/inputs/<stage>` by name, and saying
+outright that a `/results` path quoted by an earlier stage is that stage's directory and
+not its own. Prompts do not have to explain the filesystem, and an agent does not have
+to guess at it.
+
+### The shared prompt
+
+Fleet knows what a job may spend and which directories it has. What it cannot know is
+the standing rules of *your* project — how to treat an earlier attempt, which
+conventions to follow, what never to touch.
+
+Most of what needs saying, though, is not project-specific at all: what `/results` is,
+how `/inputs/<stage>` relates to it, what to do with a previous run's directory. Fleet
+ships that as a default, and **every project gets it without doing anything.** To see
+it, or to change it:
+
+```bash
+fleet init            # writes FLEET.md into the workspace
+```
+
+Usually you leave that file alone. Edit it to add what is specific to your project, and
+`fleet init` will not overwrite your edits — it says so and stops, unless you pass
+`--force`. A project with no file at all still gets the packaged default; a project with
+one gets exactly that file and nothing appended, so deleting a rule really deletes it.
+
+`FLEET.md` is looked for first, then `fleet.md`, `prompts/shared.md`, `.fleet/shared.md`;
+`agent.shared_prompt` in `fleet.yaml` overrides the search. Whatever is in force is
+prepended to each agent's system prompt under a heading marking it project-wide, telling
+the agent the task wins where the two genuinely conflict. It is read once per run, so
+editing mid-run cannot split a workflow's stages across two sets of rules.
+
+Keep it about the layout. What a job should *conclude*, and to what standard — evidence
+bars, output formats, how to weigh a result — belongs in that job's task prompt;
+methodology put here applies itself to every job in the project whether or not it fits.
+Note too that the file complements rather than repeats the generated filesystem brief:
+the brief names the mounts *this* job actually has, while the shared prompt explains the
+conventions, such as what a stage directory usually contains.
+
+Without this, standing rules get copied into every task prompt, where they drift apart
+and go stale. With it, a task prompt says what *this* job is for and nothing else.
+
+### Isolation
+
+`isolate_agents: true` gives every agent job its own git worktree on its own branch, so
+a run's mistakes cost a branch rather than your working tree, and one run's scratch
+files cannot leak into the next.
+
+Fleet provisions what that needs. If the workspace is already a git repository, it is
+used as-is and fleet only ever adds `fleet/*` branches. If it is not — a directory of
+data, prompts and YAML usually is not — fleet creates a repository for the purpose,
+arranged so it is not a claim on your files:
+
+- the git directory lives at `<root>/isolation/<workspace>.git`, leaving only a pointer
+  file in your project;
+- nothing is tracked, staged or committed, so no prompt or config enters a history, and
+  `git status` in the workspace stays silent;
+- consequently an isolated job's `/workspace` starts *empty*. Inputs reach it by mount:
+  `/inputs`, `/results`, and whatever the project binds in (research-ship's
+  `EXTRA_MOUNTS` is the usual way to attach a large read-only data bundle).
+
+Sequential isolated stages are chained — each branches from the previous stage's
+committed worktree — so a plan → implement → review pipeline still sees its own earlier
+edits, and the agent is told so. Where isolation cannot be provisioned at all, the run
+warns, records the reason in the ledger, and continues without it rather than failing.
 
 ### Writing it as a dependency graph
 

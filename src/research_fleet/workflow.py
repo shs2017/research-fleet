@@ -18,6 +18,7 @@ import yaml
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from .spec import JobKind, JobResult, JobState, Mount
+from . import runlayout
 
 _PLACEHOLDER = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
 
@@ -424,10 +425,24 @@ class WorkflowRunner:
         )
         matches = [e for e in events if e.payload.get("fingerprint") == self._fingerprint]
         if not matches:
-            raise ValueError(
-                f"run {prior_run!r} has no compatible checkpoint for workflow "
-                f"{self.workflow.name!r}"
+            if resume:
+                # Resuming skips completed stages, so a changed definition would leave
+                # this run half-built from a DAG that no longer exists.
+                raise ValueError(
+                    f"run {prior_run!r} has no compatible checkpoint for workflow "
+                    f"{self.workflow.name!r}"
+                )
+            # `--from-run` re-executes everything and only inherits files, so a revised
+            # workflow is the normal case: building on a previous attempt usually means
+            # having changed the prompts in light of it. Take the prior run's artifacts
+            # and none of its step state.
+            self.fleet.ledger.append(
+                "workflow.restored",
+                {"from_run": prior_run, "resume": False, "completed": [],
+                 "definition_changed": True},
+                run_id=self.fleet.run_id,
             )
+            return
         state = matches[-1].payload
         self.results = {
             name: JobResult.model_validate(value)
@@ -469,6 +484,60 @@ class WorkflowRunner:
         }
         return {"steps": steps, "workflow": self.workflow.name, **(extra or {})}
 
+    def _stage_mounts(self) -> list[Mount]:
+        """Every finished stage's `/results`, mounted read-only at `/inputs/<stage>`.
+
+        A stage's `/results` is private to its own container, so without this the only
+        thing that crosses a stage boundary is the final message -- and a stage that
+        answers "the write-up is in /results/findings.md" hands the next one a path that
+        resolves to an empty directory there.
+
+        The naming mirrors templating: whatever is addressable as
+        `{{ steps.X.output }}` is readable as `/inputs/X/`. Read-only, so a later stage
+        cannot rewrite the evidence it is reviewing.
+        """
+        mounts = []
+        for name, result in self.results.items():
+            # Each result carries the directory it actually wrote to, which is what
+            # makes a restored result from an earlier run resolve correctly here.
+            if result.results_dir and Path(result.results_dir).is_dir():
+                mounts.append(
+                    Mount(source=result.results_dir, target=f"/inputs/{name}", mode="ro")
+                )
+        return mounts
+
+    def _previous_run_mounts(self) -> list[Mount]:
+        """The run this one builds on, read-only: whole at `/previous-results`, and
+        stage by stage at `/previous/<stage>`.
+
+        The per-stage view is what makes a prior run usable rather than merely present.
+        A researcher starting a second attempt wants last time's `findings.md` *and* the
+        judge's `review.md`, and it should not have to open `job_4319620b5f63/` to find
+        out which one that is.
+        """
+        if not self._prior_run:
+            return []
+        prior_dir = runlayout.run_dir_for(self.fleet.config.results_path, self._prior_run)
+        if prior_dir is None:
+            return []
+
+        mounts = [Mount(source=str(prior_dir), target="/previous-results", mode="ro")]
+        for stage, path in runlayout.stage_dirs(prior_dir, self._prior_job_names()).items():
+            mounts.append(Mount(source=str(path), target=f"/previous/{stage}", mode="ro"))
+        return mounts
+
+    def _prior_job_names(self) -> dict[str, str]:
+        """job id -> stage name for the prior run, for runs whose directories are ids."""
+        try:
+            jobs = self.fleet.ledger.jobs(run_id=self._prior_run)
+        except Exception:
+            return {}
+        return {
+            job_id: name
+            for job in jobs
+            if (job_id := job.get("job_id")) and (name := job.get("name"))
+        }
+
     def _submit(self, step: Step, label: str, extra_ctx: dict[str, Any]) -> tuple[list[str], str | None]:
         """Submit a step and return its job ids and optional worktree chain label."""
         ctx = self._context(extra_ctx)
@@ -485,12 +554,7 @@ class WorkflowRunner:
         base_run = self._worktree_tip_run if chainable else None
 
         records = []
-        inherited_mounts = []
-        if self._prior_run:
-            inherited_mounts = [Mount(
-                source=str(self.fleet.config.results_path / self._prior_run),
-                target="/previous-results", mode="ro",
-            )]
+        inherited_mounts = self._stage_mounts() + self._previous_run_mounts()
         for index, item in enumerate(items):
             item_ctx = {**ctx, "item": item, "index": index}
             name = label if len(items) == 1 else f"{label}-{index}"

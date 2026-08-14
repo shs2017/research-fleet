@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +29,7 @@ class ScriptedExecutor:
         self.delay = delay
         self.calls: list[str] = []          # job names, in execution order
         self.tasks: list[str] = []          # the prompt each agent received
+        self.systems: list[str] = []        # the system prompt each agent received
         self.isolated: list[bool] = []
         self.spans: dict[str, tuple[float, float]] = {}   # name -> (start, end)
         self._lock = threading.Lock()
@@ -55,6 +57,8 @@ class ScriptedExecutor:
         if spec.kind is JobKind.AGENT:
             prompt = argv[argv.index("-p") + 1] if "-p" in argv else ""
             self.tasks.append(prompt)
+            flag = "--append-system-prompt"
+            self.systems.append(argv[argv.index(flag) + 1] if flag in argv else "")
             on_line("stdout", json.dumps({
                 "type": "assistant",
                 "message": {"model": "claude-sonnet-5", "content": [{"type": "text", "text": "working"}],
@@ -805,5 +809,534 @@ def test_a_loop_can_depend_on_an_earlier_stage(tmp_path):
         ]})
         assert stub.calls[0] == "plan"
         assert report.outcomes[1].stopped_early
+    finally:
+        fleet.close()
+
+
+# ------------------------------------------------- artifacts across stages
+
+
+class ArtifactExecutor(ScriptedExecutor):
+    """Writes a file into its own `/results` and records the mounts it was given.
+
+    Each job's `/results` is a private directory, so this is what proves a later
+    stage can actually open what an earlier one wrote.
+    """
+
+    def __init__(self, filename: str = "findings.md", **kwargs):
+        super().__init__(**kwargs)
+        self.filename = filename
+        self.mounts: dict[str, list] = {}
+
+    def run(self, spec, *, argv, env, placement, policy, on_line):
+        self.mounts[spec.name] = list(spec.mounts)
+        results = next((m.source for m in spec.mounts if m.target == "/results"), None)
+        if results is not None:
+            (Path(results) / self.filename).write_text(f"written by {spec.name}")
+        return super().run(spec, argv=argv, env=env, placement=placement,
+                           policy=policy, on_line=on_line)
+
+
+def test_a_later_stage_can_read_an_earlier_stages_results(tmp_path):
+    stub = ArtifactExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({"stages": [
+            {"name": "research", "task": "analyse", "gpus": 0},
+            {"name": "judge", "task": "review", "needs": ["research"], "gpus": 0},
+        ]})
+        inputs = {m.target: m for m in stub.mounts["judge"]}
+        assert "/inputs/research" in inputs, "judge got no view of the research stage"
+        assert inputs["/inputs/research"].mode == "ro"
+        assert (Path(inputs["/inputs/research"].source) / "findings.md").read_text() == \
+            "written by research"
+    finally:
+        fleet.close()
+
+
+def test_the_first_stage_gets_no_input_mounts(tmp_path):
+    stub = ArtifactExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({"stages": [
+            {"name": "research", "task": "analyse", "gpus": 0},
+            {"name": "judge", "task": "review", "needs": ["research"], "gpus": 0},
+        ]})
+        assert [m.target for m in stub.mounts["research"] if m.target.startswith("/inputs")] == []
+    finally:
+        fleet.close()
+
+
+def test_each_fanned_out_copy_keeps_its_own_results_directory(tmp_path):
+    stub = ArtifactExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({"stages": [
+            {"name": "probe", "task": "t", "copies": 2, "gpus": 0},
+        ]})
+        sources = {
+            name: next(m.source for m in mounts if m.target == "/results")
+            for name, mounts in stub.mounts.items()
+        }
+        assert len(set(sources.values())) == 2, "copies shared a results directory"
+    finally:
+        fleet.close()
+
+
+def test_a_stage_sees_every_completed_stage_by_name(tmp_path):
+    stub = ArtifactExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({"stages": [
+            {"name": "one", "task": "t", "gpus": 0},
+            {"name": "two", "task": "t", "needs": ["one"], "gpus": 0},
+            {"name": "three", "task": "t", "needs": ["two"], "gpus": 0},
+        ]})
+        targets = {m.target for m in stub.mounts["three"]}
+        assert {"/inputs/one", "/inputs/two"} <= targets
+    finally:
+        fleet.close()
+
+
+def test_a_long_final_answer_reaches_the_next_stage_whole(tmp_path):
+    """The judge's prompt interpolates the researcher's answer. If that answer is
+    clipped on the way, findings vanish from the review without anyone noticing."""
+    answer = "## F1: first\n" + ("filler " * 3000) + "\n## F7: last"
+    stub = ScriptedExecutor({"research": [answer]})
+    fleet = _fleet(tmp_path, stub)
+    try:
+        report = fleet.run_workflow({"stages": [
+            {"name": "research", "task": "analyse", "gpus": 0},
+            {"name": "judge", "task": "grade this:\n{{ steps.research.output }}", "gpus": 0},
+        ]})
+        assert report.steps["research"].output == answer
+        judge_prompt = stub.tasks[1]
+        assert "## F7: last" in judge_prompt, "the tail of the answer never reached the judge"
+    finally:
+        fleet.close()
+
+
+# ------------------------------------------------------------ run directories
+
+
+def _results_root(fleet):
+    return fleet.config.results_path
+
+
+def test_a_run_lands_under_its_workflow_name_and_attempt(tmp_path):
+    stub = ArtifactExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({"name": "myc-discovery", "stages": [
+            {"name": "research", "task": "t", "gpus": 0},
+            {"name": "judge", "task": "t", "needs": ["research"], "gpus": 0},
+        ]})
+        run_dir = _results_root(fleet) / "myc-discovery" / "001"
+        assert (run_dir / "research" / "findings.md").exists()
+        assert (run_dir / "judge" / "findings.md").exists()
+    finally:
+        fleet.close()
+
+
+def test_running_the_same_workflow_again_opens_the_next_attempt(tmp_path):
+    workflow = {"name": "myc-discovery", "stages": [{"name": "research", "task": "t", "gpus": 0}]}
+    first = _fleet(tmp_path, ArtifactExecutor())
+    try:
+        first.run_workflow(workflow)
+    finally:
+        first.close()
+    second = _fleet(tmp_path, ArtifactExecutor())
+    try:
+        second.run_workflow(workflow)
+        attempts = sorted(p.name for p in (_results_root(second) / "myc-discovery").iterdir())
+        assert attempts == ["001", "002"]
+    finally:
+        second.close()
+
+
+def test_a_repeat_run_is_told_nothing_about_the_last_one(tmp_path):
+    """Isolation is the default: only an explicit resume or base run inherits."""
+    workflow = {"name": "wf", "stages": [
+        {"name": "research", "task": "t", "gpus": 0},
+        {"name": "judge", "task": "t", "needs": ["research"], "gpus": 0},
+    ]}
+    first = _fleet(tmp_path, ArtifactExecutor())
+    try:
+        first.run_workflow(workflow)
+    finally:
+        first.close()
+
+    stub = ArtifactExecutor()
+    second = _fleet(tmp_path, stub)
+    try:
+        second.run_workflow(workflow)
+        for name, mounts in stub.mounts.items():
+            sources = [m.source for m in mounts]
+            assert not any("/001/" in s for s in sources), f"{name} reached into attempt 001"
+            assert "/previous-results" not in [m.target for m in mounts]
+        # ...and the judge still sees this run's own research stage.
+        assert "/inputs/research" in {m.target for m in stub.mounts["judge"]}
+    finally:
+        second.close()
+
+
+def test_a_resume_continues_in_the_same_directory(tmp_path):
+    workflow = {"name": "wf", "stages": [
+        {"name": "first", "task": "t", "gpus": 0},
+        {"name": "second", "task": "t", "needs": ["first"], "gpus": 0},
+    ]}
+    first = _fleet(tmp_path, ArtifactExecutor())
+    try:
+        first.run_workflow(workflow)
+        prior_run = first.run_id
+    finally:
+        first.close()
+
+    resumed = _fleet(tmp_path, ArtifactExecutor())
+    try:
+        resumed.run_workflow(workflow, resume_from=prior_run)
+        root = _results_root(resumed) / "wf"
+        assert sorted(p.name for p in root.iterdir()) == ["001"]
+        manifest = json.loads((root / "001" / "run.json").read_text())
+        assert manifest["run_id"] == prior_run
+        assert resumed.run_id in manifest["continued_by"]
+    finally:
+        resumed.close()
+
+
+def test_a_base_run_opens_a_new_attempt_and_keeps_the_old_one(tmp_path):
+    workflow = {"name": "wf", "stages": [{"name": "first", "task": "t", "gpus": 0}]}
+    first = _fleet(tmp_path, ArtifactExecutor())
+    try:
+        first.run_workflow(workflow)
+        prior_run = first.run_id
+    finally:
+        first.close()
+
+    stub = ArtifactExecutor()
+    based = _fleet(tmp_path, stub)
+    try:
+        based.run_workflow(workflow, base_run=prior_run)
+        root = _results_root(based) / "wf"
+        assert sorted(p.name for p in root.iterdir()) == ["001", "002"]
+        assert json.loads((root / "002" / "run.json").read_text())["based_on"] == prior_run
+        assert (root / "001" / "first" / "findings.md").exists(), "the earlier attempt was clobbered"
+        previous = [m for m in stub.mounts["first"] if m.target == "/previous-results"]
+        assert previous and previous[0].source.endswith("/001")
+    finally:
+        based.close()
+
+
+def test_a_run_that_submits_nothing_leaves_no_directory(tmp_path):
+    fleet = _fleet(tmp_path, ArtifactExecutor())
+    try:
+        assert not _results_root(fleet).exists() or list(_results_root(fleet).iterdir()) == []
+    finally:
+        fleet.close()
+
+
+def test_cycle_iterations_and_copies_get_their_own_directories(tmp_path):
+    stub = ArtifactExecutor(script={"review": ["needs work", "APPROVED"]})
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({"name": "wf", "stages": [
+            {"name": "probe", "task": "t", "copies": 2, "gpus": 0},
+            {"name": "cycle", "needs": ["probe"], "loop": {
+                "max_iterations": 2,
+                "until": {"step": "review", "output_contains": "APPROVED"},
+                "steps": [{"name": "review", "task": "t", "gpus": 0}]}},
+        ]})
+        names = sorted(p.name for p in (_results_root(fleet) / "wf" / "001").iterdir() if p.is_dir())
+        assert names == ["cycle-review-1", "cycle-review-2", "probe-0", "probe-1"]
+    finally:
+        fleet.close()
+
+
+def test_isolation_is_provisioned_without_the_user_asking(tmp_path):
+    """A research directory is not a git repo and should not have to become one by
+    hand for isolation to work."""
+    from research_fleet import isolation
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (workspace / "prompts.md").write_text("a prompt")
+
+    fleet = Fleet(root=str(tmp_path / "state"), workspace=str(workspace),
+                  executor={"kind": "dry-run"}, isolate_agents=True)
+    fleet.executor = fleet.scheduler.executor = ScriptedExecutor()
+    try:
+        fleet.run_workflow({"name": "wf", "stages": [{"name": "one", "task": "t", "gpus": 0}]})
+        assert isolation.is_repo(workspace)
+        assert (workspace / ".git").is_file(), "the git directory should not live in the project"
+        import subprocess
+        tracked = subprocess.run(["git", "ls-files"], cwd=workspace,
+                                 capture_output=True, text=True).stdout
+        assert tracked.strip() == "", "fleet tracked the user's files"
+    finally:
+        fleet.close()
+
+
+def test_a_run_with_no_isolated_jobs_never_touches_the_workspace(tmp_path):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    fleet = Fleet(root=str(tmp_path / "state"), workspace=str(workspace),
+                  executor={"kind": "dry-run"}, isolate_agents=False)
+    fleet.executor = fleet.scheduler.executor = ScriptedExecutor()
+    try:
+        fleet.run_workflow({"name": "wf", "stages": [{"name": "one", "task": "t", "gpus": 0}]})
+        assert not (workspace / ".git").exists()
+    finally:
+        fleet.close()
+
+
+def test_an_unusable_workspace_degrades_instead_of_failing_the_run(tmp_path):
+    """Losing isolation is better than losing the run."""
+    fleet = Fleet(root=str(tmp_path / "state"), workspace=str(tmp_path / "gone"),
+                  executor={"kind": "dry-run"}, isolate_agents=True)
+    stub = ScriptedExecutor()
+    fleet.executor = fleet.scheduler.executor = stub
+    try:
+        with pytest.warns(UserWarning, match="isolation"):
+            report = fleet.run_workflow({"name": "wf", "stages": [
+                {"name": "one", "task": "t", "gpus": 0}]})
+        assert report.steps["one"].state is JobState.SUCCEEDED
+        assert stub.isolated == [False]
+    finally:
+        fleet.close()
+
+
+def test_a_based_run_sees_the_earlier_runs_stages_by_name(tmp_path):
+    workflow = {"name": "wf", "stages": [
+        {"name": "research", "task": "t", "gpus": 0},
+        {"name": "judge", "task": "t", "needs": ["research"], "gpus": 0},
+    ]}
+    first = _fleet(tmp_path, ArtifactExecutor())
+    try:
+        first.run_workflow(workflow)
+        prior_run = first.run_id
+    finally:
+        first.close()
+
+    stub = ArtifactExecutor()
+    based = _fleet(tmp_path, stub)
+    try:
+        based.run_workflow(workflow, base_run=prior_run)
+        targets = {m.target: m for m in stub.mounts["research"]}
+        assert "/previous/research" in targets and "/previous/judge" in targets
+        assert targets["/previous/research"].mode == "ro"
+        assert (Path(targets["/previous/judge"].source) / "findings.md").exists()
+        # The whole prior run stays available under its documented name.
+        assert "/previous-results" in targets
+    finally:
+        based.close()
+
+
+def test_a_fresh_run_is_given_no_previous_stages(tmp_path):
+    workflow = {"name": "wf", "stages": [{"name": "research", "task": "t", "gpus": 0}]}
+    first = _fleet(tmp_path, ArtifactExecutor())
+    try:
+        first.run_workflow(workflow)
+    finally:
+        first.close()
+
+    stub = ArtifactExecutor()
+    second = _fleet(tmp_path, stub)
+    try:
+        second.run_workflow(workflow)
+        assert not [m for m in stub.mounts["research"] if m.target.startswith("/previous")]
+    finally:
+        second.close()
+
+
+def test_a_based_run_tolerates_a_revised_workflow(tmp_path):
+    """Building on an earlier attempt usually means having changed the prompts in
+    light of it, so `--from-run` must not require an unchanged definition."""
+    first = _fleet(tmp_path, ArtifactExecutor())
+    try:
+        first.run_workflow({"name": "wf", "stages": [{"name": "research", "task": "v1", "gpus": 0}]})
+        prior_run = first.run_id
+    finally:
+        first.close()
+
+    stub = ArtifactExecutor()
+    based = _fleet(tmp_path, stub)
+    try:
+        based.run_workflow(
+            {"name": "wf", "stages": [
+                {"name": "research", "task": "v2, now referencing /previous", "gpus": 0}]},
+            base_run=prior_run,
+        )
+        assert stub.calls == ["research"]
+        assert "/previous/research" in {m.target for m in stub.mounts["research"]}
+    finally:
+        based.close()
+
+
+def test_a_resume_still_refuses_a_revised_workflow(tmp_path):
+    """Resuming skips completed stages, so a changed DAG would half-build the run."""
+    first = _fleet(tmp_path, ArtifactExecutor())
+    try:
+        first.run_workflow({"name": "wf", "stages": [{"name": "a", "task": "v1", "gpus": 0}]})
+        prior_run = first.run_id
+    finally:
+        first.close()
+
+    resumed = _fleet(tmp_path, ArtifactExecutor())
+    try:
+        with pytest.raises(ValueError, match="no compatible checkpoint"):
+            resumed.run_workflow(
+                {"name": "wf", "stages": [{"name": "a", "task": "v2", "gpus": 0}]},
+                resume_from=prior_run,
+            )
+    finally:
+        resumed.close()
+
+
+def test_every_stage_receives_the_projects_shared_prompt(tmp_path):
+    """The point of the file: standing rules stop being copied into each task prompt."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (workspace / "FLEET.md").write_text("Never quote a number you did not compute.")
+
+    stub = ScriptedExecutor()
+    fleet = Fleet(root=str(tmp_path / "state"), workspace=str(workspace),
+                  executor={"kind": "dry-run"})
+    fleet.executor = fleet.scheduler.executor = stub
+    try:
+        fleet.run_workflow({"name": "wf", "stages": [
+            {"name": "research", "task": "analyse", "gpus": 0},
+            {"name": "judge", "task": "review", "needs": ["research"], "gpus": 0},
+        ]})
+        assert len(stub.systems) == 2
+        for system in stub.systems:
+            assert "Never quote a number you did not compute." in system
+        # ...and it did not displace the task itself.
+        assert "analyse" in stub.tasks[0] and "review" in stub.tasks[1]
+    finally:
+        fleet.close()
+
+
+def test_a_project_without_a_file_still_gets_the_default_instructions(tmp_path):
+    """The generic guidance ships with fleet, so a new project is not left with none."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    stub = ScriptedExecutor()
+    fleet = Fleet(root=str(tmp_path / "state"), workspace=str(workspace),
+                  executor={"kind": "dry-run"})
+    fleet.executor = fleet.scheduler.executor = stub
+    try:
+        fleet.run_workflow({"name": "wf", "stages": [{"name": "a", "task": "t", "gpus": 0}]})
+        assert "Project instructions" in stub.systems[0]
+        assert "How a run is organised" in stub.systems[0]
+    finally:
+        fleet.close()
+
+
+def test_the_shared_prompt_is_read_once_per_run(tmp_path):
+    """A file edited mid-run would otherwise split a workflow's stages across two sets
+    of rules -- the drift the shared prompt exists to prevent."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    shared = workspace / "FLEET.md"
+    shared.write_text("version one")
+
+    class Editing(ScriptedExecutor):
+        def run(self, spec, **kw):
+            shared.write_text("version two")
+            return super().run(spec, **kw)
+
+    stub = Editing()
+    fleet = Fleet(root=str(tmp_path / "state"), workspace=str(workspace),
+                  executor={"kind": "dry-run"})
+    fleet.executor = fleet.scheduler.executor = stub
+    try:
+        fleet.run_workflow({"name": "wf", "stages": [
+            {"name": "a", "task": "t", "gpus": 0},
+            {"name": "b", "task": "t", "needs": ["a"], "gpus": 0},
+        ]})
+        assert all("version one" in s for s in stub.systems)
+    finally:
+        fleet.close()
+
+
+def test_a_resumed_stage_overwrites_its_failed_attempt_not_its_neighbour(tmp_path):
+    """The whole point of stage-named directories is that `/inputs/second` is the
+    second stage's result. A resume must not leave the failure sitting there."""
+    from research_fleet import runlayout
+
+    class Gated(ArtifactExecutor):
+        """`second` fails until a gate file appears in `first`'s results."""
+
+        def run(self, spec, **kw):
+            result = super().run(spec, **kw)
+            if spec.name == "second":
+                results = next(m.source for m in spec.mounts if m.target == "/results")
+                gate = [m.source for m in spec.mounts if m.target == "/inputs/first"]
+                if not (gate and (Path(gate[0]) / "gate").exists()):
+                    result.state = JobState.FAILED
+                    result.exit_code = 1
+                else:
+                    (Path(results) / "second.txt").write_text("resumed ok")
+            return result
+
+    workflow = {"name": "wf", "stages": [
+        {"name": "first", "task": "t", "gpus": 0},
+        {"name": "second", "task": "t", "needs": ["first"], "gpus": 0},
+    ]}
+
+    first = _fleet(tmp_path, Gated())
+    try:
+        first.run_workflow(workflow)
+        prior_run = first.run_id
+    finally:
+        first.close()
+
+    run_dir = _results_root(first) / "wf" / "001"
+    assert not (run_dir / "second" / "second.txt").exists(), "the stage should have failed"
+    (run_dir / "first" / "gate").write_text("go")
+
+    resumed = _fleet(tmp_path, Gated())
+    try:
+        resumed.run_workflow(workflow, resume_from=prior_run)
+    finally:
+        resumed.close()
+
+    assert (run_dir / "second" / "second.txt").exists(), \
+        "the successful re-run did not land in the stage's own directory"
+    assert not (run_dir / "second~2").exists(), "the re-run was pushed aside by a suffix"
+    superseded = run_dir / runlayout.SUPERSEDED
+    assert superseded.is_dir() and any(superseded.iterdir()), "the failed attempt was lost"
+    # ...and a later run building on this one gets the success, not the failure.
+    assert "second.txt" in {p.name for p in runlayout.stage_dirs(run_dir)["second"].iterdir()}
+
+
+def test_a_harness_failure_stops_the_workflow_instead_of_feeding_the_next_stage(tmp_path):
+    """A refused prompt exits 0 with the refusal as its 'answer'. Marked succeeded, the
+    run carries on and spends the next stage judging an error message."""
+    class Refusing(ScriptedExecutor):
+        def run(self, spec, *, argv, env, placement, policy, on_line):
+            if spec.name == "research":
+                self.calls.append(spec.name)
+                self.tasks.append("")
+                self.systems.append("")
+                on_line("stdout", json.dumps({
+                    "type": "result", "subtype": "success", "is_error": False,
+                    "num_turns": 0,
+                    "result": "Goal condition is limited to 4000 characters (got 4184)",
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                }))
+                return JobResult(job_id=spec.id, state=JobState.SUCCEEDED, exit_code=0)
+            return super().run(spec, argv=argv, env=env, placement=placement,
+                               policy=policy, on_line=on_line)
+
+    stub = Refusing()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        report = fleet.run_workflow({"name": "wf", "stages": [
+            {"name": "research", "task": "t", "gpus": 0},
+            {"name": "judge", "task": "grade {{ steps.research.output }}", "gpus": 0},
+        ]})
+        assert report.steps["research"].state is JobState.FAILED
+        assert "4000 characters" in (report.steps["research"].error or "")
+        assert "judge" not in stub.calls, "the judge ran against an error message"
     finally:
         fleet.close()

@@ -167,6 +167,12 @@ class JobResult(BaseModel):
     output: str = Field(
         "", description="The job's answer: an agent's final message, or a command's last output."
     )
+    results_dir: str | None = Field(
+        None,
+        description="Host directory the job's `/results` was mounted from. Recorded "
+                    "rather than recomputed, so it survives a checkpoint written under "
+                    "a different run and an older on-disk layout.",
+    )
     agent_seconds: float | None = Field(
         None,
         description="Time the harness reported working, excluding container start and "

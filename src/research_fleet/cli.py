@@ -26,9 +26,10 @@ from .fleet import CredentialsUnavailable, Fleet
 from .ledger import Ledger
 from .spec import JobSpec, new_id
 from .sweep import parse_grid_args
+from . import sharedprompt
 
 app = typer.Typer(
-    add_completion=False,
+    add_completion=True,
     no_args_is_help=True,
     help="Auditable, containerized, multi-GPU agent fleet for autonomous research.",
 )
@@ -36,6 +37,51 @@ audit_app = typer.Typer(no_args_is_help=True, help="Inspect and verify the audit
 app.add_typer(audit_app, name="audit")
 
 console = Console()
+
+
+def _complete_runs(ctx: typer.Context, incomplete: str) -> list[str]:
+    """Complete run ids from the configured ledger and detached-run logs."""
+    config = (ctx.params or {}).get("config") if ctx is not None else None
+    root = (ctx.params or {}).get("root") if ctx is not None else None
+    try:
+        cfg = load_config(config, root=root)
+        with Ledger(cfg.root_path) as ledger:
+            found = {r["run_id"] for r in ledger.runs()}
+            found.update(ev.run_id for ev in ledger.events(limit=100000) if ev.run_id)
+        log_dir = cfg.root_path / "logs"
+        if log_dir.exists():
+            found.update(p.stem for p in log_dir.glob("run_*.log"))
+        return sorted(run_id for run_id in found if run_id.startswith(incomplete))
+    except Exception:
+        # Completion must never turn a typo or unavailable state directory into a
+        # traceback in the user's interactive shell.
+        return []
+
+
+def _complete_jobs(ctx: typer.Context, incomplete: str) -> list[str]:
+    """Complete job ids from the configured ledger."""
+    config = (ctx.params or {}).get("config") if ctx is not None else None
+    try:
+        cfg = load_config(config)
+        with Ledger(cfg.root_path) as ledger:
+            return sorted(
+                job["job_id"] for job in ledger.jobs()
+                if job["job_id"].startswith(incomplete)
+            )
+    except Exception:
+        return []
+
+
+def _choices(*values: str):
+    def complete(incomplete: str) -> list[str]:
+        return [value for value in values if value.startswith(incomplete)]
+
+    return complete
+
+
+_BACKENDS = _choices("claude-cli", "codex-cli")
+_EFFORTS = _choices("low", "medium", "high", "xhigh", "max")
+_EXECUTORS = _choices("ship", "slurm", "ray", "dry-run")
 
 
 def _fleet(config: Optional[str], **overrides) -> Fleet:
@@ -165,8 +211,12 @@ def run(
     task: str = typer.Argument(..., help="The research task to hand the agents."),
     agents: int = typer.Option(1, "--agents", "-n", help="How many agents to run in parallel."),
     model: Optional[str] = typer.Option(None, "--model", "-m"),
-    backend: Optional[str] = typer.Option(None, "--backend", help="claude-cli | codex-cli"),
-    effort: Optional[str] = typer.Option(None, "--effort", help="low|medium|high|xhigh|max"),
+    backend: Optional[str] = typer.Option(
+        None, "--backend", help="claude-cli | codex-cli", autocompletion=_BACKENDS
+    ),
+    effort: Optional[str] = typer.Option(
+        None, "--effort", help="low|medium|high|xhigh|max", autocompletion=_EFFORTS
+    ),
     gpus: Optional[float] = typer.Option(
         None, "--gpus",
         help="GPUs per agent. Default: share the devices so every agent runs at once.",
@@ -179,13 +229,24 @@ def run(
     image: Optional[str] = typer.Option(None, "--image"),
     timeout: int = typer.Option(3600, "--timeout", help="Per-agent wall clock, seconds."),
     max_usd: Optional[float] = typer.Option(None, "--max-usd", help="Budget ceiling for the whole run."),
-    executor: Optional[str] = typer.Option(None, "--executor", help="ship | slurm | ray | dry-run"),
+    executor: Optional[str] = typer.Option(
+        None, "--executor", help="ship | slurm | ray | dry-run", autocompletion=_EXECUTORS
+    ),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
     detach: bool = typer.Option(False, "--detach", "-d", help="Return immediately; run in the background."),
+    resume_from: Optional[str] = typer.Option(
+        None, "--resume", help="Continue this run in its existing workspace/results directory.",
+        autocompletion=_complete_runs,
+    ),
     run_id: Optional[str] = typer.Option(None, "--run-id", hidden=True),
 ):
-    """Launch one or more research agents on a task."""
+    """Launch one or more research agents on a task.
+
+    ``--resume`` reuses the prior run's results directory and workspace context while
+    submitting the requested task as a new continuation attempt. It does not resume
+    the provider's interactive conversation/session.
+    """
     if detach:
         _detach_and_return(config)
         return
@@ -212,6 +273,7 @@ def run(
             fleet.run_agents(
                 task, n=agents, model=model, backend=backend, effort=effort,
                 gpus=share, cpus=cpu_share, timeout_s=timeout,
+                resume_from=resume_from,
             )
         except CredentialsUnavailable as exc:
             _credentials_error(exc)
@@ -229,7 +291,7 @@ def sweep(
     workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
     image: Optional[str] = typer.Option(None, "--image"),
     timeout: int = typer.Option(3600, "--timeout"),
-    executor: Optional[str] = typer.Option(None, "--executor"),
+    executor: Optional[str] = typer.Option(None, "--executor", autocompletion=_EXECUTORS),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
@@ -248,18 +310,22 @@ def sweep(
 
 @app.command()
 def workflow(
-    file: str = typer.Argument(..., help="Workflow YAML."),
+    file: Path = typer.Argument(..., help="Workflow YAML.", exists=True, dir_okay=False),
     workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
     max_usd: Optional[float] = typer.Option(None, "--max-usd"),
-    executor: Optional[str] = typer.Option(None, "--executor", help="ship | slurm | ray | dry-run"),
+    executor: Optional[str] = typer.Option(
+        None, "--executor", help="ship | slurm | ray | dry-run", autocompletion=_EXECUTORS
+    ),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
     plan: bool = typer.Option(False, "--plan", help="Validate and print the stages, run nothing."),
     resume_from: Optional[str] = typer.Option(
-        None, "--resume", help="Continue from the last compatible checkpoint in this run."
+        None, "--resume", help="Continue from the last compatible checkpoint in this run.",
+        autocompletion=_complete_runs,
     ),
     base_run: Optional[str] = typer.Option(
-        None, "--from-run", help="Reuse a run's outputs/files but execute all stages again."
+        None, "--from-run", help="Reuse a run's outputs/files but execute all stages again.",
+        autocompletion=_complete_runs,
     ),
     detach: bool = typer.Option(
         False, "--detach", "-d", help="Return immediately; run the workflow in the background."
@@ -444,11 +510,12 @@ def _detach_and_return(config: Optional[str]) -> None:
     argv += ["--run-id", run_id]
 
     with log_path.open("w", encoding="utf-8") as log:
-        subprocess.Popen(
+        process = subprocess.Popen(
             argv, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True,        # survives this shell closing
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
+    (log_dir / f"{run_id}.pid").write_text(f"{process.pid}\n", encoding="utf-8")
     console.print(f"[bold]run {run_id}[/bold] started in the background")
     console.print(f"  fleet watch {run_id}      follow it")
     console.print(f"  fleet ls {run_id}         job states")
@@ -458,7 +525,7 @@ def _detach_and_return(config: Optional[str]) -> None:
 
 @app.command()
 def watch(
-    run_id: str = typer.Argument(..., help="Run to follow."),
+    run_id: str = typer.Argument(..., help="Run to follow.", autocompletion=_complete_runs),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
 ):
     """Follow a detached run's output."""
@@ -467,12 +534,70 @@ def watch(
     if not log_path.exists():
         console.print(f"[red]no log for {run_id}[/red] at {log_path}")
         raise typer.Exit(1)
-    import subprocess
-
     try:
-        subprocess.run(["tail", "-n", "+1", "-f", str(log_path)], check=False)
+        _follow_run_log(
+            log_path, cfg.root_path, run_id,
+            pid_path=log_path.with_suffix(".pid"),
+        )
     except KeyboardInterrupt:
         pass
+
+
+def _follow_run_log(
+    log_path: Path,
+    root_path: Path,
+    run_id: str,
+    *,
+    pid_path: Path | None = None,
+    poll_interval: float = 0.2,
+) -> None:
+    """Stream a detached log and stop once its ledger run is terminal.
+
+    ``tail -f`` never exits when the scheduler closes and its output can be block
+    buffered when ``fleet watch`` is called by another process.  Reading here lets us
+    flush every append, survive a truncated/replaced log, and use the ledger as the
+    authoritative completion signal.
+    """
+    offset = 0
+    saw_jobs = False
+    terminal_polls = 0
+    terminal_states = {"succeeded", "failed", "cancelled", "denied"}
+
+    while True:
+        try:
+            size = log_path.stat().st_size
+            if size < offset:
+                offset = 0
+            with log_path.open("r", encoding="utf-8", errors="replace") as log:
+                log.seek(offset)
+                chunk = log.read()
+                offset = log.tell()
+        except FileNotFoundError:
+            chunk = ""
+            offset = 0
+
+        if chunk:
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+
+        with Ledger(root_path) as ledger:
+            jobs = ledger.jobs(run_id=run_id)
+        saw_jobs = saw_jobs or bool(jobs)
+        terminal = saw_jobs and jobs and all(job["state"] in terminal_states for job in jobs)
+        if not saw_jobs and pid_path is not None and pid_path.exists():
+            try:
+                pid = int(pid_path.read_text(encoding="utf-8").strip())
+                stat = Path(f"/proc/{pid}/stat")
+                process_alive = stat.exists() and stat.read_text().split()[2] != "Z"
+            except (OSError, ValueError, IndexError):
+                process_alive = False
+            terminal = not process_alive
+        terminal_polls = terminal_polls + 1 if terminal else 0
+
+        # One extra poll drains text written just after the terminal ledger event.
+        if terminal_polls >= 2:
+            return
+        time.sleep(poll_interval)
 
 
 @app.command()
@@ -503,7 +628,9 @@ def login(
 
 @app.command()
 def kill(
-    run_id: Optional[str] = typer.Argument(None, help="Which run. Default: every active run."),
+    run_id: Optional[str] = typer.Argument(
+        None, help="Which run. Default: every active run.", autocompletion=_complete_runs
+    ),
     root: Optional[str] = typer.Option(None, "--root", help="State directory the run used."),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
 ):
@@ -568,7 +695,9 @@ def usage(
     by: str = typer.Option("run", "--by", "-b",
                            help="run, model, stage, attempt, name, kind, backend, day, job. "
                                 "Comma separated for a finer grain, e.g. run,stage,attempt."),
-    run_id: Optional[str] = typer.Option(None, "--run", help="Only this run."),
+    run_id: Optional[str] = typer.Option(
+        None, "--run", help="Only this run.", autocompletion=_complete_runs
+    ),
     days: Optional[int] = typer.Option(None, "--days", help="Only the last N days."),
     kind: Optional[str] = typer.Option(None, "--kind", help="agent or command."),
     jobs: bool = typer.Option(False, "--jobs", help="List every job instead of totals."),
@@ -629,6 +758,32 @@ def usage(
 
 
 @app.command()
+def init(
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite an edited FLEET.md with the current default."
+    ),
+):
+    """Write the default agent instructions (FLEET.md) into a project."""
+    cfg = load_config(config, **_overrides(workspace=workspace))
+    target = Path(cfg.workspace).expanduser().resolve()
+    path, outcome = sharedprompt.write_default(target, force=force)
+
+    if outcome == "written":
+        console.print(f"[green]Wrote[/] {path}")
+        console.print(
+            "Every agent job in this project now gets these instructions. They are "
+            "general on purpose;\nedit the file to add anything specific to this "
+            "project, and fleet will not overwrite it."
+        )
+    elif outcome == "unchanged":
+        console.print(f"{path} already matches the default; nothing to do.")
+    else:
+        console.print(f"[yellow]Kept[/] your edited {path} (use --force to replace it).")
+
+
+@app.command()
 def runs(config: Optional[str] = typer.Option(None, "--config", "-c")):
     """List past runs."""
     cfg = load_config(config)
@@ -646,7 +801,7 @@ def runs(config: Optional[str] = typer.Option(None, "--config", "-c")):
 
 @app.command("ls")
 def list_jobs(
-    run_id: Optional[str] = typer.Argument(None),
+    run_id: Optional[str] = typer.Argument(None, autocompletion=_complete_runs),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
 ):
     """List jobs, optionally filtered to one run."""
@@ -666,7 +821,7 @@ def list_jobs(
 
 @app.command()
 def trace(
-    job_id: str = typer.Argument(..., help="Job to replay."),
+    job_id: str = typer.Argument(..., help="Job to replay.", autocompletion=_complete_jobs),
     types: Optional[str] = typer.Option(None, "--types", help="Comma-separated event types to include."),
     limit: int = typer.Option(500, "--limit"),
     raw: bool = typer.Option(False, "--raw", help="Emit JSONL instead of prose."),
@@ -719,7 +874,7 @@ def audit_verify(config: Optional[str] = typer.Option(None, "--config", "-c")):
 
 @audit_app.command("export")
 def audit_export(
-    run_id: Optional[str] = typer.Option(None, "--run"),
+    run_id: Optional[str] = typer.Option(None, "--run", autocompletion=_complete_runs),
     out: Optional[str] = typer.Option(None, "--out", "-o"),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
 ):
