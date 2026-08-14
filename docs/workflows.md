@@ -11,9 +11,11 @@ silently starts a fresh agent.
 
 ## Stages
 
-Stages use `task` for an agent or `command` for a normal process. `needs` controls
-dependencies. Independent stages can run concurrently, except two stages cannot
-use the same persistent actor concurrently.
+Stages use `task` for a short agent prompt, `task_file` for a prompt stored beside
+the workflow, or `command` for a normal process. A stage must set either `task` or
+`task_file`, not both. Relative task-file paths are resolved from the workflow YAML.
+`needs` controls dependencies. Independent stages can run concurrently, except two
+stages cannot use the same persistent actor concurrently.
 
 Each stage is rendered only when it becomes runnable. Templates can reference
 earlier output with `{{ steps.NAME.output }}`. This is also the key information
@@ -33,7 +35,7 @@ actors:
 stages:
   - name: first
     actor: researcher
-    task: Do the first task.
+    task_file: prompts/01-first.md
     gpus: 0
   - name: second
     actor: researcher

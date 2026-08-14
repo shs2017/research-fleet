@@ -52,7 +52,8 @@ context.
 
 Fleet releases a stage only after its dependencies finish. The actor receives
 that stage's prompt at release time, so later instructions remain undisclosed
-until the workflow reaches them.
+through the workflow interface until the workflow reaches them. Long prompts can
+use `task_file`, resolved relative to the workflow YAML.
 
 ```yaml
 name: investigate
@@ -67,7 +68,7 @@ actors:
 stages:
   - name: research
     actor: researcher
-    task: Investigate the question and save your evidence.
+    task_file: prompts/01-research.md
     gpus: 0
   - name: judge
     actor: judge
