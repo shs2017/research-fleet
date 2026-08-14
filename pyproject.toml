@@ -1,7 +1,7 @@
 [project]
 name = "research-fleet"
 version = "0.1.0"
-description = "Auditable, containerized, multi-GPU agent fleet for autonomous research"
+description = "Configurable, reproducible agent workflows for autonomous research"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

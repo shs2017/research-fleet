@@ -31,7 +31,7 @@ from . import sharedprompt
 app = typer.Typer(
     add_completion=True,
     no_args_is_help=True,
-    help="Auditable, containerized, multi-GPU agent fleet for autonomous research.",
+    help="Configurable, reproducible agent workflows for autonomous research.",
 )
 audit_app = typer.Typer(no_args_is_help=True, help="Inspect and verify the audit ledger.")
 app.add_typer(audit_app, name="audit")
@@ -283,7 +283,6 @@ def run(
         raise typer.Exit(0 if not report.failed else 1)
 
 
-@app.command()
 @app.command()
 def workflow(
     file: Path = typer.Argument(..., help="Workflow YAML.", exists=True, dir_okay=False),
@@ -887,10 +886,9 @@ def audit_reindex(config: Optional[str] = typer.Option(None, "--config", "-c")):
 def pending(config: Optional[str] = typer.Option(None, "--config", "-c")):
     """List jobs parked waiting for operator approval, and why.
 
-    Approval itself is in-process: a parked job belongs to a live scheduler, so
-    grant it with `fleet.approve(job_id)` from the session that submitted it (or
-    from the Python session that submitted it. There is no cross-process approve command:
-    a job whose scheduler has exited cannot be resumed, only resubmitted.
+    Approval is in-process: a parked job belongs to a live scheduler, so grant it
+    with `fleet.approve(job_id)` from the Python session that submitted it. There
+    is no cross-process approval command. If the scheduler exits, resubmit the job.
     """
     cfg = load_config(config)
     with Ledger(cfg.root_path) as ledger:
