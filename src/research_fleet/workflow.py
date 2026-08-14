@@ -68,6 +68,10 @@ class Step(BaseModel):
     kind: JobKind = JobKind.AGENT
     task: str = ""                          # agent steps
     task_file: str = ""
+    context_files: list[str] = Field(
+        default_factory=list,
+        description="Private reference files appended to this stage's task prompt.",
+    )
     command: list[str] = Field(default_factory=list)   # command steps
 
     model: str | None = None
@@ -342,21 +346,27 @@ class Workflow(BaseModel):
         Paths are relative to the workflow file, not the working directory, so a
         workflow keeps working when it is run from somewhere else.
         """
-        ref = entry.get("task_file")
-        if not ref:
-            return entry
         name = entry.get("name", "?")
-        if entry.get("task"):
+        ref = entry.get("task_file")
+        if ref and entry.get("task"):
             raise ValueError(f"step {name!r}: set either `task` or `task_file`, not both")
-        path = Path(ref).expanduser()
-        if not path.is_absolute() and base_dir is not None:
-            path = base_dir / path
-        try:
-            entry["task"] = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise ValueError(f"step {name!r}: cannot read task_file {str(path)!r}: {exc}") from exc
-        if not entry["task"].strip():
-            raise ValueError(f"step {name!r}: task_file {str(path)!r} is empty")
+        refs = ([ref] if ref else []) + list(entry.get("context_files", []))
+        parts: list[str] = []
+        for item in refs:
+            path = Path(item).expanduser()
+            if not path.is_absolute() and base_dir is not None:
+                path = base_dir / path
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ValueError(
+                    f"step {name!r}: cannot read prompt file {str(path)!r}: {exc}"
+                ) from exc
+            if not text.strip():
+                raise ValueError(f"step {name!r}: prompt file {str(path)!r} is empty")
+            parts.append(text)
+        if parts:
+            entry["task"] = "\n\n---\n\n".join(parts)
         return entry
 
     @classmethod

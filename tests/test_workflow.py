@@ -1295,6 +1295,22 @@ def test_every_stage_receives_the_projects_shared_prompt(tmp_path):
         fleet.close()
 
 
+def test_stage_context_files_are_appended_to_only_that_stage(tmp_path):
+    task = tmp_path / "task.md"
+    schema = tmp_path / "schema.md"
+    task.write_text("Do the memory step.")
+    schema.write_text("Required schema detail.")
+
+    workflow = Workflow.from_dict({"name": "wf", "stages": [
+        {"name": "memory", "task_file": "task.md", "context_files": ["schema.md"]},
+        {"name": "later", "task": "A separate stage.", "needs": ["memory"]},
+    ]}, base_dir=tmp_path)
+
+    assert "Do the memory step." in workflow.stages[0].task
+    assert "Required schema detail." in workflow.stages[0].task
+    assert "Required schema detail." not in workflow.stages[1].task
+
+
 def test_a_project_without_a_file_still_gets_the_default_instructions(tmp_path):
     """The generic guidance ships with fleet, so a new project is not left with none."""
     workspace = tmp_path / "project"
