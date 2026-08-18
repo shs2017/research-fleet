@@ -47,5 +47,30 @@ stages:
 Stages may also contain a bounded `loop` with `until.output_contains`. Use
 `fleet workflow FILE --plan` to validate and display the graph without running it.
 
-Results live under `ROOT/results/RUN_ID/`; events and usage live in the ledger at
-`ROOT`.
+## Files, iterations, and snapshots
+
+A stage sees result directories only from its transitive `needs` dependencies under
+`/inputs`. A repeated stage can therefore see an earlier iteration through its
+rendered output and persistent actor conversation, while an isolated chain also
+inherits tracked `/workspace` changes. Iteration result directories remain separate
+(`review`, `review-2`, and so on). No stage can see a different run unless that run is
+explicitly selected with `--from-run` or `--resume`.
+
+With `isolate: true`, every finished job records `snapshot.json` and a binary-capable
+`snapshot.patch` in its result directory. Fleet commits the stage's tracked workspace
+state and retains it under the Git ref named in `snapshot.json`, so the state remains
+inspectable after the temporary worktree is removed. `result.json` records the base
+commit, snapshot commit, and ref.
+
+Results live under `ROOT/results/<workflow>/<attempt>/`; events and usage live in the
+ledger at `ROOT`.
+
+The default `ship` executor runs stages in containers. The same workflow can run on
+the host with `fleet workflow workflow.yaml --executor direct`; Fleet rewrites its
+standard `/workspace`, `/results`, `/inputs`, and `/previous` paths to host paths.
+With `isolate: true`, direct mode also chains and snapshots Git worktrees.
+
+Fleet checkpoints after every cycle stage. If a stage fails or is denied, later
+cycle stages are not submitted. Re-run the unchanged workflow with
+`--resume RUN_ID` to retry that stage and continue from there; completed stages are
+not repeated.

@@ -8,6 +8,7 @@ worktrees must stay fully usable so stage-to-stage chaining can still commit.
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -93,6 +94,22 @@ def test_an_existing_repository_is_left_alone(tmp_path):
     assert (ws / ".git").is_dir(), "fleet replaced the user's own git directory"
     assert not isolation.gitdir_for(tmp_path / "root", ws).exists()
     assert _git("ls-files", cwd=ws).stdout.strip() == "code.py"
+
+
+def test_a_project_nested_in_another_repo_gets_its_own_private_repo(tmp_path):
+    parent = tmp_path / "parent"
+    project = parent / "private-agent-workspace"
+    project.mkdir(parents=True)
+    _git("init", "-q", cwd=parent)
+    (parent / "secret-prompt.md").write_text("do not expose")
+    (project / "README.md").write_text("runtime")
+
+    usable, detail = isolation.ensure_repo(project, tmp_path / "state")
+
+    assert usable, detail
+    assert isolation.is_repo(project)
+    assert Path(_git("rev-parse", "--show-toplevel", cwd=project).stdout.strip()) == project
+    assert _git("ls-files", cwd=project).stdout.strip() == ""
 
 
 def test_provisioning_twice_changes_nothing(workspace, tmp_path):

@@ -35,9 +35,10 @@ def _git(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
 
 
 def is_repo(workspace: Path) -> bool:
-    """Whether the workspace already sits inside a git repository."""
+    """Whether the workspace itself, rather than one of its parents, is a repository."""
     try:
-        return _git("rev-parse", "--git-dir", cwd=workspace).returncode == 0
+        found = _git("rev-parse", "--show-toplevel", cwd=workspace)
+        return found.returncode == 0 and Path(found.stdout.strip()).resolve() == workspace.resolve()
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -84,7 +85,9 @@ def ensure_repo(workspace: Path, root: Path) -> tuple[bool, str]:
     """Make sure `workspace` can host worktrees. Returns (usable, explanation).
 
     Idempotent: an already-provisioned workspace takes the same path as a user's own
-    repository and is left untouched.
+    repository and is left untouched. A configured project nested inside some larger
+    repository gets its own empty isolation repository so a worktree cannot expose the
+    parent's prompts or unrelated files.
     """
     workspace = Path(workspace).expanduser().resolve()
     if not workspace.is_dir():

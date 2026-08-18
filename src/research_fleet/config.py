@@ -45,7 +45,7 @@ class BudgetConfig(BaseModel):
 
 
 class ExecutorConfig(BaseModel):
-    kind: Literal["ship", "dry-run"] = "ship"
+    kind: Literal["ship", "direct", "dry-run"] = "ship"
     ship_binary: str = Field("ship", description="The research-ship launcher, on PATH.")
     project_dir: str | None = Field(
         None,

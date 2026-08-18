@@ -452,6 +452,7 @@ class WorkflowRunner:
         self._restored_outcomes: dict[str, StageOutcome] = {}
         self._actor_sessions: dict[str, str] = {}
         self._actors_started: set[str] = set()
+        self._cycle_progress: dict[str, dict[str, int]] = {}
         self._fingerprint = hashlib.sha256(json.dumps(
             workflow.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
         ).encode()).hexdigest()
@@ -465,12 +466,10 @@ class WorkflowRunner:
         matches = [e for e in events if e.payload.get("fingerprint") == self._fingerprint]
         if not matches:
             if resume:
-                # Resuming skips completed stages, so a changed definition would leave
-                # this run half-built from a DAG that no longer exists.
-                raise ValueError(
-                    f"run {prior_run!r} has no compatible checkpoint for workflow "
-                    f"{self.workflow.name!r}"
-                )
+                if self._restore_legacy_run(prior_run):
+                    return
+                raise ValueError(f"run {prior_run!r} has no compatible checkpoint for "
+                                 f"workflow {self.workflow.name!r}")
             # `--from-run` re-executes everything and only inherits files, so a revised
             # workflow is the normal case: building on a previous attempt usually means
             # having changed the prompts in light of it. Take the prior run's artifacts
@@ -496,6 +495,7 @@ class WorkflowRunner:
         self._worktree_tip_run = state.get("worktree_tip_run") or prior_run
         self._actor_sessions = dict(state.get("actor_sessions", {})) if resume else {}
         self._actors_started = set(state.get("actors_started", [])) if resume else set()
+        self._cycle_progress = dict(state.get("cycle_progress", {})) if resume else {}
         self.fleet.ledger.append(
             "workflow.restored",
             {"from_run": prior_run, "resume": resume,
@@ -516,19 +516,111 @@ class WorkflowRunner:
                 "worktree_tip_run": self._worktree_tip_run,
                 "actor_sessions": dict(self._actor_sessions),
                 "actors_started": sorted(self._actors_started),
+                "cycle_progress": dict(self._cycle_progress),
             },
             run_id=self.fleet.run_id,
         )
 
-    def _context(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    @staticmethod
+    def _cycle_key(group: list[str]) -> str:
+        return "\x1f".join(group)
+
+    def _restore_legacy_run(self, prior_run: str) -> bool:
+        """Recover a pre-stage-checkpoint cycle from its durable job records."""
+        started = self.fleet.ledger.events(
+            run_id=prior_run, types=["workflow.started"], limit=100000
+        )
+        if not started or started[-1].payload.get("name") != self.workflow.name:
+            return False
+        submitted = self.fleet.ledger.events(
+            run_id=prior_run, types=["job.submitted"], limit=100000
+        )
+        specs = {event.job_id: event.payload.get("spec", {}) for event in submitted}
+        rows = self.fleet.ledger.jobs(run_id=prior_run)
+        jobs = []
+        for row in rows:
+            spec = specs.get(row["job_id"], {})
+            labels = spec.get("labels") or {}
+            raw = row.get("result")
+            try:
+                result = JobResult.model_validate(json.loads(raw) if isinstance(raw, str) else raw)
+            except (TypeError, ValueError):
+                continue
+            jobs.append((labels.get("stage") or spec.get("name"),
+                         int(labels.get("attempt") or 1), spec, result))
+
+        restored_any = False
+        outcomes: dict[str, StageOutcome] = {}
+        for group in self.workflow.cycles():
+            key = self._cycle_key(group)
+            by_position = {(stage, iteration): (spec, result) for stage, iteration, spec, result in jobs}
+            limit = self.workflow.repeat_limit(group)
+            for iteration in range(1, limit + 1):
+                for index, name in enumerate(group):
+                    pair = by_position.get((name, iteration))
+                    if pair is None or pair[1].state is not JobState.SUCCEEDED:
+                        self._cycle_progress[key] = {"iteration": iteration, "next": index}
+                        self._restored_outcomes.update(outcomes)
+                        self.fleet.ledger.append(
+                            "workflow.restored",
+                            {"from_run": prior_run, "resume": True,
+                             "legacy_recovery": True, "cycle_progress": self._cycle_progress},
+                            run_id=self.fleet.run_id,
+                        )
+                        return restored_any
+                    spec, result = pair
+                    restored_any = True
+                    self.results[name] = result
+                    self.results[f"{name}-0"] = result
+                    outcome = outcomes.setdefault(name, StageOutcome(stage=name, iterations=iteration))
+                    outcome.iterations = iteration
+                    outcome.job_ids.append(result.job_id)
+                    step = self._step_named(name)
+                    if step and step.actor and result.session_id:
+                        actor = self.workflow.actors[step.actor]
+                        if actor.persistent:
+                            self._actor_sessions[step.actor] = result.session_id
+                        self._actors_started.add(step.actor)
+                    branch = result.worktree_branch
+                    if branch:
+                        prefix = f"fleet/{prior_run}-"
+                        self._worktree_tip = branch[len(prefix):] if branch.startswith(prefix) else spec.get("name")
+                        self._worktree_tip_run = prior_run
+            self._cycle_progress.pop(key, None)
+        return restored_any
+
+    def _dependency_names(self, step: Step) -> set[str]:
+        """All transitive prerequisites visible to a stage."""
+        graph = self.workflow.graph()
+        if step.name not in graph:  # an inner loop step belongs to its enclosing cycle
+            return set(self.results)
+        visible: set[str] = set()
+        pending = list(graph[step.name])
+        while pending:
+            name = pending.pop()
+            if name in visible:
+                continue
+            visible.add(name)
+            pending.extend(graph.get(name, ()))
+        return visible
+
+    def _visible_result_names(self, step: Step) -> set[str]:
+        stages = self._dependency_names(step)
+        return {
+            name for name in self.results
+            if any(name == stage or name.startswith(f"{stage}-") for stage in stages)
+        }
+
+    def _context(self, step: Step, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        visible = self._visible_result_names(step)
         steps = {
             name: {"output": r.output, "state": r.state.value, "job_id": r.job_id}
-            for name, r in self.results.items()
+            for name, r in self.results.items() if name in visible
         }
         return {"steps": steps, "workflow": self.workflow.name, **(extra or {})}
 
-    def _stage_mounts(self) -> list[Mount]:
-        """Every finished stage's `/results`, mounted read-only at `/inputs/<stage>`.
+    def _stage_mounts(self, step: Step) -> list[Mount]:
+        """Dependency results, mounted read-only at `/inputs/<stage>`.
 
         A stage's `/results` is private to its own container, so without this the only
         thing that crosses a stage boundary is the final message -- and a stage that
@@ -539,11 +631,12 @@ class WorkflowRunner:
         `{{ steps.X.output }}` is readable as `/inputs/X/`. Read-only, so a later stage
         cannot rewrite the evidence it is reviewing.
         """
+        visible = self._visible_result_names(step)
         mounts = []
         for name, result in self.results.items():
             # Each result carries the directory it actually wrote to, which is what
             # makes a restored result from an earlier run resolve correctly here.
-            if result.results_dir and Path(result.results_dir).is_dir():
+            if name in visible and result.results_dir and Path(result.results_dir).is_dir():
                 mounts.append(
                     Mount(source=result.results_dir, target=f"/inputs/{name}", mode="ro")
                 )
@@ -583,7 +676,7 @@ class WorkflowRunner:
 
     def _submit(self, step: Step, label: str, extra_ctx: dict[str, Any]) -> tuple[list[str], str | None]:
         """Submit a step and return its job ids and optional worktree chain label."""
-        ctx = self._context(extra_ctx)
+        ctx = self._context(step, extra_ctx)
         model = step.model or self.workflow.model
         effort = step.effort or self.workflow.effort
         actor = self.workflow.actors.get(step.actor) if step.actor else None
@@ -606,7 +699,7 @@ class WorkflowRunner:
         base_run = self._worktree_tip_run if chainable else None
 
         records = []
-        inherited_mounts = self._stage_mounts() + self._previous_run_mounts()
+        inherited_mounts = self._stage_mounts(step) + self._previous_run_mounts()
         for index, item in enumerate(items):
             item_ctx = {**ctx, "item": item, "index": index}
             name = label if len(items) == 1 else f"{label}-{index}"
@@ -655,12 +748,11 @@ class WorkflowRunner:
                 self.fleet.drop_worktree(old_tip)
 
     def _outcomes_succeeded(self, names: list[str], outcomes: dict[str, StageOutcome]) -> bool:
-        ids = [job_id for name in names for job_id in outcomes[name].job_ids]
-        return bool(ids) and all(
-            (record := self.fleet.scheduler._jobs.get(job_id)) is not None
-            and record.result is not None
-            and record.result.state is JobState.SUCCEEDED
-            for job_id in ids
+        """Whether the latest result for every stage succeeded, including restored ones."""
+        return bool(names) and all(
+            (result := self.results.get(name)) is not None
+            and result.state is JobState.SUCCEEDED
+            for name in names
         )
 
     def _record(self, step_name: str, job_ids: list[str], report) -> None:
@@ -680,9 +772,10 @@ class WorkflowRunner:
         if step is not None and step.actor is not None:
             actor = self.workflow.actors[step.actor]
             first = self.results.get(step_name)
-            self._actors_started.add(step.actor)
-            if actor.persistent and first is not None and first.session_id:
-                self._actor_sessions[step.actor] = first.session_id
+            if first is not None and first.state is JobState.SUCCEEDED:
+                self._actors_started.add(step.actor)
+                if actor.persistent and first.session_id:
+                    self._actor_sessions[step.actor] = first.session_id
 
     def _step_named(self, name: str) -> Step | None:
         for stage in self.workflow.stages:
@@ -721,7 +814,7 @@ class WorkflowRunner:
             if set(wave) <= completed:
                 continue
             if tuple(wave) in cyclic:
-                outcomes.update(self._run_cycle(wave, by_name))
+                outcomes.update(self._run_cycle(wave, by_name, completed, outcomes))
                 if not self._outcomes_succeeded(wave, outcomes):
                     self._checkpoint(completed, outcomes)
                     break
@@ -768,33 +861,57 @@ class WorkflowRunner:
         return self.outcomes
 
     def _run_cycle(
-        self, group: list[str], by_name: dict[str, Step | Loop]
+        self, group: list[str], by_name: dict[str, Step | Loop],
+        completed: set[str], all_outcomes: dict[str, StageOutcome],
     ) -> dict[str, StageOutcome]:
         """Repeat a cyclic component until a stop condition holds or the limit is hit."""
         limit = self.workflow.repeat_limit(group)
         stops = self.workflow.stop_conditions(group)
-        outcomes = {name: StageOutcome(stage=name, iterations=0) for name in group}
+        outcomes = {
+            name: all_outcomes.get(name, StageOutcome(stage=name, iterations=0))
+            for name in group
+        }
+        key = self._cycle_key(group)
+        progress = self._cycle_progress.get(key, {"iteration": 1, "next": 0})
 
-        for iteration in range(1, limit + 1):
-            for name in group:
+        for iteration in range(progress["iteration"], limit + 1):
+            start = progress["next"] if iteration == progress["iteration"] else 0
+            for index in range(start, len(group)):
+                name = group[index]
                 stage = by_name[name]
                 outcomes[name].iterations = iteration
                 if isinstance(stage, Loop):
                     inner = self._run_loop(stage)
                     outcomes[name].job_ids += inner.job_ids
+                    self._cycle_progress[key] = {"iteration": iteration, "next": index + 1}
+                    self._checkpoint(completed, {**all_outcomes, **outcomes})
                     continue
                 label = f"{name}-{iteration}" if iteration > 1 else name
                 job_ids, chain_label = self._submit(stage, label, {"iteration": iteration})
                 outcomes[name].job_ids += job_ids
                 self._collect(name, job_ids)
                 self._advance_tip(chain_label, name)
+                latest = self.results.get(name)
+                if latest is None or latest.state is not JobState.SUCCEEDED:
+                    self._cycle_progress[key] = {"iteration": iteration, "next": index}
+                    self._checkpoint(completed, {**all_outcomes, **outcomes})
+                    return outcomes
+                self._cycle_progress[key] = {"iteration": iteration, "next": index + 1}
+                self._checkpoint(completed, {**all_outcomes, **outcomes})
 
             met = [n for n, cond in stops if cond.met(self.results, default_step=n)]
             predicate = self.predicates.get(group[0])
             if met or (predicate is not None and predicate(self.results)):
                 for outcome in outcomes.values():
                     outcome.stopped_early = True
+                self._cycle_progress.pop(key, None)
+                self._checkpoint(completed, {**all_outcomes, **outcomes})
                 break
+            if iteration < limit:
+                self._cycle_progress[key] = {"iteration": iteration + 1, "next": 0}
+                self._checkpoint(completed, {**all_outcomes, **outcomes})
+        else:
+            self._cycle_progress.pop(key, None)
 
         return outcomes
 

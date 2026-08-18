@@ -746,6 +746,49 @@ def test_a_cycle_without_a_stop_condition_uses_every_round(tmp_path):
         fleet.close()
 
 
+def test_cycle_stops_on_failure_and_resume_starts_at_that_stage(tmp_path):
+    class FailBOnce(ScriptedExecutor):
+        def __init__(self, fail_b: bool):
+            super().__init__({"c": ["APPROVED"]})
+            self.fail_b = fail_b
+
+        def run(self, spec, **kwargs):
+            result = super().run(spec, **kwargs)
+            if self.fail_b and spec.name == "b":
+                result.state = JobState.FAILED
+                result.exit_code = 1
+            return result
+
+    workflow = {
+        "name": "resumable-cycle", "max_iterations": 3,
+        "graph": {
+            "a": {"task": "a", "needs": ["c"], "gpus": 0},
+            "b": {"task": "b", "needs": ["a"], "gpus": 0},
+            "c": {"task": "c", "needs": ["b"], "gpus": 0,
+                  "until": {"output_contains": "APPROVED"}},
+        },
+    }
+    first_exec = FailBOnce(True)
+    first = _fleet(tmp_path, first_exec)
+    try:
+        with pytest.warns(UserWarning):
+            first.run_workflow(workflow)
+        prior_run = first.run_id
+        assert first_exec.calls == ["a", "b"]
+    finally:
+        first.close()
+
+    resumed_exec = FailBOnce(False)
+    resumed = _fleet(tmp_path, resumed_exec)
+    try:
+        with pytest.warns(UserWarning):
+            report = resumed.run_workflow(workflow, resume_from=prior_run)
+        assert resumed_exec.calls == ["b", "c"]
+        assert all(result.state is JobState.SUCCEEDED for result in report.steps.values())
+    finally:
+        resumed.close()
+
+
 def test_a_self_dependency_repeats_one_node(tmp_path):
     stub = ScriptedExecutor({"tune": ["0.9", "0.4"]})
     fleet = _fleet(tmp_path, stub)
@@ -978,6 +1021,24 @@ def test_a_stage_sees_every_completed_stage_by_name(tmp_path):
         fleet.close()
 
 
+def test_unrelated_graph_branches_cannot_see_each_others_files_or_outputs(tmp_path):
+    stub = ArtifactExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({"graph": {
+            "seed_a": {"task": "a", "gpus": 0},
+            "seed_b": {"task": "b", "gpus": 0},
+            "consumer": {"task": "use a", "needs": ["seed_a"], "gpus": 0},
+        }})
+        seed_b_inputs = {m.target for m in stub.mounts["seed_b"]}
+        consumer_inputs = {m.target for m in stub.mounts["consumer"]}
+        assert "/inputs/seed_a" not in seed_b_inputs
+        assert "/inputs/seed_a" in consumer_inputs
+        assert "/inputs/seed_b" not in consumer_inputs
+    finally:
+        fleet.close()
+
+
 def test_a_long_final_answer_reaches_the_next_stage_whole(tmp_path):
     """The judge's prompt interpolates the researcher's answer. If that answer is
     clipped on the way, findings vanish from the review without anyone noticing."""
@@ -1128,6 +1189,25 @@ def test_cycle_iterations_and_copies_get_their_own_directories(tmp_path):
         ]})
         names = sorted(p.name for p in (_results_root(fleet) / "wf" / "001").iterdir() if p.is_dir())
         assert names == ["cycle-review-1", "cycle-review-2", "probe-0", "probe-1"]
+    finally:
+        fleet.close()
+
+
+def test_a_repeated_stage_sees_the_latest_prior_iterations_files(tmp_path):
+    stub = ArtifactExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({"stages": [
+            {"name": "cycle", "loop": {
+                "max_iterations": 2,
+                "steps": [{"name": "review", "task": "t", "gpus": 0}]},
+            },
+        ]})
+        mounts = {m.target: m for m in stub.mounts["cycle-review-2"]}
+        previous = mounts["/inputs/review"]
+        assert Path(previous.source).name == "cycle-review-1"
+        assert (Path(previous.source) / "findings.md").read_text() == \
+            "written by cycle-review-1"
     finally:
         fleet.close()
 

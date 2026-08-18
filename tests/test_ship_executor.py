@@ -8,14 +8,16 @@ flags we pass *to* the ship, and the limits we layer *onto* what it returns.
 from __future__ import annotations
 
 import os
+import json
 import stat
+import subprocess
 
 import pytest
 
 from research_fleet.executors import Placement
 from research_fleet.executors.ship_exec import ShipExecutor, ShipUnavailable
 from research_fleet.policy import Policy
-from research_fleet.spec import JobSpec, Mount, Resources
+from research_fleet.spec import JobResult, JobSpec, JobState, Mount, Resources
 
 FAKE_SHIP = """#!/usr/bin/env bash
 # Records the flags it was called with, then emits a plausible argv.
@@ -153,6 +155,47 @@ def test_parallel_isolated_jobs_get_distinct_branches(fake_ship):
         flags = log.read_text().splitlines()
         branches.add(flags[flags.index("--worktree") + 1])
     assert len(branches) == 2, "each job needs its own branch to be reviewable"
+
+
+def test_isolated_stage_snapshot_retains_commit_and_patch(tmp_path):
+    workspace = tmp_path / "workspace"
+    results = tmp_path / "results"
+    workspace.mkdir()
+    results.mkdir()
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    (workspace / "paper.txt").write_text("before\n")
+    subprocess.run(["git", "-C", str(workspace), "add", "-A"], check=True)
+    subprocess.run([
+        "git", "-C", str(workspace), "-c", "user.name=test",
+        "-c", "user.email=test@localhost", "commit", "-qm", "base",
+    ], check=True)
+    base = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True,
+    ).strip()
+    (workspace / "paper.txt").write_text("after\n")
+    spec = _spec(
+        id="job_snapshot", run_id="run_snapshot", isolate=True,
+        mounts=[Mount(source=str(results), target="/results", mode="rw")],
+    )
+    result = JobResult(
+        job_id=spec.id, state=JobState.SUCCEEDED,
+        worktree_path=str(workspace), worktree_branch="fleet/stage",
+        worktree_base_commit=base,
+    )
+
+    executor = object.__new__(ShipExecutor)
+    executor._snapshot_worktree(spec, result)
+
+    snapshot = json.loads((results / "snapshot.json").read_text())
+    assert snapshot["base_commit"] == base
+    assert snapshot["commit"] == result.worktree_commit
+    assert snapshot["ref"] == result.worktree_snapshot_ref
+    assert "-before" in (results / "snapshot.patch").read_text()
+    assert "+after" in (results / "snapshot.patch").read_text()
+    assert subprocess.run(
+        ["git", "-C", str(workspace), "show-ref", "--verify", snapshot["ref"]],
+        check=False,
+    ).returncode == 0
 
 
 def test_openai_api_key_satisfies_the_credential_preflight(fake_ship, monkeypatch):

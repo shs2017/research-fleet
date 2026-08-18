@@ -4,8 +4,8 @@
 
 # research-fleet
 
-Run configurable, reproducible agent workflows in containers. Fleet schedules stages and preserves
-agent sessions; research-ship owns the container environment.
+Run configurable, reproducible agent workflows directly or in containers. Fleet schedules stages
+and preserves agent sessions; research-ship owns the optional container environment.
 
 ## Install
 
@@ -32,6 +32,7 @@ Run a YAML workflow:
 ```bash
 fleet workflow discovery.yaml --plan
 fleet workflow discovery.yaml
+fleet workflow discovery.yaml --executor direct
 ```
 
 Inspect it:
@@ -91,9 +92,10 @@ See [docs/workflows.md](docs/workflows.md) for the YAML reference and
 - YAML defines actors, persistence, prompts, dependencies, models, effort, and
   resource requirements in one place.
 - The scheduler runs ready stages, enforces budgets and resource limits, and
-  checkpoints workflow progress.
-- Research Ship provides the reproducible container environment, credentials,
-  project workspace, and networking behavior.
+  checkpoints workflow progress after every stage. A resumed cycle starts at
+  its first unfinished stage.
+- Stages run directly on the host with `--executor direct`, or in Research Ship's
+  reproducible container environment with the default `ship` executor.
 - An append-only ledger records events, costs, results, and provider session IDs.
 - `fleet log` presents agent messages, tool activity, lifecycle events, and
   usage as a readable job history.

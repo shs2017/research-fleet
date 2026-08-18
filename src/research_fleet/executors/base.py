@@ -39,11 +39,12 @@ def run_process(
     on_start: Callable[[subprocess.Popen], None],
     on_timeout: Callable[[], None],
     stderr_tail_size: int = 0,
+    cwd: str | None = None,
 ) -> ProcessOutcome:
     """Run and stream a subprocess with the lifecycle shared by local executors."""
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1, env=env,
+        text=True, bufsize=1, env=env, cwd=cwd,
     )
     on_start(proc)
     stderr_tail: collections.deque[str] = collections.deque(maxlen=stderr_tail_size)

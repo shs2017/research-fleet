@@ -7,6 +7,7 @@ internal job-spec API.
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -77,7 +78,7 @@ def _choices(*values: str):
 
 _BACKENDS = _choices("claude-cli", "codex-cli")
 _EFFORTS = _choices("low", "medium", "high", "xhigh", "max")
-_EXECUTORS = _choices("ship", "dry-run")
+_EXECUTORS = _choices("ship", "direct", "dry-run")
 
 
 def _fleet(config: Optional[str], **overrides) -> Fleet:
@@ -226,7 +227,7 @@ def run(
     timeout: int = typer.Option(3600, "--timeout", help="Per-agent wall clock, seconds."),
     max_usd: Optional[float] = typer.Option(None, "--max-usd", help="Budget ceiling for the whole run."),
     executor: Optional[str] = typer.Option(
-        None, "--executor", help="ship | dry-run", autocompletion=_EXECUTORS
+        None, "--executor", help="ship | direct | dry-run", autocompletion=_EXECUTORS
     ),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
@@ -285,7 +286,7 @@ def workflow(
     workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
     max_usd: Optional[float] = typer.Option(None, "--max-usd"),
     executor: Optional[str] = typer.Option(
-        None, "--executor", help="ship | dry-run", autocompletion=_EXECUTORS
+        None, "--executor", help="ship | direct | dry-run", autocompletion=_EXECUTORS
     ),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
@@ -517,6 +518,69 @@ def _follow_run_log(
         if terminal_polls >= 2:
             return
         time.sleep(poll_interval)
+
+
+def _render_log_event(ev, *, raw: bool = False, show_job: bool = False) -> None:
+    """Render one ledger event for both run- and job-level logs."""
+    if raw:
+        print(ev.to_json())
+        return
+    ts = time.strftime("%H:%M:%S", time.localtime(ev.ts))
+    job = f" [dim]{(ev.job_id or '')[-6:]}[/dim]" if show_job and ev.job_id else ""
+    if ev.type == "job.submitted":
+        spec = ev.payload.get("spec", {})
+        agent = spec.get("agent") or {}
+        if agent:
+            session = agent.get("session_id")
+            detail = "continued session" if session else "new session"
+            title = f"[dim]{ts}[/dim]{job} prompt · {spec.get('name', 'agent')} · {detail}"
+            parts = []
+            if agent.get("system_prompt"):
+                parts.append("[bold]System[/bold]\n" + agent["system_prompt"])
+            parts.append("[bold]Task[/bold]\n" + agent.get("task", ""))
+            console.print(Panel(
+                "\n\n".join(parts), title=title, title_align="left",
+                border_style="green", padding=(0, 1),
+            ))
+        else:
+            console.print(
+                f"[dim]{ts}[/dim]{job} [green]command[/green] "
+                f"[bold]{spec.get('name', '')}[/bold] "
+                f"{shlex.join(spec.get('command') or [])}"
+            )
+    elif ev.type == "job.output":
+        stream = ev.payload.get("stream", "stdout")
+        style = "red" if stream == "stderr" else "white"
+        console.print(f"[dim]{ts}[/dim]{job} [{style}]{ev.payload.get('line', '')}[/{style}]")
+    elif ev.type == "agent.message":
+        console.print(Panel(
+            ev.payload.get("text", ""), title=f"[dim]{ts}[/dim]{job} agent",
+            title_align="left", border_style="blue", padding=(0, 1),
+        ))
+    elif ev.type == "agent.tool_use":
+        console.print(
+            f"[dim]{ts}[/dim]{job} [cyan]◆ tool[/cyan] [bold]{ev.payload.get('tool')}[/bold]"
+        )
+        console.print(JSON.from_data(ev.payload.get("payload", {})), style="dim", soft_wrap=True)
+    elif ev.type == "agent.tool_result":
+        console.print(f"[dim]{ts}[/dim]{job} [magenta]◇ result[/magenta]")
+        console.print(JSON.from_data(ev.payload.get("payload", {})), style="dim", soft_wrap=True)
+    elif ev.type == "budget.committed":
+        usage = ev.payload.get("usage", {})
+        console.print(
+            f"[dim]{ts}[/dim]{job} [yellow]budget[/yellow] "
+            f"${ev.payload.get('cost_usd', 0):.4f} "
+            f"({usage.get('total_tokens', 0):,} tokens)"
+        )
+    else:
+        state_style = {
+            "job.succeeded": "green", "job.failed": "red",
+            "job.denied": "red", "job.running": "cyan",
+        }.get(ev.type, "dim")
+        console.print(
+            f"[dim]{ts}[/dim]{job} [{state_style}]● {ev.type}[/{state_style}] "
+            f"[dim]{str(ev.payload)[:300]}[/dim]"
+        )
 
 
 @app.command()
@@ -751,17 +815,31 @@ def log(
     cfg = load_config(config)
     if target.startswith("run_"):
         log_path = cfg.root_path / "logs" / f"{target}.log"
-        if not log_path.exists():
-            console.print(f"[red]no detached log for {target}[/red] at {log_path}")
-            raise typer.Exit(1)
-        if follow:
+        wanted = types.split(",") if types else None
+        terminal_states = {"succeeded", "failed", "denied", "cancelled"}
+        seen: set[int] = set()
+        while True:
+            with Ledger(cfg.root_path) as ledger:
+                events = ledger.events(run_id=target, types=wanted, limit=limit)
+                rows = ledger.jobs(run_id=target)
+            if not events and not rows:
+                console.print(f"[yellow]No events found for {target}[/yellow]")
+                raise typer.Exit(1)
+            if not raw and not seen:
+                console.print(Panel.fit(
+                    f"[bold]{target}[/bold]\n[dim]{len(rows)} job(s)[/dim]",
+                    title="Fleet log", border_style="cyan",
+                ))
+            for ev in events:
+                if ev.seq not in seen:
+                    _render_log_event(ev, raw=raw, show_job=True)
+                    seen.add(ev.seq)
+            if not follow or (rows and all(row["state"] in terminal_states for row in rows)):
+                return
             try:
-                _follow_run_log(log_path, cfg.root_path, target, pid_path=log_path.with_suffix(".pid"))
+                time.sleep(0.2)
             except KeyboardInterrupt:
-                pass
-        else:
-            console.print(log_path.read_text(encoding="utf-8", errors="replace"), end="")
-        return
+                return
 
     job_id = target
     wanted = types.split(",") if types else None
@@ -778,49 +856,12 @@ def log(
             f"[bold]{job_id}[/bold]\n[dim]{subtitle or 'event history'}[/dim]",
             title="Fleet log", border_style="cyan",
         ))
-    def render_event(ev) -> None:
-            if raw:
-                print(ev.to_json())
-                return
-            ts = time.strftime("%H:%M:%S", time.localtime(ev.ts))
-            if ev.type == "job.output":
-                stream = ev.payload.get("stream", "stdout")
-                style = "red" if stream == "stderr" else "white"
-                console.print(f"[dim]{ts}[/dim] [{style}]{ev.payload.get('line', '')}[/{style}]")
-            elif ev.type == "agent.message":
-                console.print(Panel(
-                    ev.payload.get("text", ""), title=f"[dim]{ts}[/dim] agent",
-                    title_align="left", border_style="blue", padding=(0, 1),
-                ))
-            elif ev.type == "agent.tool_use":
-                console.print(f"[dim]{ts}[/dim] [cyan]◆ tool[/cyan] [bold]{ev.payload.get('tool')}[/bold]")
-                console.print(JSON.from_data(ev.payload.get("payload", {})), style="dim", soft_wrap=True)
-            elif ev.type == "agent.tool_result":
-                console.print(f"[dim]{ts}[/dim] [magenta]◇ result[/magenta]")
-                console.print(JSON.from_data(ev.payload.get("payload", {})), style="dim", soft_wrap=True)
-            elif ev.type == "budget.committed":
-                usage = ev.payload.get("usage", {})
-                console.print(
-                    f"[dim]{ts}[/dim] [yellow]budget[/yellow] "
-                    f"${ev.payload.get('cost_usd', 0):.4f} "
-                    f"({usage.get('total_tokens', 0):,} tokens)"
-                )
-            else:
-                state_style = {
-                    "job.succeeded": "green", "job.failed": "red",
-                    "job.denied": "red", "job.running": "cyan",
-                }.get(ev.type, "dim")
-                console.print(
-                    f"[dim]{ts}[/dim] [{state_style}]● {ev.type}[/{state_style}] "
-                    f"[dim]{str(ev.payload)[:300]}[/dim]"
-                )
-
     seen: set[int] = set()
     try:
         while True:
             for ev in events:
                 if ev.seq not in seen:
-                    render_event(ev)
+                    _render_log_event(ev, raw=raw)
                     seen.add(ev.seq)
             if not follow:
                 return
@@ -830,7 +871,7 @@ def log(
             if rows.get(job_id, {}).get("state") in {"succeeded", "failed", "denied", "cancelled"}:
                 for ev in events:
                     if ev.seq not in seen:
-                        render_event(ev)
+                        _render_log_event(ev, raw=raw)
                 return
             time.sleep(0.2)
     except KeyboardInterrupt:

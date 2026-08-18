@@ -5,6 +5,7 @@ keeps plans and tests independent of Docker and GPUs.
 """
 
 from .base import Executor, LineHandler, Placement  # noqa: F401
+from .direct_exec import DirectExecutor  # noqa: F401
 from .ship_exec import DryRunExecutor, ShipExecutor, ShipUnavailable  # noqa: F401
 
 
@@ -19,11 +20,13 @@ def build_executor(cfg) -> Executor:
             project_dir=cfg.executor.project_dir or cfg.workspace,
             docker_binary=cfg.executor.docker_binary,
         )
+    if kind == "direct":
+        return DirectExecutor(project_dir=cfg.executor.project_dir or cfg.workspace)
     raise ValueError(f"unknown executor kind {kind!r}")
 
 
 __all__ = [
     "Executor", "LineHandler", "Placement",
-    "ShipExecutor", "ShipUnavailable", "DryRunExecutor",
+    "ShipExecutor", "ShipUnavailable", "DirectExecutor", "DryRunExecutor",
     "build_executor",
 ]

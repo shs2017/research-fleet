@@ -454,14 +454,17 @@ class Scheduler:
         """
         with self._lock:
             if self._isolation is None:
+                isolation_workspace = Path(
+                    self.config.executor.project_dir or self.config.workspace
+                )
                 usable, detail = isolation.ensure_repo(
-                    Path(self.config.workspace), self.config.root_path
+                    isolation_workspace, self.config.root_path
                 )
                 self._isolation = usable
                 self.ledger.append(
                     "run.isolation",
                     {"enabled": usable, "detail": detail,
-                     "workspace": str(Path(self.config.workspace).expanduser().resolve())},
+                     "workspace": str(isolation_workspace.expanduser().resolve())},
                     run_id=self.run_id,
                 )
                 if not usable:

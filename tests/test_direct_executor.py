@@ -1,0 +1,72 @@
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+from research_fleet import Fleet
+
+
+def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+
+
+def test_direct_workflow_translates_dependency_and_result_paths(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    state = tmp_path / "state"
+    fleet = Fleet(
+        root=str(state), workspace=str(project),
+        executor={"kind": "direct", "project_dir": str(project)},
+    )
+    try:
+        report = fleet.run_workflow({"name": "direct-paths", "gpus": 0, "stages": [
+            {"name": "first", "kind": "command", "gpus": 0, "command": [
+                "python3", "-c",
+                "from pathlib import Path; Path('/results/value.txt').write_text('one')",
+            ]},
+            {"name": "second", "kind": "command", "needs": ["first"], "gpus": 0,
+             "command": ["python3", "-c",
+                "from pathlib import Path; value=Path('/inputs/first/value.txt').read_text(); "
+                "Path('/results/value.txt').write_text(value + '-two')"]},
+        ]})
+        assert all(result.state.value == "succeeded" for result in report.run.results.values())
+        assert (state / "results/direct-paths/001/second/value.txt").read_text() == "one-two"
+    finally:
+        fleet.close()
+
+
+def test_direct_isolated_stages_chain_and_keep_snapshots(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _git("init", "-q", cwd=project)
+    (project / "base.txt").write_text("base")
+    _git("add", "-A", cwd=project)
+    _git("-c", "user.name=test", "-c", "user.email=test@localhost",
+         "commit", "-qm", "base", cwd=project)
+    state = tmp_path / "state"
+    fleet = Fleet(
+        root=str(state), workspace=str(project),
+        executor={"kind": "direct", "project_dir": str(project)},
+        isolate_agents=True,
+    )
+    try:
+        report = fleet.run_workflow({"name": "direct-isolated", "gpus": 0, "stages": [
+            {"name": "first", "kind": "command", "gpus": 0,
+             "command": ["python3", "-c",
+                         "from pathlib import Path; Path('/workspace/carried.txt').write_text('one')"]},
+            {"name": "second", "kind": "command", "needs": ["first"], "gpus": 0,
+             "command": ["python3", "-c",
+                         "from pathlib import Path; p=Path('/workspace/carried.txt'); "
+                         "assert p.read_text() == 'one'; p.write_text('two')"]},
+        ]})
+        second = report.steps["second"]
+        assert second.state.value == "succeeded"
+        snapshot = json.loads(
+            (state / "results/direct-isolated/001/second/snapshot.json").read_text()
+        )
+        assert snapshot["base_commit"] != snapshot["commit"]
+        shown = _git("show", f"{snapshot['ref']}:carried.txt", cwd=project)
+        assert shown.returncode == 0 and shown.stdout == "two"
+    finally:
+        fleet.close()

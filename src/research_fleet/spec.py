@@ -167,6 +167,15 @@ class JobResult(BaseModel):
     worktree_branch: str | None = Field(
         None, description="The branch that path is checked out on."
     )
+    worktree_base_commit: str | None = Field(
+        None, description="Git commit checked out when this isolated stage started."
+    )
+    worktree_commit: str | None = Field(
+        None, description="Durable Git snapshot commit recorded when the stage finished."
+    )
+    worktree_snapshot_ref: str | None = Field(
+        None, description="Immutable Git ref retaining the stage snapshot after its worktree is removed."
+    )
     usage: dict[str, Any] = Field(default_factory=dict, description="Token/cost accounting for agent jobs.")
     output: str = Field(
         "", description="The job's answer: an agent's final message, or a command's last output."

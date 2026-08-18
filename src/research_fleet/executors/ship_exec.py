@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -296,6 +297,9 @@ class ShipExecutor:
             match = _WORKTREE_RE.search(ship_stderr)
             if match:
                 result.worktree_path, result.worktree_branch = match.group(1), match.group(2)
+                result.worktree_base_commit = self._git(
+                    result.worktree_path, "rev-parse", "HEAD"
+                )
 
         child_env = dict(os.environ)
         for key, value in env.items():
@@ -330,7 +334,62 @@ class ShipExecutor:
         else:
             result.state = JobState.FAILED
             result.error = _explain(outcome.exit_code, outcome.stderr_tail)
+        if spec.isolate and result.worktree_path:
+            self._snapshot_worktree(spec, result)
         return result
+
+    @staticmethod
+    def _git(path: str, *args: str) -> str | None:
+        proc = subprocess.run(
+            ["git", "-C", path, *args], capture_output=True, text=True, check=False,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
+    @staticmethod
+    def _results_source(spec: JobSpec) -> Path | None:
+        return next(
+            (Path(m.source) for m in spec.mounts if m.target == "/results"), None
+        )
+
+    def _snapshot_worktree(self, spec: JobSpec, result: JobResult) -> None:
+        """Commit and retain one isolated stage, with an inspectable patch in results."""
+        path = result.worktree_path
+        results = self._results_source(spec)
+        if not path or results is None:
+            return
+        status = self._git(path, "status", "--porcelain") or ""
+        if status:
+            self._git(path, "add", "-A")
+            self._git(
+                path, "-c", "user.name=fleet", "-c", "user.email=fleet@localhost",
+                "commit", "-m", f"fleet: snapshot {spec.run_id}/{spec.name}",
+            )
+        commit = self._git(path, "rev-parse", "HEAD")
+        if not commit:
+            return
+        result.worktree_commit = commit
+        safe_job = re.sub(r"[^A-Za-z0-9._-]+", "-", spec.id)
+        ref = f"refs/fleet-snapshots/{spec.run_id}/{safe_job}"
+        if self._git(path, "update-ref", ref, commit) is not None:
+            result.worktree_snapshot_ref = ref
+        base = result.worktree_base_commit
+        patch = self._git(path, "diff", "--binary", f"{base}..{commit}") if base else ""
+        metadata = {
+            "run_id": spec.run_id,
+            "job_id": spec.id,
+            "stage": spec.name,
+            "branch": result.worktree_branch,
+            "base_commit": base,
+            "commit": commit,
+            "ref": result.worktree_snapshot_ref,
+            "changed": base != commit,
+            "status_before_snapshot": status.splitlines(),
+        }
+        try:
+            (results / "snapshot.patch").write_text((patch or "") + ("\n" if patch else ""))
+            (results / "snapshot.json").write_text(json.dumps(metadata, indent=2) + "\n")
+        except OSError:
+            pass
 
     CANCEL_GRACE_S = 5
 

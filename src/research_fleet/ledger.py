@@ -352,7 +352,7 @@ class Ledger:
     def runs(self) -> list[dict[str, Any]]:
         rows = self._db.execute(
             "SELECT run_id, COUNT(*), MIN(created_at), MAX(updated_at),"
-            " SUM(state='succeeded'), SUM(state='failed')"
+            " SUM(state='succeeded'), SUM(state IN ('failed','denied','cancelled'))"
             " FROM jobs WHERE run_id IS NOT NULL GROUP BY run_id ORDER BY MIN(created_at) DESC"
         ).fetchall()
         return [

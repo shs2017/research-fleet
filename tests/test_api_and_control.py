@@ -184,6 +184,31 @@ def test_watch_exits_when_detached_scheduler_dies_before_creating_jobs(tmp_path,
     assert capsys.readouterr().out == "startup traceback\n"
 
 
+def test_log_reads_a_foreground_run_from_the_ledger(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from research_fleet import cli
+
+    root = tmp_path / "state"
+    config = tmp_path / "fleet.yaml"
+    config.write_text(f"root: {root}\n")
+    monkeypatch.setenv("FLEET_CONFIG", str(config))
+    with Ledger(root) as ledger:
+        spec = JobSpec(id="job_foreground", run_id="run_foreground", command=["true"])
+        ledger.upsert_job(spec, "succeeded")
+        ledger.append(
+            "agent.message", {"text": "foreground result"},
+            run_id=spec.run_id, job_id=spec.id,
+        )
+
+    result = CliRunner().invoke(cli.app, ["log", "run_foreground"])
+
+    assert result.exit_code == 0, result.output
+    assert "run_foreground" in result.output
+    assert "foreground result" in result.output
+    assert "no detached log" not in result.output
+
+
 def test_completion_lists_commands_options_runs_and_jobs(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
@@ -384,6 +409,18 @@ def test_runs_and_jobs_projections_are_queryable(tmp_path):
         assert runs[run_id]["jobs"] == 2 and runs[run_id]["succeeded"] == 2
         assert len(ledger.jobs(run_id)) == 2
         assert ledger.jobs("no_such_run") == []
+    finally:
+        ledger.close()
+
+
+def test_runs_counts_denied_and_cancelled_jobs_as_unsuccessful(tmp_path):
+    ledger = Ledger(tmp_path / "state")
+    try:
+        for suffix, state in (("denied", "denied"), ("cancelled", "cancelled")):
+            spec = JobSpec(id=f"job_{suffix}", run_id="run_unfinished", command=["true"])
+            ledger.upsert_job(spec, state)
+        run = ledger.runs()[0]
+        assert run["failed"] == 2
     finally:
         ledger.close()
 
