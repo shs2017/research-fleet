@@ -84,6 +84,28 @@ class DirectExecutor:
         pattern = re.compile("|".join(re.escape(target) for target in sources))
         return pattern.sub(lambda match: sources[match.group(0)], value)
 
+    @staticmethod
+    def _sandbox_codex(command: list[str], spec: JobSpec) -> list[str]:
+        """Replace Codex's container-only bypass with a host filesystem sandbox.
+
+        The working directory is writable under ``workspace-write``. Fleet mounts
+        marked rw (normally just /results) must also be declared explicitly. Read-only
+        inputs need no exception and therefore remain protected from agent writes.
+        """
+        bypass = "--dangerously-bypass-approvals-and-sandbox"
+        if bypass not in command:
+            return command
+        writable = [
+            str(Path(mount.source).expanduser().resolve())
+            for mount in spec.mounts
+            if mount.mode == "rw"
+        ]
+        replacement = ["--sandbox", "workspace-write"]
+        for path in dict.fromkeys(writable):
+            replacement += ["--add-dir", path]
+        index = command.index(bypass)
+        return command[:index] + replacement + command[index + 1:]
+
     def _snapshot(self, spec: JobSpec, result: JobResult) -> None:
         path = result.worktree_path
         results = next((Path(m.source) for m in spec.mounts if m.target == "/results"), None)
@@ -127,6 +149,7 @@ class DirectExecutor:
                 result.worktree_path, result.worktree_branch, result.worktree_base_commit = worktree
             mapping = self._mapping(spec, workspace)
             command = [self._translate(part, mapping) for part in argv]
+            command = self._sandbox_codex(command, spec)
             direct_env = {key: self._translate(value, mapping) for key, value in env.items()}
             direct_env = {**os.environ, **direct_env}
             if placement.gpu_ids:

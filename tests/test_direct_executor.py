@@ -5,10 +5,34 @@ import subprocess
 from pathlib import Path
 
 from research_fleet import Fleet
+from research_fleet.executors.direct_exec import DirectExecutor
+from research_fleet.spec import JobSpec, Mount
 
 
 def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+
+
+def test_direct_codex_uses_workspace_sandbox_and_only_rw_mounts(tmp_path):
+    results = tmp_path / "results"
+    inputs = tmp_path / "inputs"
+    spec = JobSpec(command=["true"], mounts=[
+        Mount(source=str(results), target="/results", mode="rw"),
+        Mount(source=str(inputs), target="/inputs/first", mode="ro"),
+    ])
+    command = DirectExecutor._sandbox_codex([
+        "codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "task",
+    ], spec)
+
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+    assert command[2:4] == ["--sandbox", "workspace-write"]
+    assert command[4:6] == ["--add-dir", str(results.resolve())]
+    assert str(inputs.resolve()) not in command
+
+
+def test_direct_non_codex_commands_are_unchanged():
+    command = ["python3", "analysis.py"]
+    assert DirectExecutor._sandbox_codex(command, JobSpec(command=["true"])) == command
 
 
 def test_direct_workflow_translates_dependency_and_result_paths(tmp_path):
