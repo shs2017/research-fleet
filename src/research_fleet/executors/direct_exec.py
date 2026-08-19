@@ -106,11 +106,17 @@ class DirectExecutor:
         # research hosts. Landlock enforces this simple workspace-write policy in the
         # kernel without that requirement; forcing it avoids a run that starts normally
         # but fails on every agent shell command with `bwrap: ... Permission denied`.
+        roots = list(dict.fromkeys(writable))
+        # Use config overrides instead of `--sandbox`/`--add-dir`: unlike those
+        # top-level exec flags, `-c` is also accepted by `codex exec resume`, which is
+        # how persistent Fleet actors run every stage after their first one.
         replacement = [
-            "--sandbox", "workspace-write", "--enable", "use_legacy_landlock",
+            "-c", 'sandbox_mode="workspace-write"',
+            "-c", f"sandbox_workspace_write.writable_roots={json.dumps(roots)}",
+            "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+            "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+            "--enable", "use_legacy_landlock",
         ]
-        for path in dict.fromkeys(writable):
-            replacement += ["--add-dir", path]
         index = command.index(bypass)
         return command[:index] + replacement + command[index + 1:]
 

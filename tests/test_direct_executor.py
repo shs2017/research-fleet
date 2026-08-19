@@ -26,11 +26,29 @@ def test_direct_codex_uses_workspace_sandbox_and_only_rw_mounts(tmp_path):
     ], spec, str(workspace))
 
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
-    assert command[2:4] == ["--sandbox", "workspace-write"]
-    assert command[4:6] == ["--enable", "use_legacy_landlock"]
-    assert command[6:8] == ["--add-dir", str(workspace.resolve())]
-    assert command[8:10] == ["--add-dir", str(results.resolve())]
+    assert "--sandbox" not in command and "--add-dir" not in command
+    assert 'sandbox_mode="workspace-write"' in command
+    roots = next(value for value in command if value.startswith(
+        "sandbox_workspace_write.writable_roots="
+    ))
+    assert str(workspace.resolve()) in roots
+    assert str(results.resolve()) in roots
+    assert "sandbox_workspace_write.exclude_slash_tmp=true" in command
+    assert "sandbox_workspace_write.exclude_tmpdir_env_var=true" in command
+    assert command[command.index("--enable") + 1] == "use_legacy_landlock"
     assert str(inputs.resolve()) not in command
+
+
+def test_direct_sandbox_flags_are_valid_for_persistent_codex_resume(tmp_path):
+    workspace = tmp_path / "worktree"
+    command = DirectExecutor._sandbox_codex([
+        "codex", "exec", "resume", "--json",
+        "--dangerously-bypass-approvals-and-sandbox", "session-id", "task",
+    ], JobSpec(command=["true"]), str(workspace))
+
+    assert command[:3] == ["codex", "exec", "resume"]
+    assert "--sandbox" not in command and "--add-dir" not in command
+    assert 'sandbox_mode="workspace-write"' in command
 
 
 def test_direct_non_codex_commands_are_unchanged():
