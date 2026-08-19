@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from .budget import ModelCost, register_model_cost
 from .policy import Policy
+from .spec import Mount
 
 USER_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "research-fleet" / "config.yaml"
 PROJECT_CONFIG = Path("fleet.yaml")
@@ -52,6 +53,10 @@ class ExecutorConfig(BaseModel):
         description="Project whose .ship.conf and image to use. Defaults to `workspace`.",
     )
     docker_binary: str = "docker"
+    mounts: list[Mount] = Field(
+        default_factory=list,
+        description="Files or directories exposed to every job at a stable path.",
+    )
 
 
 class AgentBackendConfig(BaseModel):

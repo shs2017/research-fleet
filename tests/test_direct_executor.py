@@ -35,6 +35,35 @@ def test_direct_non_codex_commands_are_unchanged():
     assert DirectExecutor._sandbox_codex(command, JobSpec(command=["true"])) == command
 
 
+def test_direct_executor_mounts_are_translated_and_read_only_to_codex(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    data = tmp_path / "external-data"
+    data.mkdir()
+    (data / "value.txt").write_text("visible")
+    state = tmp_path / "state"
+    fleet = Fleet(
+        root=str(state), workspace=str(project),
+        executor={
+            "kind": "direct", "project_dir": str(project),
+            "mounts": [{"source": str(data), "target": "/workspace/data", "mode": "ro"}],
+        },
+        policy={"allowed_mount_roots": [str(project), str(state), str(data)]},
+    )
+    try:
+        report = fleet.run_workflow({"name": "static-mount", "gpus": 0, "stages": [{
+            "name": "read", "kind": "command", "gpus": 0,
+            "command": ["python3", "-c",
+                        "from pathlib import Path; "
+                        "Path('/results/value.txt').write_text("
+                        "Path('/workspace/data/value.txt').read_text())"],
+        }]})
+        assert report.steps["read"].state.value == "succeeded"
+        assert (state / "results/static-mount/001/read/value.txt").read_text() == "visible"
+    finally:
+        fleet.close()
+
+
 def test_direct_workflow_translates_dependency_and_result_paths(tmp_path):
     project = tmp_path / "project"
     project.mkdir()

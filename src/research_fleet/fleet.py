@@ -177,6 +177,9 @@ class Fleet:
         return self.scheduler.run_id
 
     def submit(self, spec: JobSpec) -> JobRecord:
+        # Executor mounts are the stable project inputs shared by every stage. Stage
+        # mounts follow them so a more specific dependency path can override one.
+        spec.mounts = [*self.config.executor.mounts, *spec.mounts]
         return self.scheduler.submit(spec)
 
     def drop_worktree(self, branch: str) -> None:
