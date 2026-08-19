@@ -14,6 +14,7 @@ def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
 
 
 def test_direct_codex_uses_workspace_sandbox_and_only_rw_mounts(tmp_path):
+    workspace = tmp_path / "worktree"
     results = tmp_path / "results"
     inputs = tmp_path / "inputs"
     spec = JobSpec(command=["true"], mounts=[
@@ -22,12 +23,13 @@ def test_direct_codex_uses_workspace_sandbox_and_only_rw_mounts(tmp_path):
     ])
     command = DirectExecutor._sandbox_codex([
         "codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "task",
-    ], spec)
+    ], spec, str(workspace))
 
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
     assert command[2:4] == ["--sandbox", "workspace-write"]
     assert command[4:6] == ["--enable", "use_legacy_landlock"]
-    assert command[6:8] == ["--add-dir", str(results.resolve())]
+    assert command[6:8] == ["--add-dir", str(workspace.resolve())]
+    assert command[8:10] == ["--add-dir", str(results.resolve())]
     assert str(inputs.resolve()) not in command
 
 

@@ -85,7 +85,9 @@ class DirectExecutor:
         return pattern.sub(lambda match: sources[match.group(0)], value)
 
     @staticmethod
-    def _sandbox_codex(command: list[str], spec: JobSpec) -> list[str]:
+    def _sandbox_codex(
+        command: list[str], spec: JobSpec, workspace: str | None = None
+    ) -> list[str]:
         """Replace Codex's container-only bypass with a host filesystem sandbox.
 
         The working directory is writable under ``workspace-write``. Fleet mounts
@@ -95,7 +97,7 @@ class DirectExecutor:
         bypass = "--dangerously-bypass-approvals-and-sandbox"
         if bypass not in command:
             return command
-        writable = [
+        writable = ([str(Path(workspace).resolve())] if workspace else []) + [
             str(Path(mount.source).expanduser().resolve())
             for mount in spec.mounts
             if mount.mode == "rw"
@@ -155,7 +157,7 @@ class DirectExecutor:
                 result.worktree_path, result.worktree_branch, result.worktree_base_commit = worktree
             mapping = self._mapping(spec, workspace)
             command = [self._translate(part, mapping) for part in argv]
-            command = self._sandbox_codex(command, spec)
+            command = self._sandbox_codex(command, spec, workspace)
             direct_env = {key: self._translate(value, mapping) for key, value in env.items()}
             direct_env = {**os.environ, **direct_env}
             if placement.gpu_ids:
