@@ -49,6 +49,14 @@ def test_codex_builds_a_command_with_the_brief_prepended(codex):
     assert "PROJECT RULES" in argv[-1]
 
 
+def test_codex_keeps_high_distinct_from_max(codex):
+    high = codex.build_command(AgentConfig(task="t", effort="high"))
+    maximum = codex.build_command(AgentConfig(task="t", effort="max"))
+
+    assert high[high.index("-c") + 1] == 'model_reasoning_effort="high"'
+    assert maximum[maximum.index("-c") + 1] == 'model_reasoning_effort="max"'
+
+
 def test_codex_resumes_an_explicit_session(codex):
     argv = codex.build_command(AgentConfig(task="next", session_id="thread-123"))
     assert argv[:3] == ["codex", "exec", "resume"]
