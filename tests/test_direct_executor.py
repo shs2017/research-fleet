@@ -26,7 +26,8 @@ def test_direct_codex_uses_workspace_sandbox_and_only_rw_mounts(tmp_path):
 
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
     assert command[2:4] == ["--sandbox", "workspace-write"]
-    assert command[4:6] == ["--add-dir", str(results.resolve())]
+    assert command[4:6] == ["--enable", "use_legacy_landlock"]
+    assert command[6:8] == ["--add-dir", str(results.resolve())]
     assert str(inputs.resolve()) not in command
 
 

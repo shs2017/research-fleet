@@ -100,7 +100,13 @@ class DirectExecutor:
             for mount in spec.mounts
             if mount.mode == "rw"
         ]
-        replacement = ["--sandbox", "workspace-write"]
+        # Bubblewrap needs mount namespaces that are commonly disabled on managed
+        # research hosts. Landlock enforces this simple workspace-write policy in the
+        # kernel without that requirement; forcing it avoids a run that starts normally
+        # but fails on every agent shell command with `bwrap: ... Permission denied`.
+        replacement = [
+            "--sandbox", "workspace-write", "--enable", "use_legacy_landlock",
+        ]
         for path in dict.fromkeys(writable):
             replacement += ["--add-dir", path]
         index = command.index(bypass)
