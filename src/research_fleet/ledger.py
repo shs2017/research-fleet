@@ -350,16 +350,32 @@ class Ledger:
         return [dict(zip(cols, row)) for row in self._db.execute(q, args).fetchall()]
 
     def runs(self) -> list[dict[str, Any]]:
+        # A run is real as soon as its run.started event is written.  Do not
+        # wait for the first job row: startup failures and queued runs should
+        # still be visible, with the event timestamp as their start time.
         rows = self._db.execute(
             "SELECT run_id, COUNT(*), MIN(created_at), MAX(updated_at),"
             " SUM(state='succeeded'), SUM(state IN ('failed','denied','cancelled'))"
-            " FROM jobs WHERE run_id IS NOT NULL GROUP BY run_id ORDER BY MIN(created_at) DESC"
+            " FROM jobs WHERE run_id IS NOT NULL GROUP BY run_id"
         ).fetchall()
-        return [
-            {"run_id": r[0], "jobs": r[1], "started_at": r[2], "updated_at": r[3],
-             "succeeded": r[4] or 0, "failed": r[5] or 0}
+        summary = {
+            r[0]: {"run_id": r[0], "jobs": r[1], "started_at": r[2],
+                   "updated_at": r[3], "succeeded": r[4] or 0,
+                   "failed": r[5] or 0}
             for r in rows
-        ]
+        }
+        starts = self._db.execute(
+            "SELECT run_id, MIN(ts) FROM events "
+            "WHERE run_id IS NOT NULL AND type = 'run.started' GROUP BY run_id"
+        ).fetchall()
+        for run_id, started_at in starts:
+            item = summary.setdefault(
+                run_id, {"run_id": run_id, "jobs": 0, "started_at": None,
+                         "updated_at": None, "succeeded": 0, "failed": 0}
+            )
+            item["started_at"] = started_at
+            item["updated_at"] = item["updated_at"] or started_at
+        return sorted(summary.values(), key=lambda r: r["started_at"] or 0, reverse=True)
 
     def observed_cost(self, model: str | None = None, kind: str = "agent") -> dict[str, Any]:
         """What work like this has actually cost, for estimating the next one.

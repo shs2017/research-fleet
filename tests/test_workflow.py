@@ -95,6 +95,21 @@ def _fleet(tmp_path, executor, **overrides):
     return fleet
 
 
+def test_workflow_max_duration_cancels_active_work(tmp_path):
+    """The workflow deadline stops active work, not just individual stage timeouts."""
+    executor = ScriptedExecutor(delay=2.0)
+    fleet = _fleet(tmp_path, executor)
+    report = fleet.run_workflow({
+        "name": "deadline",
+        "max_duration_s": 1,
+        "gpus": 0,
+        "stages": [{"name": "slow", "task": "sleep", "gpus": 0}],
+    })
+    events = fleet.ledger.events(run_id=report.run.run_id, types=["run.cancelled"])
+    assert events and "workflow exceeded 1s deadline" in events[-1].payload["reason"]
+    assert any(result.state is JobState.CANCELLED for result in report.run.results.values())
+
+
 # ---------------------------------------------------------------- templating
 
 

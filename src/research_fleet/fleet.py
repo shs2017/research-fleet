@@ -13,6 +13,7 @@ The CLI is a thin wrapper around this class.
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Sequence
@@ -349,7 +350,20 @@ class Fleet:
             prior_run=resume_from or base_run,
             resume=resume_from is not None,
         )
-        outcomes = runner.run()
+        deadline_timer = None
+        if workflow.max_duration_s:
+            deadline_timer = threading.Timer(
+                workflow.max_duration_s,
+                self.cancel,
+                kwargs={"reason": f"workflow exceeded {workflow.max_duration_s}s deadline"},
+            )
+            deadline_timer.daemon = True
+            deadline_timer.start()
+        try:
+            outcomes = runner.run()
+        finally:
+            if deadline_timer is not None:
+                deadline_timer.cancel()
         self.ledger.append(
             "workflow.finished",
             {"name": workflow.name, "outcomes": [o.model_dump() for o in outcomes]},

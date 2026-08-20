@@ -152,6 +152,7 @@ class Workflow(BaseModel):
     gpus: float | None = None
     isolate: bool | None = None
     timeout_s: int | None = Field(None, gt=0, description="Maximum seconds allowed for each stage.")
+    max_duration_s: int | None = Field(None, gt=0, description="Maximum seconds for the complete workflow run.")
     max_iterations: int = Field(
         3, ge=1, description="Default cap on how many times a cycle repeats."
     )

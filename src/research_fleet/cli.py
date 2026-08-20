@@ -539,7 +539,14 @@ def _follow_run_log(
 def _render_log_event(ev, *, raw: bool = False, show_job: bool = False) -> None:
     """Render one ledger event for both run- and job-level logs."""
     if raw:
-        print(ev.to_json())
+        # Keep the original epoch ``ts`` for machines, and add a readable
+        # timezone-local timestamp for people inspecting JSONL logs.
+        record = vars(ev).copy()
+        record["timestamp"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%S%z", time.localtime(ev.ts)
+        )
+        import json
+        print(json.dumps(record, separators=(",", ":"), default=str))
         return
     ts = time.strftime("%H:%M:%S", time.localtime(ev.ts))
     job = f" [dim]{(ev.job_id or '')[-6:]}[/dim]" if show_job and ev.job_id else ""
