@@ -151,6 +151,9 @@ class DirectExecutor:
         for mount in spec.mounts:
             source = str(Path(mount.source).expanduser().resolve())
             wrapped += ["--allow" if mount.mode == "rw" else "--read", source]
+        # Native package builds need the system compiler headers and libraries.
+        # This is read-only and does not expose writable host state.
+        wrapped += ["--read", "/usr"]
         # The conservative profile intentionally removes broad system writes.
         # These device nodes are still needed by ordinary shells and Python
         # (for example, `2>/dev/null` and `os.urandom`) and do not expose a
@@ -183,6 +186,7 @@ class DirectExecutor:
              "--no-audit", "--no-rollback", "--allow", self.project_dir,
              "--allow-file", "/dev/null", "--allow-file", "/dev/zero",
              "--allow-file", "/dev/random", "--allow-file", "/dev/urandom",
+             "--read", "/usr",
              "--", "/bin/true"],
             cwd=self.project_dir, capture_output=True, text=True, check=False,
             env={**os.environ, "XDG_STATE_HOME": self._nono_state_home()},

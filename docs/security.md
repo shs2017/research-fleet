@@ -45,7 +45,9 @@ cannot be read, written, or deleted.
 
 Fleet explicitly grants only the standard device files needed by normal command
 execution (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`, and `/dev/tty`).
-It does not grant general `/dev` access.
+It does not grant general `/dev` access. `/usr` is readable so compilers can use
+system headers and libraries when a stage installs a native Python package; it is
+not writable.
 
 With `executor.kind: ship`, Docker provides the process boundary and the same
 mount modes are passed as Docker bind mounts. With `executor.kind: direct`, Fleet
