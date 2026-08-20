@@ -621,7 +621,10 @@ def kill(
 
     This works across processes because containers carry a `fleet.run` label.
     """
+    import os
+    import signal
     import subprocess
+    import time
 
     cfg = load_config(config, root=root)
     ledger = Ledger(cfg.root_path)
@@ -643,8 +646,53 @@ def kill(
                 subprocess.run(["docker", "stop", "-t", "10", *containers],
                                capture_output=True, text=True, check=False)
 
+            # Host/nonо jobs run outside the scheduler process. The direct
+            # executor records one PID per job; terminate the whole process group
+            # so nono and the agent/compiler children cannot survive the kill.
+            pid_dir = cfg.root_path / "nono" / "pids" / target
+            host_pids: list[int] = []
+            if pid_dir.is_dir():
+                for path in pid_dir.glob("*.pid"):
+                    try:
+                        pid = int(path.read_text(encoding="ascii").strip())
+                    except (OSError, ValueError):
+                        continue
+                    if pid > 1:
+                        try:
+                            os.killpg(pid, signal.SIGTERM)
+                            host_pids.append(pid)
+                        except ProcessLookupError:
+                            pass
+                        except PermissionError:
+                            console.print(f"[red]permission denied stopping process group {pid}[/red]")
+            # Older nono jobs may predate PID-file support. Their worktree path
+            # still carries the run id, so use /proc cwd as a conservative fallback.
+            if not host_pids:
+                marker = f"fleet-{target}"
+                for cwd_link in Path("/proc").glob("[0-9]*/cwd"):
+                    try:
+                        pid = int(cwd_link.parent.name)
+                        cwd = os.readlink(cwd_link)
+                    except (OSError, ValueError):
+                        continue
+                    if marker not in cwd or pid <= 1:
+                        continue
+                    try:
+                        os.killpg(pid, signal.SIGTERM)
+                        host_pids.append(pid)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                if host_pids:
+                    time.sleep(1)
+                    for pid in host_pids:
+                        try:
+                            os.killpg(pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+
             marked = ledger.mark_cancelled(target, "killed by operator")
-            parts = [f"{len(containers)} container(s) stopped"]
+            parts = [f"{len(containers)} container(s) stopped",
+                     f"{len(host_pids)} host job(s) stopped"]
             parts.append(f"{len(marked)} job(s) marked cancelled")
             console.print(f"[yellow]{target}[/yellow]: " + ", ".join(parts))
             if not containers and marked:

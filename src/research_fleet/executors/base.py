@@ -45,6 +45,7 @@ def run_process(
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1, env=env, cwd=cwd,
+        start_new_session=True,
     )
     on_start(proc)
     stderr_tail: collections.deque[str] = collections.deque(maxlen=stderr_tail_size)

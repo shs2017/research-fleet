@@ -154,6 +154,9 @@ class DirectExecutor:
         # Native package builds need the system compiler headers and libraries.
         # This is read-only and does not expose writable host state.
         wrapped += ["--read", "/usr"]
+        # Matplotlib/fontconfig need only the system font configuration; keep it
+        # read-only rather than exposing the rest of /etc.
+        wrapped += ["--read", "/etc/fonts"]
         # The conservative profile intentionally removes broad system writes.
         # These device nodes are still needed by ordinary shells and Python
         # (for example, `2>/dev/null` and `os.urandom`) and do not expose a
@@ -234,6 +237,7 @@ class DirectExecutor:
         started = time.time()
         result = JobResult(job_id=spec.id, state=JobState.RUNNING, started_at=started,
                            node="local", gpu_ids=list(placement.gpu_ids))
+        pid_file: Path | None = None
         try:
             worktree = self._worktree(spec)
             workspace = worktree[0] if worktree else self.project_dir
@@ -255,6 +259,12 @@ class DirectExecutor:
             def register(proc: subprocess.Popen) -> None:
                 with self._lock:
                     self._procs[spec.id] = proc
+                if self.nono:
+                    pid_file_dir = Path(self.state_dir) / "pids" / spec.run_id
+                    pid_file_dir.mkdir(parents=True, exist_ok=True)
+                    nonlocal pid_file
+                    pid_file = pid_file_dir / f"{spec.id}.pid"
+                    pid_file.write_text(str(proc.pid) + "\n", encoding="ascii")
 
             outcome = run_process(
                 command, env=direct_env, cwd=workspace, timeout_s=spec.timeout_s,
@@ -263,6 +273,8 @@ class DirectExecutor:
             )
             with self._lock:
                 self._procs.pop(spec.id, None)
+            if pid_file:
+                pid_file.unlink(missing_ok=True)
             result.exit_code = outcome.exit_code
             result.state = JobState.SUCCEEDED if outcome.exit_code == 0 else JobState.FAILED
             if outcome.timed_out:
@@ -275,6 +287,8 @@ class DirectExecutor:
             if worktree:
                 self._snapshot(spec, result)
         except Exception as exc:
+            if pid_file:
+                pid_file.unlink(missing_ok=True)
             result.state = JobState.FAILED
             result.error = f"{type(exc).__name__}: {exc}"
         result.ended_at = time.time()
@@ -286,7 +300,7 @@ class DirectExecutor:
         if process is None:
             return False
         try:
-            process.send_signal(signal.SIGTERM)
+            os.killpg(process.pid, signal.SIGTERM)
         except OSError:
             return False
         return True
