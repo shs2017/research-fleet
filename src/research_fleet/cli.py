@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+import yaml
 from rich.console import Console
 from rich.json import JSON
 from rich.panel import Panel
@@ -299,6 +300,10 @@ def workflow(
         None, "--from-run", help="Reuse a run's outputs/files but execute all stages again.",
         autocompletion=_complete_runs,
     ),
+    parameter: list[str] = typer.Option(
+        [], "--set", help="Set a workflow parameter (key=value); repeat for ablations/seeds."
+    ),
+    ablation: Optional[str] = typer.Option(None, "--ablation", help="Select a structural or prompt variant."),
     detach: bool = typer.Option(
         False, "--detach", "-d", help="Return immediately; run the workflow in the background."
     ),
@@ -307,7 +312,18 @@ def workflow(
     """Run a multi-step pipeline, for example a coder and reviewer loop."""
     from .workflow import Loop, Step, Workflow
 
-    wf = Workflow.from_yaml(file)
+    wf = Workflow.from_yaml(file, ablation=ablation)
+    for assignment in parameter:
+        if "=" not in assignment:
+            raise typer.BadParameter("workflow parameters must use key=value", param_hint="--set")
+        key, value = assignment.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise typer.BadParameter("workflow parameter name cannot be empty", param_hint="--set")
+        try:
+            wf.parameters[key] = yaml.safe_load(value)
+        except yaml.YAMLError as exc:
+            raise typer.BadParameter(f"invalid value for {key}: {exc}", param_hint="--set") from exc
 
     if plan:
         console.print(f"[bold]{wf.name}[/bold]  {wf.description}")

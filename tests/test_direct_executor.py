@@ -293,8 +293,9 @@ def test_direct_workflow_translates_dependency_and_result_paths(tmp_path):
             ]},
             {"name": "second", "kind": "command", "needs": ["first"], "gpus": 0,
              "command": ["python3", "-c",
-                "from pathlib import Path; value=Path('/inputs/first/value.txt').read_text(); "
-                "Path('/results/value.txt').write_text(value + '-two')"]},
+                "import os; from pathlib import Path; "
+                "value=Path(os.environ['FLEET_INPUT_FIRST'])/'value.txt'; "
+                "Path(os.environ['FLEET_RESULTS_DIR']).joinpath('value.txt').write_text(value.read_text() + '-two')"]},
         ]})
         assert all(result.state.value == "succeeded" for result in report.run.results.values())
         assert (state / "results/direct-paths/001/second/value.txt").read_text() == "one-two"

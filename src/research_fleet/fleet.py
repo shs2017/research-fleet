@@ -329,7 +329,8 @@ class Fleet:
 
         self.ledger.append(
             "workflow.started",
-            {"name": workflow.name, "stages": [st.name for st in workflow.stages]},
+            {"name": workflow.name, "stages": [st.name for st in workflow.stages],
+             "parameters": workflow.parameters},
             run_id=self.run_id,
         )
         if resume_from and base_run:

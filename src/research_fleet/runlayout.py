@@ -160,7 +160,10 @@ def input_stages(mounts) -> list[str]:
     return sorted(by_source.values())
 
 
-def render_environment_brief(mounts, *, isolated: bool = False, chained_from: str | None = None) -> str:
+def render_environment_brief(
+    mounts, *, isolated: bool = False, chained_from: str | None = None,
+    host_paths: bool = False,
+) -> str:
     """Tell the agent which directories it has and what each one means.
 
     Without this an agent has to infer the filesystem from its task prompt. That fails
@@ -173,6 +176,11 @@ def render_environment_brief(mounts, *, isolated: bool = False, chained_from: st
     stages = input_stages(mounts)
     targets = {m.target for m in mounts}
     lines = ["", "## Files and directories", ""]
+    lines += [
+        "Use `$FLEET_WORKSPACE_DIR` as the working directory and `$FLEET_RESULTS_DIR` "
+        "for writable deliverables. These variables resolve to the correct paths in "
+        "both container and nono execution.",
+    ]
 
     if isolated:
         # Sequential isolated stages are chained: each branches from the previous one's
@@ -231,6 +239,23 @@ def render_environment_brief(mounts, *, isolated: bool = False, chained_from: st
             "`/inputs/<that stage>/`. Check there before reporting a promised file "
             "missing.",
         ]
+        lines.append("Input mounts also have environment variables; prefer them when running commands:")
+        for stage in stages:
+            variable = re.sub(r"[^A-Za-z0-9]", "_", stage).upper()
+            lines.append(f"- `$FLEET_INPUT_{variable}` -> `/inputs/{stage}`")
+    if host_paths:
+        lines += [
+            "",
+            "This job uses the host sandbox rather than a container mount namespace. "
+            "The virtual paths above are not literal `/inputs` or `/results` paths "
+            "for shell commands; use only these declared host-path mappings:",
+        ]
+        for mount in mounts:
+            try:
+                source = str(Path(mount.source).expanduser().resolve())
+            except (OSError, RuntimeError, ValueError):
+                source = str(mount.source)
+            lines.append(f"- `{mount.target}` -> `{source}` ({mount.mode})")
     return "\n".join(lines)
 
 

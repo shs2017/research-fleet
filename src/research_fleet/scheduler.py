@@ -493,7 +493,17 @@ class Scheduler:
         runlayout.reclaim(results_dir)
         results_dir.mkdir(parents=True, exist_ok=True)
         spec.mounts.append(Mount(source=str(results_dir), target="/results", mode="rw"))
+        # Keep prompts portable across Docker-style mounts and nono's host execution.
+        # DirectExecutor translates these virtual values to the real host paths.
+        env["FLEET_WORKSPACE_DIR"] = "/workspace"
         env["FLEET_RESULTS_DIR"] = "/results"
+        for mount in spec.mounts:
+            for prefix, variable in (("/inputs/", "FLEET_INPUT_"),
+                                     ("/previous/", "FLEET_PREVIOUS_")):
+                if mount.target.startswith(prefix):
+                    name = mount.target[len(prefix):].replace("-", "_").replace("/", "_").upper()
+                    if name:
+                        env[f"{variable}{name}"] = mount.target
         rec.results_dir = results_dir
         rec.stream_log = (results_dir / "stream.log").open("w", buffering=1)
 
@@ -553,6 +563,7 @@ class Scheduler:
                 rec.spec.mounts,
                 isolated=rec.spec.isolate,
                 chained_from=rec.spec.worktree_base,
+                host_paths=self.executor.kind in {"nono", "direct"},
             ),
             sharedprompt.render(self._shared_prompt()),
         ])

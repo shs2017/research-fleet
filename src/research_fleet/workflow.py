@@ -143,6 +143,7 @@ class Workflow(BaseModel):
 
     name: str = "workflow"
     description: str = ""
+    parameters: dict[str, Any] = Field(default_factory=dict)
     stages: list[Step | Loop] = Field(default_factory=list)
     actors: dict[str, Actor] = Field(default_factory=dict)
 
@@ -150,6 +151,7 @@ class Workflow(BaseModel):
     effort: str | None = None
     gpus: float | None = None
     isolate: bool | None = None
+    timeout_s: int | None = Field(None, gt=0, description="Maximum seconds allowed for each stage.")
     max_iterations: int = Field(
         3, ge=1, description="Default cap on how many times a cycle repeats."
     )
@@ -336,10 +338,47 @@ class Workflow(BaseModel):
         return notes
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> Workflow:
+    def from_yaml(cls, path: str | Path, *, ablation: str | None = None) -> Workflow:
         p = Path(path).expanduser()
         raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        return cls.from_dict(raw, base_dir=p.parent)
+        return cls.from_dict(raw, base_dir=p.parent, ablation=ablation)
+
+    @staticmethod
+    def _apply_ablation(raw: dict[str, Any], name: str | None) -> dict[str, Any]:
+        variants = raw.pop("ablations", {}) or {}
+        if not name:
+            return raw
+        if name not in variants:
+            raise ValueError(f"unknown ablation {name!r}; choose from {', '.join(sorted(variants))}")
+        variant = variants[name] or {}
+        if variant.get("workflow"):
+            raw.update(variant["workflow"])
+        if "stages" in variant:
+            raw["stages"] = variant["stages"]
+        stages = [dict(s) for s in raw.get("stages", [])]
+        removed = set(variant.get("remove", []) or [])
+        stages = [s for s in stages if s.get("name") not in removed]
+        for stage in stages:
+            if stage.get("name") in (variant.get("replace", {}) or {}):
+                stage.update(variant["replace"][stage["name"]] or {})
+            if removed:
+                stage["needs"] = [n for n in stage.get("needs", []) if n not in removed]
+        raw["stages"] = stages
+        raw.setdefault("parameters", {}).update(variant.get("parameters", {}) or {})
+        raw["parameters"]["ablation"] = name
+        scale = variant.get("timeout_scale")
+        if scale is not None:
+            def scale_timeouts(node: Any) -> None:
+                if isinstance(node, dict):
+                    if "timeout_s" in node:
+                        node["timeout_s"] = max(1, round(float(node["timeout_s"]) * float(scale)))
+                    for value in node.values():
+                        scale_timeouts(value)
+                elif isinstance(node, list):
+                    for value in node:
+                        scale_timeouts(value)
+            scale_timeouts(stages)
+        return raw
 
     @staticmethod
     def _resolve_task_file(entry: dict[str, Any], base_dir: Path | None) -> dict[str, Any]:
@@ -382,7 +421,8 @@ class Workflow(BaseModel):
         return Loop(**body)
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any], base_dir: str | Path | None = None) -> Workflow:
+    def from_dict(cls, raw: dict[str, Any], base_dir: str | Path | None = None,
+                  ablation: str | None = None) -> Workflow:
         """Accepts two equivalent spellings, and a mix of them.
 
         `stages:` is an ordered list, where a node without `needs` waits for everything
@@ -390,7 +430,7 @@ class Workflow(BaseModel):
         all, for when the dependencies are the point. Nodes from `graph:` are appended
         after any `stages:`, and `needs` may point in either direction.
         """
-        data = dict(raw)
+        data = cls._apply_ablation(dict(raw), ablation)
         base = Path(base_dir) if base_dir is not None else None
         stages: list[Step | Loop] = []
 
@@ -619,7 +659,8 @@ class WorkflowRunner:
             name: {"output": r.output, "state": r.state.value, "job_id": r.job_id}
             for name, r in self.results.items() if name in visible
         }
-        return {"steps": steps, "workflow": self.workflow.name, **(extra or {})}
+        return {"steps": steps, "workflow": self.workflow.name,
+                "parameters": self.workflow.parameters, **(extra or {})}
 
     def _stage_mounts(self, step: Step) -> list[Mount]:
         """Dependency results, mounted read-only at `/inputs/<stage>`.
@@ -692,6 +733,7 @@ class WorkflowRunner:
                 )
         gpus = self.workflow.gpus if step.gpus == 1.0 and self.workflow.gpus is not None else step.gpus
         isolate = step.isolate if step.isolate is not None else self.workflow.isolate
+        timeout_s = min(step.timeout_s, self.workflow.timeout_s) if self.workflow.timeout_s else step.timeout_s
         if isolate is None:
             isolate = self.fleet.config.isolate_agents
         items = list(step.for_each) if step.for_each else list(range(step.copies))
@@ -712,6 +754,14 @@ class WorkflowRunner:
             }
             if len(items) > 1:
                 labels["copy"] = str(index)
+            for key in ("seed", "ablation", "variant"):
+                if key in self.workflow.parameters:
+                    labels[key] = str(self.workflow.parameters[key])
+            run_env = {
+                f"FLEET_{key.upper()}": str(self.workflow.parameters[key])
+                for key in ("seed", "ablation", "variant")
+                if key in self.workflow.parameters
+            }
             if step.kind is JobKind.AGENT:
                 records += self.fleet.run_agents(
                     render(step.task, item_ctx),
@@ -723,17 +773,19 @@ class WorkflowRunner:
                     allowed_tools=step.allowed_tools,
                     disallowed_tools=step.disallowed_tools,
                     gpus=gpus,
-                    timeout_s=step.timeout_s, isolate=isolate, worktree_base=base,
+                    timeout_s=timeout_s, isolate=isolate, worktree_base=base,
                     worktree_base_run_id=base_run,
                     mounts=inherited_mounts,
+                    env=run_env,
                 )
             else:
                 records.append(
                     self.fleet.run_command(
                         [render(part, item_ctx) for part in step.command],
-                        name=name, gpus=gpus, timeout_s=step.timeout_s,
+                        name=name, gpus=gpus, timeout_s=timeout_s,
                         isolate=isolate, worktree_base=base,
                         worktree_base_run_id=base_run, mounts=inherited_mounts, labels=labels,
+                        env=run_env,
                     )
                 )
         return [r.spec.id for r in records], (label if chainable else None)
