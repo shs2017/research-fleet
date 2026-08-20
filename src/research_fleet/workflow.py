@@ -76,6 +76,8 @@ class Step(BaseModel):
 
     model: str | None = None
     effort: str | None = None
+    allowed_tools: list[str] | None = None
+    disallowed_tools: list[str] = Field(default_factory=list)
     gpus: float = 1.0
     timeout_s: int = 3600
     isolate: bool | None = None
@@ -718,6 +720,8 @@ class WorkflowRunner:
                     effort=effort, system_prompt=actor.system_prompt if actor else None,
                     session_id=(self._actor_sessions.get(step.actor)
                                 if actor is not None and actor.persistent else None),
+                    allowed_tools=step.allowed_tools,
+                    disallowed_tools=step.disallowed_tools,
                     gpus=gpus,
                     timeout_s=step.timeout_s, isolate=isolate, worktree_base=base,
                     worktree_base_run_id=base_run,

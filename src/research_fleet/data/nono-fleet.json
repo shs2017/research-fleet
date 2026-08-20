@@ -1,0 +1,6 @@
+{
+  "extends": "default",
+  "groups": {
+    "exclude": ["system_write_linux"]
+  }
+}

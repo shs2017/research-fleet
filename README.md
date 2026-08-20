@@ -13,6 +13,9 @@ and preserves agent sessions; research-ship owns the optional container environm
 ./fleet install
 ```
 
+Host sandboxing also requires [`nono`](https://nono.sh/); verify it with
+`nono --version` before using `--executor nono`.
+
 Authenticate once per project:
 
 ```bash
@@ -32,7 +35,7 @@ Run a YAML workflow:
 ```bash
 fleet workflow discovery.yaml --plan
 fleet workflow discovery.yaml
-fleet workflow discovery.yaml --executor direct
+fleet workflow discovery.yaml --executor nono
 ```
 
 Inspect it:
@@ -85,6 +88,7 @@ stages:
 ```
 
 See [docs/workflows.md](docs/workflows.md) for the YAML reference and
+[docs/security.md](docs/security.md) for filesystem and tool boundaries, and
 [docs/development.md](docs/development.md) for architecture and testing.
 
 ## Design
@@ -94,8 +98,8 @@ See [docs/workflows.md](docs/workflows.md) for the YAML reference and
 - The scheduler runs ready stages, enforces budgets and resource limits, and
   checkpoints workflow progress after every stage. A resumed cycle starts at
   its first unfinished stage.
-- Stages run directly on the host with `--executor direct`, or in Research Ship's
-  reproducible container environment with the default `ship` executor.
+- Stages run in Research Ship's Docker environment by default. `--executor nono`
+  runs them directly with nono's kernel-enforced filesystem sandbox.
 - An append-only ledger records events, costs, results, and provider session IDs.
 - `fleet log` presents agent messages, tool activity, lifecycle events, and
   usage as a readable job history.

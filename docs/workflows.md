@@ -66,9 +66,9 @@ Results live under `ROOT/results/<workflow>/<attempt>/`; events and usage live i
 ledger at `ROOT`.
 
 The default `ship` executor runs stages in containers. The same workflow can run on
-the host with `fleet workflow workflow.yaml --executor direct`; Fleet rewrites its
+the host with `fleet workflow workflow.yaml --executor nono`; Fleet rewrites its
 standard `/workspace`, `/results`, `/inputs`, and `/previous` paths to host paths.
-With `isolate: true`, direct mode also chains and snapshots Git worktrees.
+With `isolate: true`, host mode also chains and snapshots Git worktrees.
 
 Fleet checkpoints after every cycle stage. If a stage fails or is denied, later
 cycle stages are not submitted. Re-run the unchanged workflow with

@@ -46,13 +46,14 @@ class BudgetConfig(BaseModel):
 
 
 class ExecutorConfig(BaseModel):
-    kind: Literal["ship", "direct", "dry-run"] = "ship"
+    kind: Literal["ship", "nono", "direct", "dry-run"] = "ship"
     ship_binary: str = Field("ship", description="The research-ship launcher, on PATH.")
     project_dir: str | None = Field(
         None,
         description="Project whose .ship.conf and image to use. Defaults to `workspace`.",
     )
     docker_binary: str = "docker"
+    nono_binary: str = Field("nono", description="The nono sandbox launcher, on PATH.")
     mounts: list[Mount] = Field(
         default_factory=list,
         description="Files or directories exposed to every job at a stable path.",

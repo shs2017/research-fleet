@@ -22,6 +22,12 @@ def build_executor(cfg) -> Executor:
         )
     if kind == "direct":
         return DirectExecutor(project_dir=cfg.executor.project_dir or cfg.workspace)
+    if kind == "nono":
+        return DirectExecutor(
+            project_dir=cfg.executor.project_dir or cfg.workspace,
+            nono_binary=cfg.executor.nono_binary,
+            state_dir=str(cfg.root_path / "nono"),
+        )
     raise ValueError(f"unknown executor kind {kind!r}")
 
 

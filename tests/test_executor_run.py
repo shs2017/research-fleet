@@ -93,6 +93,16 @@ def test_build_executor_dispatches_on_kind(tmp_path):
     assert isinstance(build_executor(cfg), DryRunExecutor)
 
 
+def test_build_executor_dispatches_nono(tmp_path):
+    nono = _script(tmp_path / "nono", "#!/bin/sh\nexit 0\n")
+    cfg = FleetConfig(
+        root=str(tmp_path / "state"), workspace=str(tmp_path),
+        executor={"kind": "nono", "nono_binary": str(nono)},
+    )
+    executor = build_executor(cfg)
+    assert executor.kind == "nono"
+
+
 def test_build_executor_rejects_an_unknown_kind(tmp_path):
     cfg = FleetConfig(root=str(tmp_path))
     object.__setattr__(cfg.executor, "kind", "nonsense")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -19,8 +20,17 @@ from .base import LineHandler, Placement, run_process
 class DirectExecutor:
     kind = "direct"
 
-    def __init__(self, project_dir: str):
+    def __init__(self, project_dir: str, *, nono_binary: str | None = None,
+                 state_dir: str | None = None):
         self.project_dir = str(Path(project_dir).expanduser().resolve())
+        self.state_dir = str(Path(state_dir or self.project_dir).expanduser().resolve())
+        self.nono = shutil.which(nono_binary) if nono_binary else None
+        if nono_binary and self.nono is None:
+            raise RuntimeError(
+                f"{nono_binary!r} not found on PATH; install nono or use executor kind 'ship'"
+            )
+        if self.nono:
+            self.kind = "nono"
         self._procs: dict[str, subprocess.Popen] = {}
         self._lock = threading.Lock()
 
@@ -81,7 +91,13 @@ class DirectExecutor:
         if not mapping:
             return value
         sources = dict(mapping)
-        pattern = re.compile("|".join(re.escape(target) for target in sources))
+        # Translate container paths at the start of a value or after punctuation,
+        # but never a matching segment inside an already-absolute host path.
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9._/\\-])(?:"
+            + "|".join(re.escape(target) for target in sources)
+            + ")"
+        )
         return pattern.sub(lambda match: sources[match.group(0)], value)
 
     @staticmethod
@@ -102,10 +118,6 @@ class DirectExecutor:
             for mount in spec.mounts
             if mount.mode == "rw"
         ]
-        # Bubblewrap needs mount namespaces that are commonly disabled on managed
-        # research hosts. Landlock enforces this simple workspace-write policy in the
-        # kernel without that requirement; forcing it avoids a run that starts normally
-        # but fails on every agent shell command with `bwrap: ... Permission denied`.
         roots = list(dict.fromkeys(writable))
         # Use config overrides instead of `--sandbox`/`--add-dir`: unlike those
         # top-level exec flags, `-c` is also accepted by `codex exec resume`, which is
@@ -115,10 +127,64 @@ class DirectExecutor:
             "-c", f"sandbox_workspace_write.writable_roots={json.dumps(roots)}",
             "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
             "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-            "--enable", "use_legacy_landlock",
         ]
         index = command.index(bypass)
         return command[:index] + replacement + command[index + 1:]
+
+    def _nono_command(self, command: list[str], spec: JobSpec, workspace: str) -> list[str]:
+        """Wrap a host command in nono's kernel-enforced Landlock sandbox."""
+        if not self.nono:
+            return command
+        profile = Path(__file__).resolve().parents[1] / "data" / "nono-fleet.json"
+        wrapped = [
+            self.nono, "run", "--silent", "--profile", str(profile),
+            "--sandbox-policy", "landlock",
+            "--no-audit", "--no-rollback", "--workdir", workspace,
+            "--allow", workspace,
+        ]
+        if "--dangerously-bypass-approvals-and-sandbox" in command:
+            state = str(Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve())
+            wrapped += ["--allow", state, "--bypass-protection", state]
+        elif "--dangerously-skip-permissions" in command:
+            state = str(Path("~/.claude").expanduser().resolve())
+            wrapped += ["--allow", state, "--bypass-protection", state]
+        for mount in spec.mounts:
+            source = str(Path(mount.source).expanduser().resolve())
+            wrapped += ["--allow" if mount.mode == "rw" else "--read", source]
+        return wrapped + ["--", *command]
+
+    def _nono_state_home(self) -> str:
+        """Keep nono's own state out of world-writable scratch trees.
+
+        nono's default policy grants `/tmp`; placing its protected state below
+        `/tmp` therefore conflicts with its safety checks. Fleet results may
+        legitimately live there in tests or on a scratch node, so use the
+        user's normal state directory for nono metadata in that case.
+        """
+        state = Path(self.state_dir).resolve()
+        scratch_roots = [Path(os.environ.get("TMPDIR", "/tmp")).resolve(), Path("/tmp")]
+        if any(state == root or root in state.parents for root in scratch_roots):
+            return str(Path("~/.local/state/research-fleet").expanduser().resolve())
+        return self.state_dir
+
+    def preflight(self, policy: Policy, image: str = "") -> None:
+        if not self.nono:
+            return
+        checked = subprocess.run(
+            [self.nono, "run", "--silent", "--profile",
+             str(Path(__file__).resolve().parents[1] / "data" / "nono-fleet.json"),
+             "--sandbox-policy", "landlock",
+             "--no-audit", "--no-rollback", "--allow", self.project_dir,
+             "--", "/bin/true"],
+            cwd=self.project_dir, capture_output=True, text=True, check=False,
+            env={**os.environ, "XDG_STATE_HOME": self._nono_state_home()},
+        )
+        if checked.returncode:
+            detail = checked.stderr.strip().splitlines()
+            raise RuntimeError(
+                "nono could not start its Landlock sandbox"
+                + (f": {detail[-1]}" if detail else "")
+            )
 
     def _snapshot(self, spec: JobSpec, result: JobResult) -> None:
         path = result.worktree_path
@@ -163,9 +229,14 @@ class DirectExecutor:
                 result.worktree_path, result.worktree_branch, result.worktree_base_commit = worktree
             mapping = self._mapping(spec, workspace)
             command = [self._translate(part, mapping) for part in argv]
-            command = self._sandbox_codex(command, spec, workspace)
+            if self.nono:
+                command = self._nono_command(command, spec, workspace)
+            else:
+                command = self._sandbox_codex(command, spec, workspace)
             direct_env = {key: self._translate(value, mapping) for key, value in env.items()}
             direct_env = {**os.environ, **direct_env}
+            if self.nono:
+                direct_env["XDG_STATE_HOME"] = self._nono_state_home()
             if placement.gpu_ids:
                 direct_env["CUDA_VISIBLE_DEVICES"] = placement.cuda_visible_devices
 

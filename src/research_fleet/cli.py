@@ -78,7 +78,7 @@ def _choices(*values: str):
 
 _BACKENDS = _choices("claude-cli", "codex-cli")
 _EFFORTS = _choices("low", "medium", "high", "xhigh", "max")
-_EXECUTORS = _choices("ship", "direct", "dry-run")
+_EXECUTORS = _choices("ship", "nono", "direct", "dry-run")
 
 
 def _fleet(config: Optional[str], **overrides) -> Fleet:
@@ -227,7 +227,7 @@ def run(
     timeout: int = typer.Option(3600, "--timeout", help="Per-agent wall clock, seconds."),
     max_usd: Optional[float] = typer.Option(None, "--max-usd", help="Budget ceiling for the whole run."),
     executor: Optional[str] = typer.Option(
-        None, "--executor", help="ship | direct | dry-run", autocompletion=_EXECUTORS
+        None, "--executor", help="ship | nono | direct | dry-run", autocompletion=_EXECUTORS
     ),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
@@ -286,7 +286,7 @@ def workflow(
     workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
     max_usd: Optional[float] = typer.Option(None, "--max-usd"),
     executor: Optional[str] = typer.Option(
-        None, "--executor", help="ship | direct | dry-run", autocompletion=_EXECUTORS
+        None, "--executor", help="ship | nono | direct | dry-run", autocompletion=_EXECUTORS
     ),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),

@@ -500,6 +500,21 @@ def test_policy_merges_its_tool_denylist_into_the_job(tmp_path):
     assert d.mutations["agent_disallowed_tools"] == ["Bash", "WebFetch"]
 
 
+def test_policy_can_require_approval_for_writable_mounts(tmp_path):
+    p = Policy(allowed_mount_roots=[str(tmp_path)])
+    spec = JobSpec(name="c", command=["true"], mounts=[
+        Mount(source=str(tmp_path / "results"), target="/results", mode="rw"),
+    ])
+    d = p.check(spec, workspace_roots=[str(tmp_path / "workspace")])
+    assert d.verdict == "allow"  # the mount is inside the explicit allowlist
+
+    p = Policy(allowed_mount_roots=[], fail_closed=False,
+               require_approval_for=["mount:rw-outside-workspace"])
+    d = p.check(spec, workspace_roots=[str(tmp_path / "workspace")])
+    assert d.verdict == "require_approval"
+    assert "gate: mount:rw-outside-workspace" in d.reasons
+
+
 # ------------------------------------------------- concurrent ledger writers
 
 
