@@ -43,6 +43,10 @@ agent; no sandbox can make a declared writable directory immutable. The source
 directory of a read-only mount, undeclared host paths, prompts, and other runs
 cannot be read, written, or deleted.
 
+Fleet explicitly grants only the standard device files needed by normal command
+execution (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`, and `/dev/tty`).
+It does not grant general `/dev` access.
+
 With `executor.kind: ship`, Docker provides the process boundary and the same
 mount modes are passed as Docker bind mounts. With `executor.kind: direct`, Fleet
 uses the Codex sandbox when available; `nono` is the recommended host executor.

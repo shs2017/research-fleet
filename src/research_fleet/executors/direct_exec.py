@@ -151,6 +151,12 @@ class DirectExecutor:
         for mount in spec.mounts:
             source = str(Path(mount.source).expanduser().resolve())
             wrapped += ["--allow" if mount.mode == "rw" else "--read", source]
+        # The conservative profile intentionally removes broad system writes.
+        # These device nodes are still needed by ordinary shells and Python
+        # (for example, `2>/dev/null` and `os.urandom`) and do not expose a
+        # directory or a host data tree.
+        for device in ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty"):
+            wrapped += ["--allow-file", device]
         return wrapped + ["--", *command]
 
     def _nono_state_home(self) -> str:
@@ -175,6 +181,8 @@ class DirectExecutor:
              str(Path(__file__).resolve().parents[1] / "data" / "nono-fleet.json"),
              "--sandbox-policy", "landlock",
              "--no-audit", "--no-rollback", "--allow", self.project_dir,
+             "--allow-file", "/dev/null", "--allow-file", "/dev/zero",
+             "--allow-file", "/dev/random", "--allow-file", "/dev/urandom",
              "--", "/bin/true"],
             cwd=self.project_dir, capture_output=True, text=True, check=False,
             env={**os.environ, "XDG_STATE_HOME": self._nono_state_home()},

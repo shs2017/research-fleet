@@ -123,6 +123,8 @@ def test_nono_never_exposes_unlisted_host_paths_or_tmp(tmp_path):
     assert str(results.resolve()) in command
     assert str(data.resolve()) in command
     assert str(tmp_path.resolve()) not in command
+    for device in ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty"):
+        assert device in command
 
 
 def test_nono_preflight_reports_runtime_failure(tmp_path):
