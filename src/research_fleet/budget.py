@@ -25,7 +25,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-PRICES_AS_OF = "2026-08-05"
+PRICES_AS_OF = "2026-08-20"
 
 MTOK = 1_000_000
 
@@ -42,6 +42,9 @@ class ModelCost:
     cache_read_mult: float = 0.1
     cache_write_mult: float = 1.25      # 5-minute TTL; 1h TTL is 2.0
     cache_write_1h_mult: float = 2.0
+    long_context_threshold: int | None = None
+    long_input_mult: float = 1.0
+    long_output_mult: float = 1.0
 
     def cost_usd(
         self,
@@ -52,11 +55,20 @@ class ModelCost:
         cache_ttl: str = "5m",
     ) -> float:
         write_mult = self.cache_write_1h_mult if cache_ttl == "1h" else self.cache_write_mult
+        input_total = input_tokens + cache_read_tokens + cache_write_tokens
+        input_mult = self.long_input_mult if (
+            self.long_context_threshold is not None
+            and input_total > self.long_context_threshold
+        ) else 1.0
+        output_mult = self.long_output_mult if (
+            self.long_context_threshold is not None
+            and input_total > self.long_context_threshold
+        ) else 1.0
         return (
-            input_tokens * self.input_per_mtok
-            + output_tokens * self.output_per_mtok
-            + cache_read_tokens * self.input_per_mtok * self.cache_read_mult
-            + cache_write_tokens * self.input_per_mtok * write_mult
+            input_tokens * self.input_per_mtok * input_mult
+            + output_tokens * self.output_per_mtok * output_mult
+            + cache_read_tokens * self.input_per_mtok * self.cache_read_mult * input_mult
+            + cache_write_tokens * self.input_per_mtok * write_mult * input_mult
         ) / MTOK
 
 
@@ -73,10 +85,14 @@ MODEL_COSTS: dict[str, ModelCost] = {
         ModelCost("claude-sonnet-4-6", 3.00, 15.00, 1_000_000, 128_000),
         ModelCost("claude-haiku-4-5", 1.00, 5.00, 200_000, 64_000),
         ModelCost("gpt-5.3-codex", 1.75, 14.00, 400_000, 128_000),
-        ModelCost("gpt-5.6-sol", 5.00, 30.00, 1_050_000, 128_000),
-        ModelCost("gpt-5.6", 5.00, 30.00, 1_050_000, 128_000),
-        ModelCost("gpt-5.6-terra", 2.50, 15.00, 1_050_000, 128_000),
-        ModelCost("gpt-5.6-luna", 1.00, 6.00, 1_050_000, 128_000),
+        ModelCost("gpt-5.6-sol", 5.00, 30.00, 1_050_000, 128_000,
+                  long_context_threshold=272_000, long_input_mult=2.0, long_output_mult=1.5),
+        ModelCost("gpt-5.6", 5.00, 30.00, 1_050_000, 128_000,
+                  long_context_threshold=272_000, long_input_mult=2.0, long_output_mult=1.5),
+        ModelCost("gpt-5.6-terra", 2.00, 12.00, 1_050_000, 128_000,
+                  long_context_threshold=272_000, long_input_mult=2.0, long_output_mult=1.5),
+        ModelCost("gpt-5.6-luna", 0.20, 1.20, 1_050_000, 128_000,
+                  long_context_threshold=272_000, long_input_mult=2.0, long_output_mult=1.5),
         ModelCost("gpt-5.4", 2.50, 15.00, 1_050_000, 128_000),
         ModelCost("gpt-5.4-mini", 0.75, 4.50, 400_000, 128_000),
         ModelCost("gpt-5.4-nano", 0.20, 1.25, 400_000, 128_000),

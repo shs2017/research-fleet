@@ -121,6 +121,19 @@ def test_cost_computation_matches_price_table():
     assert mc.cost_usd(cache_read_tokens=1_000_000) == pytest.approx(0.5)
 
 
+def test_gpt56_costs_include_cache_and_long_context_rates():
+    sol = cost_for("gpt-5.6-sol")
+    # Current published rates: $5 input, $0.50 cached input, $30 output.
+    assert sol.cost_usd(input_tokens=100_000, output_tokens=100_000) == pytest.approx(3.5)
+    assert sol.cost_usd(cache_read_tokens=100_000) == pytest.approx(0.05)
+    # Over 272K input tokens applies the documented 2x input / 1.5x output rates.
+    assert sol.cost_usd(input_tokens=272_001, output_tokens=1_000_000) == pytest.approx(
+        (272_001 * 5 * 2 + 1_000_000 * 30 * 1.5) / 1_000_000
+    )
+    assert cost_for("gpt-5.6-terra").input_per_mtok == pytest.approx(2.0)
+    assert cost_for("gpt-5.6-luna").output_per_mtok == pytest.approx(1.2)
+
+
 def test_cheaper_model_quotes_lower():
     opus = quote("claude-opus-5", effort="high")
     haiku = quote("claude-haiku-4-5", effort="high")

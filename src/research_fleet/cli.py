@@ -7,6 +7,7 @@ internal job-spec API.
 from __future__ import annotations
 
 import os
+import json
 import shlex
 import sys
 import time
@@ -861,16 +862,71 @@ def jobs(
         rows = ledger.jobs(run_id)
         if groups[state] is not None:
             rows = [row for row in rows if row["state"] in groups[state]]
+        usage = {row["job_id"]: row for row in ledger.usage_rows(run_id=run_id)}
+
+        # Show the run definition separately when one run was selected. This makes
+        # seed/ablation/workflow identity explicit instead of burying it in prompts.
+        if run_id:
+            starts = ledger.events(run_id=run_id, types=["workflow.started"], limit=1)
+            if starts:
+                payload = starts[0].payload
+                parameters = payload.get("parameters") or {}
+                meta = Table(title="run", show_header=False, box=None)
+                meta.add_column("field", style="dim")
+                meta.add_column("value")
+                meta.add_row("run", run_id)
+                meta.add_row("workflow", str(payload.get("name", "-")))
+                meta.add_row("seed", str(parameters.get("seed", "-")))
+                meta.add_row("ablation", str(parameters.get("ablation", "-")))
+                meta.add_row("variant", str(parameters.get("variant", "-")))
+                console.print(meta)
+
         table = Table(title=f"{state} jobs{f' in {run_id}' if run_id else ''}")
-        for col in ("job_id", "name", "kind", "state"):
+        columns = (("job", "stage", "try", "seed/ablation", "model/effort", "state",
+                    "usage (input / cached / cache-write / output / total / cost)")
+                   if run_id else
+                   ("job", "run", "stage", "try", "seed/ablation", "model/effort", "state",
+                    "usage (input / cached / cache-write / output / total / cost)"))
+        for col in columns:
             table.add_column(col)
         for j in rows:
             colour = {"succeeded": "green", "failed": "red", "denied": "red"}.get(
                 j["state"], "yellow"
             )
-            table.add_row(j["job_id"], j["name"], j["kind"],
-                          f"[{colour}]{j['state']}[/{colour}]")
+            try:
+                spec = json.loads(j.get("spec") or "{}")
+            except (TypeError, ValueError):
+                spec = {}
+            labels = spec.get("labels") or {}
+            agent = spec.get("agent") or {}
+            u = usage.get(j["job_id"], {})
+            model = u.get("model") or agent.get("model") or "-"
+            effort = agent.get("effort") or "-"
+            identity = f"{labels.get('seed', '-')} / {labels.get('ablation', '-')}"
+            values = [
+                j["job_id"],
+                labels.get("stage") or j["name"],
+                str(labels.get("attempt") or "1"),
+                identity,
+            f"{model} / {effort} / {labels.get('execution_mode', 'standard')}",
+                f"[{colour}]{j['state']}[/{colour}]",
+                (f"{u.get('input_tokens', 0):,} / {u.get('cache_read_tokens', 0):,} / "
+                 f"{u.get('cache_write_tokens', 0):,} / {u.get('output_tokens', 0):,} / "
+                 f"{u.get('total_tokens', 0):,} / "
+                 f"${u.get('cost_usd', 0.0):.4f}" if u and not u.get("unpriced") else
+                 ("unpriced" if u else "-")),
+            ]
+            if not run_id:
+                values.insert(1, (j.get("run_id") or "-")[-8:])
+            table.add_row(*values)
         console.print(table)
+        total = ledger.usage_totals(run_id=run_id)
+        console.print(
+            f"[bold]usage:[/bold] {total['total_tokens']:,} tokens  "
+            f"${total['cost_usd']:.4f}  "
+            f"(input {total['input_tokens']:,}, cached {total['cache_read_tokens']:,}, "
+            f"output {total['output_tokens']:,})"
+        )
 
 
 @app.command()

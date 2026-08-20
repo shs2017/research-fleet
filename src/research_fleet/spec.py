@@ -83,6 +83,7 @@ class AgentConfig(BaseModel):
     # and silently falls back to the default, so a typo would quietly cost you the
     # reasoning depth you asked for. Backends pass supported values to their CLI.
     effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    execution_mode: Literal["standard", "ultra"] = "standard"
     max_turns: int | None = Field(None, ge=1)
     allowed_tools: list[str] | None = Field(
         None, description="Tool allowlist passed through to the agent CLI. None = backend default."

@@ -41,6 +41,10 @@ class CodexCLIBackend:
             # Codex CLI exposes config keys through `-c`; keep this separate from
             # the prompt so the requested reasoning level actually reaches the model.
             argv += ["-c", f'model_reasoning_effort="{agent.effort}"']
+        if agent.execution_mode == "ultra":
+            # Codex CLI's Ultra-style execution is exposed through its stable
+            # multi-agent feature; this is intentionally independent of effort.
+            argv += ["--enable", "multi_agent"]
         # Sandboxing is handled by the container; the CLI's own sandbox would be
         # redundant and blocks legitimate workspace writes.
         argv += ["--dangerously-bypass-approvals-and-sandbox"]

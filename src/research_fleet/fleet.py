@@ -200,6 +200,7 @@ class Fleet:
         model: str | None = None,
         backend: str | None = None,
         effort: str | None = None,
+        execution_mode: str = "standard",
         gpus: float = 1.0,
         cpus: float | None = None,
         image: str | None = None,
@@ -248,6 +249,7 @@ class Fleet:
                         # Passed to the harness as well as recorded as a label: the
                         # label drives cost estimation, this drives the actual run.
                         effort=effort or self.config.budget.default_effort,
+                        execution_mode=execution_mode,
                         max_turns=max_turns,
                         allowed_tools=list(allowed_tools) if allowed_tools else None,
                         disallowed_tools=list(disallowed_tools or []),

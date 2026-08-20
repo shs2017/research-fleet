@@ -12,7 +12,7 @@ import hashlib
 import json
 import warnings
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
@@ -135,6 +135,7 @@ class Actor(BaseModel):
     backend: str | None = None
     model: str | None = None
     effort: str | None = None
+    execution_mode: Literal["standard", "ultra"] = "standard"
     system_prompt: str | None = None
 
 
@@ -758,17 +759,22 @@ class WorkflowRunner:
             for key in ("seed", "ablation", "variant"):
                 if key in self.workflow.parameters:
                     labels[key] = str(self.workflow.parameters[key])
+            if actor is not None:
+                labels["execution_mode"] = actor.execution_mode
             run_env = {
                 f"FLEET_{key.upper()}": str(self.workflow.parameters[key])
                 for key in ("seed", "ablation", "variant")
                 if key in self.workflow.parameters
             }
+            if actor is not None:
+                run_env["FLEET_EXECUTION_MODE"] = actor.execution_mode
             if step.kind is JobKind.AGENT:
                 records += self.fleet.run_agents(
                     render(step.task, item_ctx),
                     n=1, name_prefix=name, labels=labels,
                     model=model, backend=actor.backend if actor else None,
                     effort=effort, system_prompt=actor.system_prompt if actor else None,
+                    execution_mode=actor.execution_mode if actor else "standard",
                     session_id=(self._actor_sessions.get(step.actor)
                                 if actor is not None and actor.persistent else None),
                     allowed_tools=step.allowed_tools,
