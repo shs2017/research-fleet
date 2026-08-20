@@ -29,6 +29,25 @@ PRICES_AS_OF = "2026-08-20"
 
 MTOK = 1_000_000
 
+# Codex subscription credits per million tokens. Cache writes are free on the
+# subscription rate card, unlike API cache-write pricing.
+CODEX_CREDIT_RATES = {
+    "gpt-5.6-sol": (125.0, 12.5, 750.0),
+    "gpt-5.6": (125.0, 12.5, 750.0),
+    "gpt-5.6-terra": (50.0, 5.0, 300.0),
+    "gpt-5.6-luna": (5.0, 0.5, 30.0),
+}
+
+
+def codex_credits(model: str | None, *, input_tokens: int = 0,
+                  cache_read_tokens: int = 0, output_tokens: int = 0) -> float | None:
+    """Return Codex subscription credits, or None for non-Codex/unpriced models."""
+    rates = CODEX_CREDIT_RATES.get(resolve_model(model)) if model else None
+    if rates is None:
+        return None
+    fresh, cached, output = rates
+    return (input_tokens * fresh + cache_read_tokens * cached + output_tokens * output) / MTOK
+
 
 @dataclass(frozen=True)
 class ModelCost:

@@ -21,7 +21,7 @@ from rich.json import JSON
 from rich.panel import Panel
 from rich.table import Table
 
-from .budget import cost_menu
+from .budget import codex_credits, cost_menu
 from .config import load_config
 from .fleet import CredentialsUnavailable, Fleet
 from .ledger import Ledger
@@ -902,6 +902,12 @@ def jobs(
             u = usage.get(j["job_id"], {})
             model = u.get("model") or agent.get("model") or "-"
             effort = agent.get("effort") or "-"
+            credits = codex_credits(
+                model,
+                input_tokens=u.get("input_tokens", 0),
+                cache_read_tokens=u.get("cache_read_tokens", 0),
+                output_tokens=u.get("output_tokens", 0),
+            ) if u else None
             identity = f"{labels.get('seed', '-')} / {labels.get('ablation', '-')}"
             values = [
                 j["job_id"],
@@ -913,7 +919,8 @@ def jobs(
                 (f"{u.get('input_tokens', 0):,} / {u.get('cache_read_tokens', 0):,} / "
                  f"{u.get('cache_write_tokens', 0):,} / {u.get('output_tokens', 0):,} / "
                  f"{u.get('total_tokens', 0):,} / "
-                 f"${u.get('cost_usd', 0.0):.4f}" if u and not u.get("unpriced") else
+                 f"${u.get('cost_usd', 0.0):.4f} / "
+                 f"{credits:.2f} credits" if u and not u.get("unpriced") else
                  ("unpriced" if u else "-")),
             ]
             if not run_id:
@@ -921,12 +928,26 @@ def jobs(
             table.add_row(*values)
         console.print(table)
         total = ledger.usage_totals(run_id=run_id)
+        total_credits = 0.0
+        credit_jobs = 0
+        for u in usage.values():
+            c = codex_credits(u.get("model"), input_tokens=u.get("input_tokens", 0),
+                              cache_read_tokens=u.get("cache_read_tokens", 0),
+                              output_tokens=u.get("output_tokens", 0))
+            if c is not None:
+                total_credits += c
+                credit_jobs += 1
         console.print(
             f"[bold]usage:[/bold] {total['total_tokens']:,} tokens  "
             f"${total['cost_usd']:.4f}  "
             f"(input {total['input_tokens']:,}, cached {total['cache_read_tokens']:,}, "
             f"output {total['output_tokens']:,})"
         )
+        if credit_jobs:
+            console.print(
+                f"[bold]Codex subscription:[/bold] {total_credits:.2f} credits "
+                "(remaining allowance/percentage is not exposed by the CLI)"
+            )
 
 
 @app.command()
