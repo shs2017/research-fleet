@@ -497,8 +497,20 @@ class WorkflowRunner:
         self._actor_sessions: dict[str, str] = {}
         self._actors_started: set[str] = set()
         self._cycle_progress: dict[str, dict[str, int]] = {}
+        # Runtime limits are deliberately excluded from compatibility.  A resume
+        # may use a longer (or shorter) deadline without changing the scientific
+        # graph, prompts, actors, or artifact semantics.  All substantive workflow
+        # changes still invalidate the checkpoint.
+        fingerprint_payload = workflow.model_dump(mode="json")
+        def without_limits(value):
+            if isinstance(value, dict):
+                return {k: without_limits(v) for k, v in value.items()
+                        if k not in {"timeout_s", "max_duration_s"}}
+            if isinstance(value, list):
+                return [without_limits(v) for v in value]
+            return value
         self._fingerprint = hashlib.sha256(json.dumps(
-            workflow.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+            without_limits(fingerprint_payload), sort_keys=True, separators=(",", ":")
         ).encode()).hexdigest()
         if prior_run:
             self._restore(prior_run, resume=resume)

@@ -110,6 +110,29 @@ def test_workflow_max_duration_cancels_active_work(tmp_path):
     assert any(result.state is JobState.CANCELLED for result in report.run.results.values())
 
 
+def test_resume_allows_a_changed_runtime_deadline(tmp_path):
+    """A longer deadline is safe to apply when continuing the same workflow."""
+    first = _fleet(tmp_path, ScriptedExecutor())
+    try:
+        first.run_workflow({
+            "name": "deadline-change", "max_duration_s": 10,
+            "stages": [{"name": "a", "task": "one", "gpus": 0}],
+        })
+        prior_run = first.run_id
+    finally:
+        first.close()
+
+    resumed = _fleet(tmp_path, ScriptedExecutor())
+    try:
+        report = resumed.run_workflow({
+            "name": "deadline-change", "max_duration_s": 9000,
+            "stages": [{"name": "a", "task": "one", "gpus": 0}],
+        }, resume_from=prior_run)
+        assert not report.run.failed
+    finally:
+        resumed.close()
+
+
 # ---------------------------------------------------------------- templating
 
 
