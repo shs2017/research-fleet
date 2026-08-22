@@ -93,7 +93,8 @@ See [docs/workflows.md](docs/workflows.md) for the YAML reference and
 
 ## Design
 
-- YAML defines actors, persistence, prompts, dependencies, models, effort, and
+- YAML defines actors, persistence, prompts, dependencies, models, effort (`low`,
+  `medium`, `high`, `xhigh`, `max`, or `ultra`), and
   resource requirements in one place.
 - The scheduler runs ready stages, enforces budgets and resource limits, and
   checkpoints workflow progress after every stage. A resumed cycle starts at

@@ -82,7 +82,7 @@ class AgentConfig(BaseModel):
     # Validated here rather than left to the harness: `claude --effort <bad>` only warns
     # and silently falls back to the default, so a typo would quietly cost you the
     # reasoning depth you asked for. Backends pass supported values to their CLI.
-    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    effort: Literal["low", "medium", "high", "xhigh", "max", "ultra"] | None = None
     execution_mode: Literal["standard", "ultra"] = "standard"
     max_turns: int | None = Field(None, ge=1)
     allowed_tools: list[str] | None = Field(

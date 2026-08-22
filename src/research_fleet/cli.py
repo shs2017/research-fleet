@@ -79,7 +79,7 @@ def _choices(*values: str):
 
 
 _BACKENDS = _choices("claude-cli", "codex-cli")
-_EFFORTS = _choices("low", "medium", "high", "xhigh", "max")
+_EFFORTS = _choices("low", "medium", "high", "xhigh", "max", "ultra")
 _EXECUTORS = _choices("ship", "nono", "direct", "dry-run")
 
 
@@ -214,7 +214,7 @@ def run(
         None, "--backend", help="claude-cli | codex-cli", autocompletion=_BACKENDS
     ),
     effort: Optional[str] = typer.Option(
-        None, "--effort", help="low|medium|high|xhigh|max", autocompletion=_EFFORTS
+        None, "--effort", help="low|medium|high|xhigh|max|ultra", autocompletion=_EFFORTS
     ),
     gpus: Optional[float] = typer.Option(
         None, "--gpus",
@@ -900,8 +900,8 @@ def jobs(
             labels = spec.get("labels") or {}
             agent = spec.get("agent") or {}
             u = usage.get(j["job_id"], {})
-            model = u.get("model") or agent.get("model") or "-"
-            effort = agent.get("effort") or "-"
+            model = u.get("model") or agent.get("model") or cfg.budget.default_model or "-"
+            effort = agent.get("effort") or cfg.budget.default_effort or "-"
             credits = codex_credits(
                 model,
                 input_tokens=u.get("input_tokens", 0),

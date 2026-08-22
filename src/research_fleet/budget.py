@@ -135,6 +135,7 @@ EFFORT_MULTIPLIER = {
     "high": 1.0,
     "xhigh": 1.5,
     "max": 2.2,
+    "ultra": 3.0,
 }
 
 # Token profiles per shape of work, as (fresh input, cached input, output).
@@ -312,7 +313,7 @@ def quote(
 def cost_menu(
     models: Iterable[str] | None = None,
     *,
-    efforts: Iterable[str] = ("low", "medium", "high", "xhigh"),
+    efforts: Iterable[str] = ("low", "medium", "high", "xhigh", "max", "ultra"),
     process: str = "agent_standard",
 ) -> list[dict[str, Any]]:
     """The table handed to an agent so it can pick a model for a sub-task on price.
