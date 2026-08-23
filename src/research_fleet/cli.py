@@ -291,6 +291,13 @@ def workflow(
         None, "--executor", help="ship | nono | direct | dry-run", autocompletion=_EXECUTORS
     ),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
+    effort: Optional[str] = typer.Option(
+        None, "--effort", help="Override agent reasoning: low|medium|high|xhigh|max|ultra",
+        autocompletion=_EFFORTS,
+    ),
+    max_duration: Optional[int] = typer.Option(
+        None, "--max-duration", help="Maximum whole-workflow runtime in seconds."
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
     plan: bool = typer.Option(False, "--plan", help="Validate and print the stages, run nothing."),
     resume_from: Optional[str] = typer.Option(
@@ -304,7 +311,9 @@ def workflow(
     parameter: list[str] = typer.Option(
         [], "--set", help="Set a workflow parameter (key=value); repeat for ablations/seeds."
     ),
-    ablation: Optional[str] = typer.Option(None, "--ablation", help="Select a structural or prompt variant."),
+    ablation: Optional[str] = typer.Option(
+        None, "--ablation", help="Select one variant or a comma-separated combination."
+    ),
     detach: bool = typer.Option(
         False, "--detach", "-d", help="Return immediately; run the workflow in the background."
     ),
@@ -314,6 +323,17 @@ def workflow(
     from .workflow import Loop, Step, Workflow
 
     wf = Workflow.from_yaml(file, ablation=ablation)
+    if effort:
+        wf.effort = effort
+        for actor in wf.actors.values():
+            actor.effort = effort
+        for stage in wf.stages:
+            if hasattr(stage, "effort"):
+                stage.effort = effort
+    if max_duration is not None:
+        if max_duration <= 0:
+            raise typer.BadParameter("must be positive", param_hint="--max-duration")
+        wf.max_duration_s = max_duration
     for assignment in parameter:
         if "=" not in assignment:
             raise typer.BadParameter("workflow parameters must use key=value", param_hint="--set")

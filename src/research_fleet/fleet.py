@@ -261,8 +261,14 @@ class Fleet:
                     isolate=self.config.isolate_agents if isolate is None else isolate,
                     worktree_base=worktree_base,
                     worktree_base_run_id=worktree_base_run_id,
-                    labels={"effort": effort or self.config.budget.default_effort,
-                            **(labels or {})},
+                    labels={
+                        "effort": effort or self.config.budget.default_effort,
+                        "execution_mode": (
+                            "ultra" if (effort or self.config.budget.default_effort) == "ultra"
+                            else execution_mode
+                        ),
+                        **(labels or {}),
+                    },
                 )
             )
         return [self.submit(s) for s in specs]

@@ -350,36 +350,42 @@ class Workflow(BaseModel):
         variants = raw.pop("ablations", {}) or {}
         if not name:
             return raw
-        if name not in variants:
-            raise ValueError(f"unknown ablation {name!r}; choose from {', '.join(sorted(variants))}")
-        variant = variants[name] or {}
-        if variant.get("workflow"):
-            raw.update(variant["workflow"])
-        if "stages" in variant:
-            raw["stages"] = variant["stages"]
-        stages = [dict(s) for s in raw.get("stages", [])]
-        removed = set(variant.get("remove", []) or [])
-        stages = [s for s in stages if s.get("name") not in removed]
-        for stage in stages:
-            if stage.get("name") in (variant.get("replace", {}) or {}):
-                stage.update(variant["replace"][stage["name"]] or {})
-            if removed:
-                stage["needs"] = [n for n in stage.get("needs", []) if n not in removed]
-        raw["stages"] = stages
-        raw.setdefault("parameters", {}).update(variant.get("parameters", {}) or {})
-        raw["parameters"]["ablation"] = name
-        scale = variant.get("timeout_scale")
-        if scale is not None:
-            def scale_timeouts(node: Any) -> None:
-                if isinstance(node, dict):
-                    if "timeout_s" in node:
-                        node["timeout_s"] = max(1, round(float(node["timeout_s"]) * float(scale)))
-                    for value in node.values():
-                        scale_timeouts(value)
-                elif isinstance(node, list):
-                    for value in node:
-                        scale_timeouts(value)
-            scale_timeouts(stages)
+        names = [part.strip() for part in name.split(",") if part.strip()]
+        for selected in names:
+            if selected not in variants:
+                raise ValueError(f"unknown ablation {selected!r}; choose from {', '.join(sorted(variants))}")
+            variant = variants[selected] or {}
+            if variant.get("workflow"):
+                raw.update(variant["workflow"])
+            if "stages" in variant:
+                raw["stages"] = variant["stages"]
+            # Actor changes support persistence and model/prompt ablations without
+            # duplicating the complete workflow YAML.
+            for actor, changes in (variant.get("actors", {}) or {}).items():
+                raw.setdefault("actors", {}).setdefault(actor, {}).update(changes or {})
+            stages = [dict(s) for s in raw.get("stages", [])]
+            removed = set(variant.get("remove", []) or [])
+            stages = [s for s in stages if s.get("name") not in removed]
+            for stage in stages:
+                if stage.get("name") in (variant.get("replace", {}) or {}):
+                    stage.update(variant["replace"][stage["name"]] or {})
+                if removed:
+                    stage["needs"] = [n for n in stage.get("needs", []) if n not in removed]
+            raw["stages"] = stages
+            raw.setdefault("parameters", {}).update(variant.get("parameters", {}) or {})
+            scale = variant.get("timeout_scale")
+            if scale is not None:
+                def scale_timeouts(node: Any) -> None:
+                    if isinstance(node, dict):
+                        if "timeout_s" in node:
+                            node["timeout_s"] = max(1, round(float(node["timeout_s"]) * float(scale)))
+                        for value in node.values():
+                            scale_timeouts(value)
+                    elif isinstance(node, list):
+                        for value in node:
+                            scale_timeouts(value)
+                scale_timeouts(stages)
+        raw.setdefault("parameters", {})["ablation"] = ",".join(names)
         return raw
 
     @staticmethod
@@ -771,22 +777,26 @@ class WorkflowRunner:
             for key in ("seed", "ablation", "variant"):
                 if key in self.workflow.parameters:
                     labels[key] = str(self.workflow.parameters[key])
+            execution_mode = (
+                "ultra" if effort == "ultra"
+                else (actor.execution_mode if actor else "standard")
+            )
             if actor is not None:
-                labels["execution_mode"] = actor.execution_mode
+                labels["execution_mode"] = execution_mode
             run_env = {
                 f"FLEET_{key.upper()}": str(self.workflow.parameters[key])
                 for key in ("seed", "ablation", "variant")
                 if key in self.workflow.parameters
             }
             if actor is not None:
-                run_env["FLEET_EXECUTION_MODE"] = actor.execution_mode
+                run_env["FLEET_EXECUTION_MODE"] = execution_mode
             if step.kind is JobKind.AGENT:
                 records += self.fleet.run_agents(
                     render(step.task, item_ctx),
                     n=1, name_prefix=name, labels=labels,
                     model=model, backend=actor.backend if actor else None,
                     effort=effort, system_prompt=actor.system_prompt if actor else None,
-                    execution_mode=actor.execution_mode if actor else "standard",
+                    execution_mode=execution_mode,
                     session_id=(self._actor_sessions.get(step.actor)
                                 if actor is not None and actor.persistent else None),
                     allowed_tools=step.allowed_tools,
