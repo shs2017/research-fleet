@@ -180,6 +180,10 @@ def render_environment_brief(
         "Use `$FLEET_WORKSPACE_DIR` as the working directory and `$FLEET_RESULTS_DIR` "
         "for writable deliverables. These variables resolve to the correct paths in "
         "both container and nono execution.",
+        "- Runtime: never execute an interpreter under `/workspace/data` (including "
+        "`/workspace/data/.venv/bin/python`). The data mount is read-only and may "
+        "be non-executable. Create a workspace-local `.analysis-venv` with `uv` "
+        "for analysis and package installation; do not modify the data mount.",
     ]
 
     if isolated:
