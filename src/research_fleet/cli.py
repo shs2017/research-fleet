@@ -921,7 +921,9 @@ def jobs(
             agent = spec.get("agent") or {}
             u = usage.get(j["job_id"], {})
             model = u.get("model") or agent.get("model") or cfg.budget.default_model or "-"
-            effort = agent.get("effort") or cfg.budget.default_effort or "-"
+            # Labels are written at submission time and preserve workflow/CLI
+            # overrides even when older serialized specs omit optional fields.
+            effort = labels.get("effort") or agent.get("effort") or cfg.budget.default_effort or "-"
             credits = codex_credits(
                 model,
                 input_tokens=u.get("input_tokens", 0),
