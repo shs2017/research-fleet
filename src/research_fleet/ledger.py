@@ -340,13 +340,13 @@ class Ledger:
         ]
 
     def jobs(self, run_id: str | None = None) -> list[dict[str, Any]]:
-        q = "SELECT job_id, run_id, name, kind, state, parent, created_at, updated_at, result FROM jobs"
+        q = "SELECT job_id, run_id, name, kind, state, parent, created_at, updated_at, spec, result FROM jobs"
         args: list[Any] = []
         if run_id:
             q += " WHERE run_id = ?"
             args.append(run_id)
         q += " ORDER BY created_at ASC"
-        cols = ["job_id", "run_id", "name", "kind", "state", "parent", "created_at", "updated_at", "result"]
+        cols = ["job_id", "run_id", "name", "kind", "state", "parent", "created_at", "updated_at", "spec", "result"]
         return [dict(zip(cols, row)) for row in self._db.execute(q, args).fetchall()]
 
     def runs(self) -> list[dict[str, Any]]:

@@ -233,6 +233,8 @@ class Fleet:
             raise ValueError(f"run {resume_from!r} has no results directory to continue")
         selected_backend = backend or self.config.agent.name
         selected_model = self.agent_model(model, selected_backend)
+        selected_effort = effort or self.config.budget.default_effort
+        selected_mode = execution_mode
         specs = []
         for i in range(n):
             specs.append(
@@ -248,8 +250,8 @@ class Fleet:
                         session_id=session_id,
                         # Passed to the harness as well as recorded as a label: the
                         # label drives cost estimation, this drives the actual run.
-                        effort=effort or self.config.budget.default_effort,
-                        execution_mode=execution_mode,
+                        effort=selected_effort,
+                        execution_mode=selected_mode,
                         max_turns=max_turns,
                         allowed_tools=list(allowed_tools) if allowed_tools else None,
                         disallowed_tools=list(disallowed_tools or []),
@@ -262,11 +264,8 @@ class Fleet:
                     worktree_base=worktree_base,
                     worktree_base_run_id=worktree_base_run_id,
                     labels={
-                        "effort": effort or self.config.budget.default_effort,
-                        "execution_mode": (
-                            "ultra" if (effort or self.config.budget.default_effort) == "ultra"
-                            else execution_mode
-                        ),
+                        "effort": selected_effort,
+                        "execution_mode": selected_mode,
                         **(labels or {}),
                     },
                 )

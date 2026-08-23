@@ -43,10 +43,6 @@ class CodexCLIBackend:
             # GPT-5.6 Sol exposes Ultra as a distinct reasoning level. Keep it
             # separate from max; Ultra also enables delegated multi-agent work.
             argv += ["-c", f'model_reasoning_effort="{agent.effort}"']
-        if agent.execution_mode == "ultra" or agent.effort == "ultra":
-            # Codex's Ultra-style execution is exposed through its multi-agent
-            # feature, independently of the underlying max reasoning setting.
-            argv += ["--enable", "multi_agent"]
         # Sandboxing is handled by the container; the CLI's own sandbox would be
         # redundant and blocks legitimate workspace writes.
         argv += ["--dangerously-bypass-approvals-and-sandbox"]
