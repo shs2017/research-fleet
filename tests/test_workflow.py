@@ -33,6 +33,7 @@ class ScriptedExecutor:
         self.isolated: list[bool] = []
         self.spans: dict[str, tuple[float, float]] = {}   # name -> (start, end)
         self.sessions: list[str | None] = []
+        self.timeouts: list[int | None] = []
         self._lock = threading.Lock()
 
     def _output_for(self, name: str) -> str:
@@ -51,6 +52,7 @@ class ScriptedExecutor:
         with self._lock:
             self.calls.append(spec.name)
             self.isolated.append(spec.isolate)
+            self.timeouts.append(spec.timeout_s)
             text = self._output_for(spec.name)
         if self.delay:
             time.sleep(self.delay)
@@ -131,6 +133,65 @@ def test_resume_allows_a_changed_runtime_deadline(tmp_path):
         assert not report.run.failed
     finally:
         resumed.close()
+
+
+def test_omitting_max_duration_s_leaves_a_slow_stage_unbounded(tmp_path):
+    """No deadline field at all -- the default -- means no timer is armed."""
+    executor = ScriptedExecutor(delay=0.2)
+    fleet = _fleet(tmp_path, executor)
+    try:
+        report = fleet.run_workflow({
+            "name": "no-deadline",
+            "stages": [{"name": "slow", "task": "sleep", "gpus": 0}],
+        })
+        assert not report.run.failed
+        assert fleet.ledger.events(run_id=report.run.run_id, types=["run.cancelled"]) == []
+    finally:
+        fleet.close()
+
+
+def test_an_unlimited_stage_is_clamped_to_the_operators_policy_ceiling_by_default(tmp_path):
+    """`timeout_s: null` on a stage means unlimited, but the operator's own
+    max_timeout_s (24h by default) still applies unless it is also nulled."""
+    stub = ScriptedExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({
+            "name": "unlimited-stage",
+            "stages": [{"name": "one", "task": "a", "gpus": 0, "timeout_s": None}],
+        })
+        assert stub.timeouts == [fleet.config.policy.max_timeout_s]
+    finally:
+        fleet.close()
+
+
+def test_a_stage_is_truly_unlimited_once_the_operator_also_nulls_the_policy_ceiling(tmp_path):
+    stub = ScriptedExecutor()
+    fleet = _fleet(tmp_path, stub, policy={"max_timeout_s": None})
+    try:
+        fleet.run_workflow({
+            "name": "unlimited-stage",
+            "stages": [{"name": "one", "task": "a", "gpus": 0, "timeout_s": None}],
+        })
+        assert stub.timeouts == [None]
+    finally:
+        fleet.close()
+
+
+def test_a_workflow_ceiling_still_clamps_an_unlimited_stage(tmp_path):
+    """An operator-set per-stage ceiling (workflow.timeout_s) still wins over an
+    individual stage's own request for no timeout."""
+    stub = ScriptedExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({
+            "name": "capped",
+            "timeout_s": 120,
+            "stages": [{"name": "one", "task": "a", "gpus": 0, "timeout_s": None}],
+        })
+        assert stub.timeouts == [120]
+    finally:
+        fleet.close()
 
 
 # ---------------------------------------------------------------- templating
@@ -342,6 +403,47 @@ def test_stages_run_in_declaration_order(tmp_path):
         assert stub.calls == ["one", "two", "three"]
         assert [o.stage for o in report.outcomes] == ["one", "two", "three"]
         assert "workflow ordered" in report.summary()
+    finally:
+        fleet.close()
+
+
+def test_workflow_summary_reports_tokens_by_type_per_stage(tmp_path):
+    stub = ScriptedExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        report = fleet.run_workflow({
+            "name": "tokened",
+            "stages": [{"name": "one", "task": "a", "gpus": 0}],
+        })
+        usage = report.stage_usage()["one"]
+        assert usage["input_tokens"] == 100
+        assert usage["output_tokens"] == 10
+        assert usage["total_tokens"] == 110
+        assert usage["models"] == ["claude-sonnet-5"]
+
+        summary = report.summary()
+        assert "110 tokens" in summary
+        assert "input=100" in summary and "output=10" in summary
+    finally:
+        fleet.close()
+
+
+def test_workflow_summary_sums_tokens_across_every_cycle_iteration(tmp_path):
+    """A stage that repeats in a cycle must be counted for every pass, not just the
+    last: `self.steps` alone only keeps the final iteration's JobResult per name."""
+    stub = ScriptedExecutor({"review": ["again", "again", "APPROVED"]})
+    fleet = _fleet(tmp_path, stub, budget={"max_usd": 50.0})
+    try:
+        with pytest.warns(UserWarning):
+            report = fleet.run_workflow({
+                "max_iterations": 3,
+                "graph": {
+                    "implement": {"task": "do it", "needs": ["review"], "gpus": 0},
+                    "review": {"task": "check it", "needs": ["implement"], "gpus": 0,
+                               "until": {"output_contains": "APPROVED"}},
+                },
+            })
+        assert report.stage_usage()["review"]["total_tokens"] == 110 * 3
     finally:
         fleet.close()
 

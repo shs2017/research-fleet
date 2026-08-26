@@ -32,7 +32,11 @@ PROJECT_CONFIG = Path("fleet.yaml")
 
 class BudgetConfig(BaseModel):
     max_usd: float = Field(50.0, gt=0, description="Ceiling for an entire run, sub-agents included.")
-    max_tokens: int = Field(100_000_000, gt=0)
+    max_tokens: int | None = Field(
+        100_000_000, gt=0,
+        description="Token ceiling for an entire run, sub-agents included. "
+                    "None (`null` in YAML) removes it.",
+    )
     default_model: str = "claude-opus-5"
     # Models a spawning agent is allowed to choose from, cheapest-first in the brief.
     delegation_models: list[str] = Field(

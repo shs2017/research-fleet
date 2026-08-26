@@ -455,6 +455,7 @@ class Ledger:
         "COALESCE(SUM(input_tokens), 0) AS input_tokens",
         "COALESCE(SUM(output_tokens), 0) AS output_tokens",
         "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens",
+        "COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens",
         "COALESCE(SUM(requests), 0) AS requests",
         "COALESCE(SUM(duration_s), 0) AS duration_s",
         "COALESCE(SUM(agent_seconds), 0) AS agent_seconds",

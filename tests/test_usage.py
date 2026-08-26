@@ -105,6 +105,24 @@ def _populate(ledger):
         ledger.upsert_job(spec, "succeeded", _result(spec, cost=cost, model=model))
 
 
+def test_totals_and_groupings_include_cache_write_tokens(tmp_path):
+    """Every token type must survive aggregation, not just input/output/cache_read --
+    reporting "tokens by type" is meaningless if one type is silently dropped."""
+    ledger = Ledger(tmp_path)
+    spec = _spec(name="plan")
+    result = _result(spec, tokens=1000)
+    result.usage["cache_write_tokens"] = 4_000
+    result.usage["total_tokens"] = 1000 + 100 + 50 + 4_000
+    ledger.upsert_job(spec, "succeeded", result)
+
+    totals = ledger.usage_totals()
+    assert totals["cache_write_tokens"] == 4_000
+
+    by_stage = ledger.usage_by("stage")
+    assert by_stage[0]["cache_write_tokens"] == 4_000
+    ledger.close()
+
+
 def test_totals_sum_everything(tmp_path):
     ledger = Ledger(tmp_path)
     _populate(ledger)

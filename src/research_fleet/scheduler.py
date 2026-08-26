@@ -6,6 +6,7 @@ Every workflow job follows the same policy, budget, scheduling, and ledger path.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -23,6 +24,22 @@ from .ledger import Ledger
 from .policy import Decision, Policy
 from .spec import JobKind, JobResult, JobSpec, JobState, Mount, new_id
 from . import isolation, runlayout, sharedprompt
+
+
+def _token_grant(policy_cap: int | None, parent_share: float) -> int | None:
+    """Combine a policy per-job token ceiling with a parent scope's headroom.
+
+    `parent_share` may be `math.inf` when the parent scope is itself unlimited.
+    The result is `None` (unlimited) only when neither side bounds it; otherwise
+    it is the tighter of the two, as a concrete int.
+    """
+    if policy_cap is None and parent_share == math.inf:
+        return None
+    if policy_cap is None:
+        return int(parent_share)
+    if parent_share == math.inf:
+        return policy_cap
+    return int(min(policy_cap, parent_share))
 
 
 class SlotPool:
@@ -299,7 +316,7 @@ class Scheduler:
         if spec.kind is not JobKind.AGENT or spec.agent is None:
             return None
         process = spec.labels.get("process") or (
-            "agent_long" if spec.timeout_s > 4 * 3600 else "agent_standard"
+            "agent_long" if spec.timeout_s is None or spec.timeout_s > 4 * 3600 else "agent_standard"
         )
         model = spec.agent.model or self.config.budget.default_model
         return quote(
@@ -522,11 +539,9 @@ class Scheduler:
             self.policy.max_usd_per_job,
             parent_node.remaining_usd * 0.5 + rec.reserved_usd,
         )
-        grant_tokens = int(
-            min(
-                self.policy.max_tokens_per_job,
-                parent_node.remaining_tokens * 0.5 + rec.reserved_tokens,
-            )
+        grant_tokens = _token_grant(
+            self.policy.max_tokens_per_job,
+            parent_node.remaining_tokens * 0.5 + rec.reserved_tokens,
         )
         child_scope = f"{spec.id}"
         # Move the reservation into the child scope instead of charging it twice.
@@ -538,7 +553,8 @@ class Scheduler:
             self.budget.open(
                 child_scope,
                 max_usd=min(grant_usd, parent_node.remaining_usd),
-                max_tokens=min(grant_tokens, parent_node.remaining_tokens),
+                max_tokens=(grant_tokens if grant_tokens is None
+                            else min(grant_tokens, parent_node.remaining_tokens)),
                 parent=parent_scope,
             )
         rec.budget_scope = child_scope
@@ -546,7 +562,9 @@ class Scheduler:
         node = self.budget.get(child_scope)
 
         env["FLEET_BUDGET_USD"] = f"{node.remaining_usd:.4f}"
-        env["FLEET_BUDGET_TOKENS"] = str(node.remaining_tokens)
+        env["FLEET_BUDGET_TOKENS"] = (
+            "unlimited" if node.remaining_tokens == math.inf else str(node.remaining_tokens)
+        )
 
         brief = self._agent_brief(rec, node.remaining_usd, node.remaining_tokens)
         return backend.build_command(spec.agent, brief=brief), env

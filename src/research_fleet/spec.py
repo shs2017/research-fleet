@@ -128,7 +128,9 @@ class JobSpec(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict, description="Caller metadata recorded verbatim in the ledger.")
     labels: dict[str, str] = Field(default_factory=dict)
 
-    timeout_s: int = Field(3600, gt=0)
+    timeout_s: int | None = Field(
+        3600, gt=0, description="Wall-clock limit for the job. None means no timeout."
+    )
     parent_job_id: str | None = Field(None, description="Set when an agent job submits this one.")
 
     created_at: float = Field(default_factory=time.time)

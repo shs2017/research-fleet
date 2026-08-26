@@ -169,6 +169,43 @@ def test_child_cannot_exceed_parent_grant():
         b.open("agent2", max_usd=9.0, max_tokens=10_000, parent="run")
 
 
+def test_unlimited_root_scope_never_rejects_a_reservation():
+    b = BudgetTracker()
+    b.open("run", max_usd=10.0, max_tokens=None)
+    b.reserve("run", usd=1.0, tokens=50_000_000)  # would exceed any ordinary ceiling
+    node = b.get("run")
+    assert node.remaining_tokens == float("inf")
+    assert node.to_dict()["max_tokens"] is None
+    assert node.to_dict()["remaining_tokens"] is None
+
+
+def test_child_requesting_unlimited_from_a_finite_parent_is_capped_at_its_remainder():
+    b = BudgetTracker()
+    b.open("run", max_usd=10.0, max_tokens=1_000)
+    b.reserve("run", usd=0.0, tokens=200)          # 800 left
+    child = b.open("agent", max_usd=1.0, max_tokens=None, parent="run")
+    assert child.max_tokens == 800
+    with pytest.raises(BudgetExceeded):
+        b.reserve("agent", usd=0.0, tokens=801)
+
+
+def test_child_requesting_unlimited_from_an_unlimited_parent_stays_unlimited():
+    b = BudgetTracker()
+    b.open("run", max_usd=10.0, max_tokens=None)
+    child = b.open("agent", max_usd=1.0, max_tokens=None, parent="run")
+    assert child.max_tokens is None
+    b.reserve("agent", usd=0.0, tokens=10_000_000)  # never rejected
+    assert b.get("run").remaining_tokens == float("inf")
+
+
+def test_closing_an_unlimited_child_does_not_corrupt_the_parents_reservations():
+    b = BudgetTracker()
+    b.open("run", max_usd=10.0, max_tokens=None)
+    b.open("agent", max_usd=1.0, max_tokens=None, parent="run")
+    b.close("agent")  # must not raise (e.g. TypeError subtracting None)
+    assert b.get("run").remaining_tokens == float("inf")
+
+
 def test_spend_rolls_up_to_ancestors():
     b = BudgetTracker()
     b.open("run", max_usd=10.0, max_tokens=10_000_000)
@@ -235,11 +272,40 @@ def test_policy_clamps_timeout_instead_of_denying():
     assert d.mutations["timeout_s"] == 100
 
 
+def test_policy_clamps_an_unlimited_stage_to_its_own_ceiling():
+    """A stage asking for no timeout is still bounded by the operator's policy."""
+    p = Policy(max_timeout_s=100)
+    d = p.check(JobSpec(name="c", command=["true"], timeout_s=None))
+    assert d.verdict == "allow"
+    assert d.mutations["timeout_s"] == 100
+
+
+def test_policy_with_no_ceiling_leaves_an_unlimited_stage_unlimited():
+    """Only an operator explicitly nulling max_timeout_s makes unlimited stick."""
+    p = Policy(max_timeout_s=None)
+    d = p.check(JobSpec(name="c", command=["true"], timeout_s=None))
+    assert d.verdict == "allow"
+    assert "timeout_s" not in d.mutations
+
+
+def test_policy_with_no_ceiling_still_clamps_a_finite_but_normal_timeout():
+    p = Policy(max_timeout_s=None)
+    d = p.check(JobSpec(name="c", command=["true"], timeout_s=3600))
+    assert d.verdict == "allow"
+    assert "timeout_s" not in d.mutations
+
+
 def test_policy_denies_over_budget_estimate():
     p = Policy(max_usd_per_job=0.001)
     d = p.check(_agent_spec(), estimate=quote("claude-opus-5", process="agent_long"))
     assert d.verdict == "deny"
     assert "max_usd_per_job" in d.reasons[0]
+
+
+def test_policy_with_no_token_ceiling_never_denies_on_tokens():
+    p = Policy(max_tokens_per_job=None, max_usd_per_job=1_000_000.0)
+    d = p.check(_agent_spec(), estimate=quote("claude-opus-5", process="agent_long"))
+    assert d.verdict == "allow"
 
 
 def test_container_policy_stays_out_of_the_ship_contract():

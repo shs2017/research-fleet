@@ -125,13 +125,55 @@ class WorkflowReport:
     steps: dict[str, JobResult]
     run: RunReport
 
+    def stage_usage(self) -> dict[str, dict[str, Any]]:
+        """Per-stage token/type/cost totals, summed across every iteration and copy.
+
+        `self.steps` holds only the latest `JobResult` per stage name, which is the
+        last iteration alone for a stage that repeated in a cycle. This instead
+        walks each `StageOutcome.job_ids` -- every job the stage ever ran -- against
+        `self.run.results` (keyed by job id, so every iteration is present) and sums
+        the `Usage.to_dict()` fields on each.
+        """
+        totals: dict[str, dict[str, Any]] = {}
+        for outcome in self.outcomes:
+            agg = {
+                "requests": 0, "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_write_tokens": 0, "total_tokens": 0,
+                "cost_usd": 0.0,
+            }
+            models: set[str] = set()
+            for job_id in outcome.job_ids:
+                result = self.run.results.get(job_id)
+                usage = result.usage if result and isinstance(result.usage, dict) else {}
+                for key in (
+                    "requests", "input_tokens", "output_tokens",
+                    "cache_read_tokens", "cache_write_tokens", "total_tokens",
+                ):
+                    agg[key] += usage.get(key) or 0
+                agg["cost_usd"] += usage.get("cost_usd") or 0.0
+                if usage.get("model"):
+                    models.add(usage["model"])
+            agg["models"] = sorted(models)
+            totals[outcome.stage] = agg
+        return totals
+
     def summary(self) -> str:
         lines = [f"workflow {self.workflow}"]
+        usage = self.stage_usage()
         for outcome in self.outcomes:
             detail = f"{outcome.iterations} iteration(s)" if outcome.iterations > 1 else ""
             if outcome.stopped_early:
                 detail += ", stopped early"
             lines.append(f"  {outcome.stage:<24} {len(outcome.job_ids)} job(s) {detail}".rstrip())
+            u = usage.get(outcome.stage) or {}
+            if u.get("total_tokens"):
+                models = "/".join(u["models"]) or "unpriced"
+                lines.append(
+                    f"    {u['total_tokens']:,} tokens [{models}]: "
+                    f"input={u['input_tokens']:,} output={u['output_tokens']:,} "
+                    f"cache_read={u['cache_read_tokens']:,} cache_write={u['cache_write_tokens']:,}  "
+                    f"${u['cost_usd']:,.4f}"
+                )
         lines.append(self.run.summary())
         return "\n".join(lines)
 
@@ -204,7 +246,7 @@ class Fleet:
         gpus: float = 1.0,
         cpus: float | None = None,
         image: str | None = None,
-        timeout_s: int = 3600,
+        timeout_s: int | None = 3600,
         max_turns: int | None = None,
         allowed_tools: Sequence[str] | None = None,
         disallowed_tools: Sequence[str] | None = None,
@@ -291,7 +333,7 @@ class Fleet:
         gpus: float = 1.0,
         cpus: float | None = None,
         image: str | None = None,
-        timeout_s: int = 3600,
+        timeout_s: int | None = 3600,
         env: dict[str, str] | None = None,
         mounts: Sequence[Mount] | None = None,
         isolate: bool | None = None,

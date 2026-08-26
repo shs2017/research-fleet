@@ -79,7 +79,9 @@ class Step(BaseModel):
     allowed_tools: list[str] | None = None
     disallowed_tools: list[str] = Field(default_factory=list)
     gpus: float = 1.0
-    timeout_s: int = 3600
+    timeout_s: int | None = Field(
+        3600, gt=0, description="Wall-clock limit for this stage. None (`null` in YAML) means unlimited."
+    )
     isolate: bool | None = None
     needs: list[str] = Field(default_factory=list)
     actor: str | None = Field(
@@ -152,10 +154,23 @@ class Workflow(BaseModel):
     effort: str | None = None
     gpus: float | None = None
     isolate: bool | None = None
-    timeout_s: int | None = Field(None, gt=0, description="Maximum seconds allowed for each stage.")
-    max_duration_s: int | None = Field(None, gt=0, description="Maximum seconds for the complete workflow run.")
+    timeout_s: int | None = Field(
+        None, gt=0,
+        description="Ceiling on every stage's own timeout_s (the lower of the two wins). "
+                    "None (the default, or `null` in YAML) leaves each stage's own "
+                    "timeout_s -- itself nullable -- as the only limit.",
+    )
+    max_duration_s: int | None = Field(
+        None, gt=0,
+        description="Wall-clock deadline for the complete workflow run, cancelling every "
+                    "outstanding job once it elapses. None (the default, or `null` in YAML) "
+                    "means the run has no overall deadline.",
+    )
     max_iterations: int = Field(
-        3, ge=1, description="Default cap on how many times a cycle repeats."
+        3, ge=1,
+        description="Default cap on how many times a cycle repeats. Always a positive, "
+                    "finite integer by design: this is what still bounds total work when "
+                    "timeout_s and max_duration_s are left unlimited.",
     )
 
     _graph_nodes: set[str] = PrivateAttr(default_factory=set)
@@ -377,7 +392,7 @@ class Workflow(BaseModel):
             if scale is not None:
                 def scale_timeouts(node: Any) -> None:
                     if isinstance(node, dict):
-                        if "timeout_s" in node:
+                        if node.get("timeout_s") is not None:
                             node["timeout_s"] = max(1, round(float(node["timeout_s"]) * float(scale)))
                         for value in node.values():
                             scale_timeouts(value)
@@ -753,7 +768,13 @@ class WorkflowRunner:
                 )
         gpus = self.workflow.gpus if step.gpus == 1.0 and self.workflow.gpus is not None else step.gpus
         isolate = step.isolate if step.isolate is not None else self.workflow.isolate
-        timeout_s = min(step.timeout_s, self.workflow.timeout_s) if self.workflow.timeout_s else step.timeout_s
+        # Either side may be None ("unlimited"); None only survives if both are.
+        if step.timeout_s is None:
+            timeout_s = self.workflow.timeout_s
+        elif self.workflow.timeout_s is None:
+            timeout_s = step.timeout_s
+        else:
+            timeout_s = min(step.timeout_s, self.workflow.timeout_s)
         if isolate is None:
             isolate = self.fleet.config.isolate_agents
         items = list(step.for_each) if step.for_each else list(range(step.copies))

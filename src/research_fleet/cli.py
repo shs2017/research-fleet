@@ -143,6 +143,15 @@ def _cpu_share(requested: Optional[float], agents: int) -> tuple[float, str]:
     return share, f"{share:.2f} CPU(s) each on {total} core(s)"
 
 
+def _optional_seconds(value: Optional[int], param_hint: str) -> Optional[int]:
+    """Seconds for a CLI timeout-like flag; `0` is the explicit spelling of unlimited."""
+    if value is None:
+        return None
+    if value < 0:
+        raise typer.BadParameter("must be 0 (unlimited) or positive", param_hint=param_hint)
+    return value or None
+
+
 def _overrides(workspace=None, image=None, executor=None, max_usd=None) -> dict:
     """Map run flags onto config overrides."""
     out: dict = {"workspace": workspace, "image": image}
@@ -226,7 +235,9 @@ def run(
     ),
     workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
     image: Optional[str] = typer.Option(None, "--image"),
-    timeout: int = typer.Option(3600, "--timeout", help="Per-agent wall clock, seconds."),
+    timeout: Optional[int] = typer.Option(
+        3600, "--timeout", help="Per-agent wall clock, seconds. 0 means unlimited."
+    ),
     max_usd: Optional[float] = typer.Option(None, "--max-usd", help="Budget ceiling for the whole run."),
     executor: Optional[str] = typer.Option(
         None, "--executor", help="ship | nono | direct | dry-run", autocompletion=_EXECUTORS
@@ -249,6 +260,7 @@ def run(
     if detach:
         _detach_and_return(config)
         return
+    timeout_s = _optional_seconds(timeout, "--timeout")
 
     with _fleet(
         config, **_overrides(workspace, image, executor, max_usd),
@@ -271,7 +283,7 @@ def run(
         try:
             fleet.run_agents(
                 task, n=agents, model=model, backend=backend, effort=effort,
-                gpus=share, cpus=cpu_share, timeout_s=timeout,
+                gpus=share, cpus=cpu_share, timeout_s=timeout_s,
                 resume_from=resume_from,
             )
         except CredentialsUnavailable as exc:
@@ -296,7 +308,15 @@ def workflow(
         autocompletion=_EFFORTS,
     ),
     max_duration: Optional[int] = typer.Option(
-        None, "--max-duration", help="Maximum whole-workflow runtime in seconds."
+        None, "--max-duration",
+        help="Maximum whole-workflow runtime in seconds. 0 means unlimited "
+             "(still bounded by max_iterations).",
+    ),
+    stage_timeout: Optional[int] = typer.Option(
+        None, "--stage-timeout",
+        help="Ceiling on every stage's own timeout, seconds. 0 means unlimited, "
+             "leaving each stage's own timeout_s (also overridable per-stage in the "
+             "YAML) as the only limit.",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
     plan: bool = typer.Option(False, "--plan", help="Validate and print the stages, run nothing."),
@@ -331,9 +351,9 @@ def workflow(
             if hasattr(stage, "effort"):
                 stage.effort = effort
     if max_duration is not None:
-        if max_duration <= 0:
-            raise typer.BadParameter("must be positive", param_hint="--max-duration")
-        wf.max_duration_s = max_duration
+        wf.max_duration_s = _optional_seconds(max_duration, "--max-duration")
+    if stage_timeout is not None:
+        wf.timeout_s = _optional_seconds(stage_timeout, "--stage-timeout")
     for assignment in parameter:
         if "=" not in assignment:
             raise typer.BadParameter("workflow parameters must use key=value", param_hint="--set")
@@ -462,7 +482,8 @@ def cost(
             f"${row['input_per_mtok']:.2f}", f"${row['output_per_mtok']:.2f}",
         )
     console.print(table)
-    console.print(f"[dim]Run budget ceiling: ${cfg.budget.max_usd:.2f} / {cfg.budget.max_tokens:,} tokens[/dim]")
+    token_ceiling = "unlimited" if cfg.budget.max_tokens is None else f"{cfg.budget.max_tokens:,}"
+    console.print(f"[dim]Run budget ceiling: ${cfg.budget.max_usd:.2f} / {token_ceiling} tokens[/dim]")
 
 
 def _detach_and_return(config: Optional[str]) -> None:
@@ -769,30 +790,37 @@ def usage(
         if jobs:
             rows = ledger.usage_rows(run_id=run_id, since=since, kind=kind)
             table = Table(title="jobs")
-            for col in ("run", "stage", "try", "model", "tokens", "cost",
-                        "agent_s", "wall_s", "gpu_s", "state"):
+            for col in ("run", "stage", "try", "model", "tokens", "input", "output",
+                        "cache_rd", "cache_wr", "cost", "agent_s", "wall_s", "gpu_s", "state"):
                 table.add_column(col)
             for r in rows:
                 table.add_row(
                     (r["run_id"] or "")[-8:], r["stage"] or r["name"], str(r["attempt"]),
                     (r["model"] or "-").replace("claude-", ""),
-                    f"{r['total_tokens']:,}", f"${r['cost_usd']:.4f}",
+                    f"{r['total_tokens']:,}", f"{r['input_tokens']:,}", f"{r['output_tokens']:,}",
+                    f"{r['cache_read_tokens']:,}", f"{r['cache_write_tokens']:,}",
+                    f"${r['cost_usd']:.4f}",
                     f"{(r['agent_seconds'] or 0):.0f}", f"{(r['duration_s'] or 0):.0f}",
                     f"{r['gpu_seconds']:.0f}", r["state"],
                 )
             console.print(table)
         else:
+            # Token *type* (input / output / cache read / cache write), not just the
+            # total, so this is the one place a stage's spend is fully accounted for.
             grouped = ledger.usage_by(by, run_id=run_id, since=since, kind=kind)
             keys = [k.strip() for k in by.split(",") if k.strip()]
             table = Table(title=f"usage by {by}")
             for key in keys:
                 table.add_column(key)
-            for col in ("jobs", "tokens", "cost", "agent_s", "wall_s", "gpu_s"):
+            for col in ("jobs", "tokens", "input", "output", "cache_rd", "cache_wr",
+                        "cost", "agent_s", "wall_s", "gpu_s"):
                 table.add_column(col, justify="right")
             for r in grouped:
                 cells = [str(r[k] if r[k] is not None else "-")[-24:] for k in keys]
                 table.add_row(
                     *cells, str(r["jobs"]), f"{r['total_tokens']:,}",
+                    f"{r['input_tokens']:,}", f"{r['output_tokens']:,}",
+                    f"{r['cache_read_tokens']:,}", f"{r['cache_write_tokens']:,}",
                     f"${r['cost_usd']:.4f}", f"{r['agent_seconds']:.0f}",
                     f"{r['duration_s']:.0f}", f"{r['gpu_seconds']:.0f}",
                 )
@@ -801,7 +829,9 @@ def usage(
         total = ledger.usage_totals(run_id=run_id, since=since, kind=kind)
         console.print(
             f"[bold]{total['jobs']} job(s)[/bold]  ${total['cost_usd']:.4f}  "
-            f"{total['total_tokens']:,} tokens  "
+            f"{total['total_tokens']:,} tokens "
+            f"({total['input_tokens']:,} input, {total['output_tokens']:,} output, "
+            f"{total['cache_read_tokens']:,} cache read, {total['cache_write_tokens']:,} cache write)  "
             f"{total['agent_seconds']:.0f}s agent / {total['duration_s']:.0f}s wall  "
             f"{total['gpu_seconds']:.0f} GPU-seconds  "
             f"{total['requests']} request(s)"

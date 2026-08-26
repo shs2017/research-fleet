@@ -60,7 +60,6 @@ def test_codex_keeps_high_distinct_from_max(codex):
 def test_codex_accepts_ultra_reasoning(codex):
     command = codex.build_command(AgentConfig(task="t", effort="ultra"))
     assert command[command.index("-c") + 1] == 'model_reasoning_effort="ultra"'
-    assert command[command.index("--enable") + 1] == "multi_agent"
 
 
 def test_codex_resumes_an_explicit_session(codex):

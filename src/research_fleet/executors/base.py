@@ -34,14 +34,18 @@ def run_process(
     argv: list[str],
     *,
     env: dict[str, str],
-    timeout_s: int,
+    timeout_s: int | None,
     on_line: LineHandler,
     on_start: Callable[[subprocess.Popen], None],
     on_timeout: Callable[[], None],
     stderr_tail_size: int = 0,
     cwd: str | None = None,
 ) -> ProcessOutcome:
-    """Run and stream a subprocess with the lifecycle shared by local executors."""
+    """Run and stream a subprocess with the lifecycle shared by local executors.
+
+    `timeout_s=None` waits indefinitely -- `Popen.wait(timeout=None)` blocks rather
+    than polling, so an unlimited job never spins.
+    """
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1, env=env, cwd=cwd,

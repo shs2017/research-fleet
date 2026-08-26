@@ -86,10 +86,17 @@ class Policy(BaseModel):
 
     max_gpus_per_job: float = Field(8.0, gt=0)
     max_memory_gb_per_job: float = Field(256.0, gt=0)
-    max_timeout_s: int = Field(24 * 3600, gt=0)
+    max_timeout_s: int | None = Field(
+        24 * 3600, gt=0,
+        description="Hard ceiling every job's timeout_s is clamped to, including an "
+                    "unlimited (None) request from the job itself. None removes the "
+                    "ceiling entirely -- an operator opt-in, not a job-level one.",
+    )
 
     max_usd_per_job: float = Field(25.0, gt=0)
-    max_tokens_per_job: int = Field(20_000_000, gt=0)
+    max_tokens_per_job: int | None = Field(
+        20_000_000, gt=0, description="None removes the per-job token ceiling."
+    )
 
     allowed_mount_roots: list[str] = Field(default_factory=list)
     deny_mount_paths: list[str] = Field(
@@ -142,9 +149,11 @@ class Policy(BaseModel):
         error = self._limit_error(spec, depth, sibling_count)
         if error:
             return Decision("deny", [error])
-        if spec.timeout_s > self.max_timeout_s:
+        if self.max_timeout_s is not None and (
+            spec.timeout_s is None or spec.timeout_s > self.max_timeout_s
+        ):
             mutations["timeout_s"] = self.max_timeout_s
-            reasons.append(f"timeout clamped {spec.timeout_s}s -> {self.max_timeout_s}s")
+            reasons.append(f"timeout clamped {spec.timeout_s or 'unlimited'}s -> {self.max_timeout_s}s")
 
         mount_error, outside_rw = self._mount_error(spec, workspace_roots)
         if mount_error:
@@ -171,7 +180,7 @@ class Policy(BaseModel):
                     [f"estimated ${estimate.est_cost_usd:.2f} exceeds max_usd_per_job=${self.max_usd_per_job:.2f}"],
                 )
             est_tokens = estimate.est_input_tokens + estimate.est_output_tokens
-            if est_tokens > self.max_tokens_per_job:
+            if self.max_tokens_per_job is not None and est_tokens > self.max_tokens_per_job:
                 return Decision(
                     "deny",
                     [f"estimated {est_tokens:,} tokens exceeds max_tokens_per_job={self.max_tokens_per_job:,}"],

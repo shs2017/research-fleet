@@ -40,8 +40,8 @@ class CodexCLIBackend:
         if agent.effort:
             # Codex CLI exposes config keys through `-c`; keep this separate from
             # the prompt so the requested reasoning level actually reaches the model.
-            # GPT-5.6 Sol exposes Ultra as a distinct reasoning level. Keep it
-            # separate from max; Ultra also enables delegated multi-agent work.
+            # GPT-5.6 Sol exposes Ultra as a distinct reasoning level, kept separate
+            # from max.
             argv += ["-c", f'model_reasoning_effort="{agent.effort}"']
         # Sandboxing is handled by the container; the CLI's own sandbox would be
         # redundant and blocks legitimate workspace writes.
