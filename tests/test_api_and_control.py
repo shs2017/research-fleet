@@ -276,6 +276,133 @@ def test_jobs_filters_states_and_log_replays_a_job(tmp_path):
     assert "job.succeeded" in followed.stdout
 
 
+def test_jobs_across_all_runs_shows_the_full_run_id(tmp_path, monkeypatch):
+    """The run column is what you copy into `fleet kill <run_id>`; a truncated
+    suffix is the wrong thing to show there. A wide COLUMNS keeps Rich from
+    wrapping/ellipsizing the cell for its own display reasons, which would
+    otherwise be indistinguishable here from the bug this pins."""
+    from typer.testing import CliRunner
+
+    from research_fleet import cli
+
+    monkeypatch.setenv("COLUMNS", "300")
+    config = tmp_path / "fleet.yaml"
+    root = tmp_path / "state"
+    config.write_text(f"root: {root}\n")
+    run_id = "run_abcdef0123456789"
+    with Ledger(root) as ledger:
+        ledger.upsert_job(JobSpec(id="job_x", run_id=run_id, name="x", command=["true"]), "succeeded")
+
+    result = CliRunner().invoke(cli.app, ["jobs", "-c", str(config)])
+    assert result.exit_code == 0
+    assert run_id in result.stdout
+
+
+def test_jobs_does_not_crash_for_a_model_with_no_codex_credit_rate(tmp_path):
+    """`credits` is None for any non-Codex model (every Claude model, for one),
+    a different axis from `unpriced` -- a priced-in-USD Claude job used to crash
+    the whole table instead of just omitting the Codex-credits figure."""
+    from typer.testing import CliRunner
+
+    from research_fleet import cli
+    from research_fleet.spec import JobResult
+
+    config = tmp_path / "fleet.yaml"
+    root = tmp_path / "state"
+    config.write_text(f"root: {root}\n")
+    with Ledger(root) as ledger:
+        spec = JobSpec(
+            id="job_claude", run_id="run_one", name="x", kind=JobKind.AGENT,
+            agent=AgentConfig(task="t", backend="claude-cli", model="claude-opus-5"),
+        )
+        result = JobResult(
+            job_id=spec.id, state=JobState.SUCCEEDED, started_at=0.0, ended_at=1.0,
+            usage={"model": "claude-opus-5", "input_tokens": 100, "output_tokens": 20,
+                   "total_tokens": 120, "cost_usd": 0.005, "unpriced_model": False},
+        )
+        ledger.upsert_job(spec, "succeeded", result)
+
+    out = CliRunner().invoke(cli.app, ["jobs", "-c", str(config)])
+    assert out.exit_code == 0, out.output
+    assert "$0.0050" in out.stdout
+    assert "credits" not in out.stdout
+
+
+def test_kill_actually_stops_a_real_host_process_and_says_so(tmp_path):
+    """A host/nono job's PID file names a real process; `kill` must terminate it
+    (not just claim to) and must not call it a stale entry once it does."""
+    import os
+    import signal
+    import subprocess
+    import time
+
+    from typer.testing import CliRunner
+
+    from research_fleet import cli
+
+    def is_running(pid: int) -> bool:
+        try:
+            with open(f"/proc/{pid}/stat") as fh:
+                state = fh.read().rsplit(")", 1)[1].split()[0]
+            return state != "Z"
+        except FileNotFoundError:
+            return False
+
+    root = tmp_path / "state"
+    run_id = "run_hostkill"
+    with Ledger(root) as ledger:
+        ledger.upsert_job(
+            JobSpec(id="job_hostkill", run_id=run_id, name="sleeper", command=["sleep", "300"]),
+            "running",
+        )
+
+    proc = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    pid_dir = root / "nono" / "pids" / run_id
+    pid_dir.mkdir(parents=True)
+    (pid_dir / "job_hostkill.pid").write_text(f"{proc.pid}\n")
+    assert is_running(proc.pid)
+
+    try:
+        result = CliRunner().invoke(cli.app, ["kill", run_id, "--root", str(root)])
+        assert result.exit_code == 0, result.output
+        assert "1 host job(s) stopped" in result.output
+        assert "stale entries" not in result.output, \
+            "a job that really was running must not be reported as a stale entry"
+
+        for _ in range(20):
+            if not is_running(proc.pid):
+                break
+            time.sleep(0.1)
+        assert not is_running(proc.pid), "the real process must actually be terminated"
+
+        with Ledger(root) as ledger:
+            assert ledger.jobs(run_id)[0]["state"] == "cancelled"
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.wait(timeout=5)
+
+
+def test_kill_still_recognises_a_genuinely_stale_run(tmp_path):
+    """No container, no host PID file: the run really is stale, and the message
+    saying so should still fire."""
+    from typer.testing import CliRunner
+
+    from research_fleet import cli
+
+    root = tmp_path / "state"
+    run_id = "run_stale"
+    with Ledger(root) as ledger:
+        ledger.upsert_job(JobSpec(id="job_stale", run_id=run_id, name="ghost", command=["true"]), "running")
+
+    result = CliRunner().invoke(cli.app, ["kill", run_id, "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "0 host job(s) stopped" in result.output
+    assert "stale entries" in result.output
+
+
 def test_trace_returns_one_jobs_events_in_order(tmp_path):
     fleet = _fleet(tmp_path)
     try:

@@ -760,7 +760,7 @@ def kill(
                      f"{len(host_pids)} host job(s) stopped"]
             parts.append(f"{len(marked)} job(s) marked cancelled")
             console.print(f"[yellow]{target}[/yellow]: " + ", ".join(parts))
-            if not containers and marked:
+            if not containers and not host_pids and marked:
                 console.print(
                     "[dim]  nothing was running; those jobs were stale entries whose "
                     "scheduler had already gone[/dim]"
@@ -961,22 +961,34 @@ def jobs(
                 output_tokens=u.get("output_tokens", 0),
             ) if u else None
             identity = f"{labels.get('seed', '-')} / {labels.get('ablation', '-')}"
+            if u and not u.get("unpriced"):
+                # `credits` is Codex-subscription-specific and None for any model
+                # outside CODEX_CREDIT_RATES (every Claude model, for instance) --
+                # a wholly different axis from `unpriced` (no USD price-table entry
+                # at all), so it needs its own None check rather than reusing that.
+                usage_cell = (
+                    f"{u.get('input_tokens', 0):,} / {u.get('cache_read_tokens', 0):,} / "
+                    f"{u.get('cache_write_tokens', 0):,} / {u.get('output_tokens', 0):,} / "
+                    f"{u.get('total_tokens', 0):,} / "
+                    f"${u.get('cost_usd', 0.0):.4f}"
+                    + (f" / {credits:.2f} credits" if credits is not None else "")
+                )
+            else:
+                usage_cell = "unpriced" if u else "-"
             values = [
                 j["job_id"],
                 labels.get("stage") or j["name"],
                 str(labels.get("attempt") or "1"),
                 identity,
-            f"{model} / {effort} / {labels.get('execution_mode', 'standard')}",
+                f"{model} / {effort} / {labels.get('execution_mode', 'standard')}",
                 f"[{colour}]{j['state']}[/{colour}]",
-                (f"{u.get('input_tokens', 0):,} / {u.get('cache_read_tokens', 0):,} / "
-                 f"{u.get('cache_write_tokens', 0):,} / {u.get('output_tokens', 0):,} / "
-                 f"{u.get('total_tokens', 0):,} / "
-                 f"${u.get('cost_usd', 0.0):.4f} / "
-                 f"{credits:.2f} credits" if u and not u.get("unpriced") else
-                 ("unpriced" if u else "-")),
+                usage_cell,
             ]
             if not run_id:
-                values.insert(1, (j.get("run_id") or "-")[-8:])
+                # The full id, not a truncated suffix: this is what you copy
+                # straight into `fleet kill <run_id>`, and a shortened one
+                # risks colliding with another run's suffix.
+                values.insert(1, j.get("run_id") or "-")
             table.add_row(*values)
         console.print(table)
         total = ledger.usage_totals(run_id=run_id)

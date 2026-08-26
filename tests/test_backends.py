@@ -218,6 +218,16 @@ def test_claude_passes_tool_restrictions_through(claude):
     assert argv[argv.index("--max-turns") + 1] == "3"
 
 
+def test_claude_accepts_ultra_reasoning(claude):
+    argv = claude.build_command(AgentConfig(task="t", effort="ultra"))
+    assert argv[argv.index("--effort") + 1] == "ultra"
+
+
+def test_claude_omits_the_effort_flag_when_unset(claude):
+    argv = claude.build_command(AgentConfig(task="t"))
+    assert "--effort" not in argv
+
+
 def test_agent_event_to_ledger_omits_empty_fields(claude):
     ev = claude.parse_line(json.dumps({"type": "assistant", "message": {"content": []}}))
     assert ev.to_ledger() == {}
