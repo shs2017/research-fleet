@@ -31,7 +31,11 @@ PROJECT_CONFIG = Path("fleet.yaml")
 
 
 class BudgetConfig(BaseModel):
-    max_usd: float = Field(50.0, gt=0, description="Ceiling for an entire run, sub-agents included.")
+    max_usd: float | None = Field(
+        50.0, gt=0,
+        description="Dollar ceiling for an entire run, sub-agents included. "
+                    "None (`null` in YAML) removes it.",
+    )
     max_tokens: int | None = Field(
         100_000_000, gt=0,
         description="Token ceiling for an entire run, sub-agents included. "

@@ -88,6 +88,18 @@ class Step(BaseModel):
         None,
         description="Named workflow actor whose provider conversation runs this agent step.",
     )
+    reset_session_after: bool = Field(
+        False,
+        description=(
+            "Once this stage succeeds, forget its actor's persistent session, even "
+            "though the actor stays `persistent: true` overall. The next stage that "
+            "uses the same actor gets a fresh provider conversation instead of "
+            "resuming; stages before this point in the same pass are unaffected. "
+            "Lets a cycle share one conversation across the stages within a single "
+            "pass while still starting fresh at the top of the next pass -- put it "
+            "on the last stage of a cycle that should reset per iteration."
+        ),
+    )
 
     until: Condition | None = Field(
         None, description="Stop repeating once this holds of the node's own output."
@@ -653,11 +665,27 @@ class WorkflowRunner:
                     outcome.iterations = iteration
                     outcome.job_ids.append(result.job_id)
                     step = self._step_named(name)
-                    if step and step.actor and result.session_id:
-                        actor = self.workflow.actors[step.actor]
-                        if actor.persistent:
-                            self._actor_sessions[step.actor] = result.session_id
-                        self._actors_started.add(step.actor)
+                    if step and step.actor:
+                        if result.session_id:
+                            actor = self.workflow.actors[step.actor]
+                            if actor.persistent:
+                                self._actor_sessions[step.actor] = result.session_id
+                            self._actors_started.add(step.actor)
+                        if step.reset_session_after:
+                            # Mirrors _record()'s own reset: a replayed stage
+                            # that was marked to reset its actor's session
+                            # must still do so, not just a live one, or the
+                            # first stage recovery hands back to a live call
+                            # would wrongly resume a session this step was
+                            # meant to have already forgotten.
+                            forgotten = self._actor_sessions.pop(step.actor, None)
+                            self._actors_started.discard(step.actor)
+                            self.fleet.ledger.append(
+                                "workflow.session_reset",
+                                {"stage": name, "actor": step.actor,
+                                 "forgotten_session_id": forgotten, "replayed": True},
+                                run_id=self.fleet.run_id,
+                            )
                     branch = result.worktree_branch
                     if branch:
                         prefix = f"fleet/{prior_run}-"
@@ -812,14 +840,28 @@ class WorkflowRunner:
             if actor is not None:
                 run_env["FLEET_EXECUTION_MODE"] = execution_mode
             if step.kind is JobKind.AGENT:
+                resumed_session_id = (self._actor_sessions.get(step.actor)
+                                      if actor is not None and actor.persistent else None)
+                if actor is not None:
+                    # A clean, top-level record of every actor call's session
+                    # decision -- distinct from job.submitted's own record
+                    # (which also carries this, buried inside spec.agent),
+                    # so "did this stage resume, and what, or start fresh"
+                    # is directly readable from the ledger without digging.
+                    self.fleet.ledger.append(
+                        "workflow.actor_session",
+                        {"stage": name, "actor": step.actor, "persistent": actor.persistent,
+                         "resumed": resumed_session_id is not None,
+                         "session_id": resumed_session_id},
+                        run_id=self.fleet.run_id,
+                    )
                 records += self.fleet.run_agents(
                     render(step.task, item_ctx),
                     n=1, name_prefix=name, labels=labels,
                     model=model, backend=actor.backend if actor else None,
                     effort=effort, system_prompt=actor.system_prompt if actor else None,
                     execution_mode=execution_mode,
-                    session_id=(self._actor_sessions.get(step.actor)
-                                if actor is not None and actor.persistent else None),
+                    session_id=resumed_session_id,
                     allowed_tools=step.allowed_tools,
                     disallowed_tools=step.disallowed_tools,
                     gpus=gpus,
@@ -882,6 +924,18 @@ class WorkflowRunner:
                 self._actors_started.add(step.actor)
                 if actor.persistent and first.session_id:
                     self._actor_sessions[step.actor] = first.session_id
+                if step.reset_session_after:
+                    # Clear both: the actor's next call must look like its very
+                    # first invocation, not merely "persistent with no session
+                    # on record" -- the latter is exactly what _submit's own
+                    # sanity check below treats as a wiring failure.
+                    forgotten = self._actor_sessions.pop(step.actor, None)
+                    self._actors_started.discard(step.actor)
+                    self.fleet.ledger.append(
+                        "workflow.session_reset",
+                        {"stage": step_name, "actor": step.actor, "forgotten_session_id": forgotten},
+                        run_id=self.fleet.run_id,
+                    )
 
     def _step_named(self, name: str) -> Step | None:
         for stage in self.workflow.stages:

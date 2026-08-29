@@ -206,6 +206,53 @@ def test_closing_an_unlimited_child_does_not_corrupt_the_parents_reservations():
     assert b.get("run").remaining_tokens == float("inf")
 
 
+def test_unlimited_dollar_root_scope_never_rejects_a_reservation():
+    b = BudgetTracker()
+    b.open("run", max_usd=None, max_tokens=1_000)
+    b.reserve("run", usd=50_000.0, tokens=1)  # would exceed any ordinary ceiling
+    node = b.get("run")
+    assert node.remaining_usd == float("inf")
+    assert node.to_dict()["max_usd"] is None
+    assert node.to_dict()["remaining_usd"] is None
+
+
+def test_child_requesting_unlimited_dollars_from_a_finite_parent_is_capped_at_its_remainder():
+    b = BudgetTracker()
+    b.open("run", max_usd=100.0, max_tokens=1_000)
+    b.reserve("run", usd=20.0, tokens=0)  # 80 left
+    child = b.open("agent", max_usd=None, max_tokens=1, parent="run")
+    assert child.max_usd == 80.0
+    with pytest.raises(BudgetExceeded):
+        b.reserve("agent", usd=80.01, tokens=0)
+
+
+def test_child_requesting_unlimited_dollars_from_an_unlimited_parent_stays_unlimited():
+    b = BudgetTracker()
+    b.open("run", max_usd=None, max_tokens=1_000)
+    child = b.open("agent", max_usd=None, max_tokens=1, parent="run")
+    assert child.max_usd is None
+    b.reserve("agent", usd=1_000_000.0, tokens=0)  # never rejected
+    assert b.get("run").remaining_usd == float("inf")
+
+
+def test_fully_unlimited_budget_survives_a_3_level_sub_agent_chain():
+    """Unlimited on both axes at once, nested twice -- the shape a real agent
+    that spawns sub-agents produces."""
+    b = BudgetTracker()
+    b.open("run", max_usd=None, max_tokens=None)
+    b.open("agent", max_usd=None, max_tokens=None, parent="run")
+    b.open("sub-agent", max_usd=None, max_tokens=None, parent="agent")
+    b.reserve("sub-agent", usd=1_000_000.0, tokens=1_000_000_000)
+    b.commit("sub-agent", Usage(input_tokens=1_000_000_000, model="claude-opus-5"))
+    for scope in ("run", "agent", "sub-agent"):
+        node = b.get(scope)
+        assert node.remaining_usd == float("inf")
+        assert node.remaining_tokens == float("inf")
+    b.close("sub-agent")
+    b.close("agent")
+    assert b.get("run").remaining_usd == float("inf")
+
+
 def test_spend_rolls_up_to_ancestors():
     b = BudgetTracker()
     b.open("run", max_usd=10.0, max_tokens=10_000_000)
@@ -304,6 +351,12 @@ def test_policy_denies_over_budget_estimate():
 
 def test_policy_with_no_token_ceiling_never_denies_on_tokens():
     p = Policy(max_tokens_per_job=None, max_usd_per_job=1_000_000.0)
+    d = p.check(_agent_spec(), estimate=quote("claude-opus-5", process="agent_long"))
+    assert d.verdict == "allow"
+
+
+def test_policy_with_no_dollar_ceiling_never_denies_on_cost():
+    p = Policy(max_usd_per_job=None, max_tokens_per_job=1_000_000_000)
     d = p.check(_agent_spec(), estimate=quote("claude-opus-5", process="agent_long"))
     assert d.verdict == "allow"
 

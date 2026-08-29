@@ -252,6 +252,91 @@ def test_nonpersistent_actor_always_starts_fresh(tmp_path):
     assert executor.sessions == [None, None]
 
 
+def test_reset_session_after_forces_the_next_call_fresh(tmp_path):
+    executor = ScriptedExecutor()
+    fleet = _fleet(tmp_path, executor)
+    workflow = Workflow.from_dict({
+        "name": "reset-mid-run",
+        "gpus": 0,
+        "actors": {"researcher": {"persistent": True, "model": "claude-sonnet-5"}},
+        "stages": [
+            {"name": "one", "actor": "researcher", "task": "first"},
+            {"name": "two", "actor": "researcher", "needs": ["one"], "task": "second",
+             "reset_session_after": True},
+            {"name": "three", "actor": "researcher", "needs": ["two"], "task": "third"},
+        ],
+    })
+    try:
+        fleet.run_workflow(workflow)
+        # "two" resumes "one"'s session as usual; "three" -- the first call
+        # after the reset-marked stage -- must NOT resume "two"'s, even
+        # though the actor is still persistent overall.
+        assert executor.sessions == [None, "session-one", None]
+
+        # The ledger must carry a readable record of both what happened and
+        # why: every actor call's own resume decision, plus a distinct
+        # event for the reset itself. Read before close() -- it closes the
+        # ledger's own db connection.
+        session_events = fleet.ledger.events(run_id=fleet.run_id, types=["workflow.actor_session"])
+        by_stage = {e.payload["stage"]: e.payload for e in session_events}
+        assert by_stage["one"]["resumed"] is False
+        assert by_stage["two"]["resumed"] is True
+        assert by_stage["two"]["session_id"] == "session-one"
+        assert by_stage["three"]["resumed"] is False
+
+        reset_events = fleet.ledger.events(run_id=fleet.run_id, types=["workflow.session_reset"])
+        assert len(reset_events) == 1
+        assert reset_events[0].payload == {
+            "stage": "two", "actor": "researcher", "forgotten_session_id": "session-one",
+        }
+    finally:
+        fleet.close()
+
+
+def test_reset_session_after_gives_a_fresh_session_at_the_top_of_each_cycle_pass(tmp_path):
+    executor = ScriptedExecutor()
+    fleet = _fleet(tmp_path, executor)
+    workflow = Workflow.from_dict({
+        "name": "reset-per-pass",
+        "gpus": 0,
+        "max_iterations": 3,
+        "actors": {"researcher": {"persistent": True, "model": "claude-sonnet-5"}},
+        "graph": {
+            "a": {"actor": "researcher", "task": "a", "needs": ["c"], "gpus": 0},
+            "b": {"actor": "researcher", "task": "b", "needs": ["a"], "gpus": 0},
+            "c": {"actor": "researcher", "task": "c", "needs": ["b"], "gpus": 0,
+                  "reset_session_after": True},
+        },
+    })
+    try:
+        with pytest.warns(UserWarning, match="No stop condition"):
+            fleet.run_workflow(workflow)
+        # Within each pass, b and c both resume the same thread a started (a
+        # stub thread id doesn't change mid-conversation, same as a real
+        # provider's). But the first stage of every later pass ("a-2", "a-3",
+        # ...) must start fresh, since the previous pass's last stage was
+        # marked reset_session_after.
+        by_name = dict(zip(executor.calls, executor.sessions))
+        assert by_name["a"] is None
+        assert by_name["b"] == "session-a"
+        assert by_name["c"] == "session-a"
+        assert by_name["a-2"] is None
+        assert by_name["b-2"] == "session-a-2"
+        assert by_name["c-2"] == "session-a-2"
+        assert by_name["a-3"] is None
+
+        # A reset event fires every time "c" completes -- all 3 rounds run
+        # (no stop condition), and _record's own step_name is always the
+        # cycle node's bare name ("c"), never the per-pass display suffix
+        # ("c-2", "c-3") that only exists on the submitted job's own label.
+        reset_events = fleet.ledger.events(run_id=fleet.run_id, types=["workflow.session_reset"])
+        reset_stages = [e.payload["stage"] for e in reset_events]
+        assert reset_stages == ["c", "c", "c"]
+        assert all(e.payload["actor"] == "researcher" for e in reset_events)
+    finally:
+        fleet.close()
+
+
 def test_unknown_actor_is_rejected():
     with pytest.raises(ValueError, match="unknown actor"):
         Workflow.from_dict({

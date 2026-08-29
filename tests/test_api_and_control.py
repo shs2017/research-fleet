@@ -24,6 +24,17 @@ def _fleet(tmp_path, **overrides):
     )
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(text: str) -> str:
+    """Strip Rich's ANSI styling and collapse whitespace/line-wraps, so an
+    asserted phrase doesn't depend on terminal width or highlighting -- Rich's
+    auto-highlighter injects escape codes mid-phrase (e.g. around a bare
+    number or a `job(s)`-shaped token) even with color disabled."""
+    return " ".join(_ANSI.sub("", text).split())
+
+
 # ------------------------------------------------------------------ RunReport
 
 
@@ -365,8 +376,9 @@ def test_kill_actually_stops_a_real_host_process_and_says_so(tmp_path):
     try:
         result = CliRunner().invoke(cli.app, ["kill", run_id, "--root", str(root)])
         assert result.exit_code == 0, result.output
-        assert "1 host job(s) stopped" in result.output
-        assert "stale entries" not in result.output, \
+        output = _plain(result.output)
+        assert "1 host job(s) stopped" in output
+        assert "stale entries" not in output, \
             "a job that really was running must not be reported as a stale entry"
 
         for _ in range(20):
@@ -399,8 +411,9 @@ def test_kill_still_recognises_a_genuinely_stale_run(tmp_path):
 
     result = CliRunner().invoke(cli.app, ["kill", run_id, "--root", str(root)])
     assert result.exit_code == 0, result.output
-    assert "0 host job(s) stopped" in result.output
-    assert "stale entries" in result.output
+    output = _plain(result.output)
+    assert "0 host job(s) stopped" in output
+    assert "stale entries" in output
 
 
 def test_trace_returns_one_jobs_events_in_order(tmp_path):

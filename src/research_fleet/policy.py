@@ -93,7 +93,9 @@ class Policy(BaseModel):
                     "ceiling entirely -- an operator opt-in, not a job-level one.",
     )
 
-    max_usd_per_job: float = Field(25.0, gt=0)
+    max_usd_per_job: float | None = Field(
+        25.0, gt=0, description="None removes the per-job dollar ceiling."
+    )
     max_tokens_per_job: int | None = Field(
         20_000_000, gt=0, description="None removes the per-job token ceiling."
     )
@@ -174,7 +176,7 @@ class Policy(BaseModel):
                 reasons.append(f"tool denylist merged from policy: {merged}")
 
         if estimate is not None:
-            if estimate.est_cost_usd > self.max_usd_per_job:
+            if self.max_usd_per_job is not None and estimate.est_cost_usd > self.max_usd_per_job:
                 return Decision(
                     "deny",
                     [f"estimated ${estimate.est_cost_usd:.2f} exceeds max_usd_per_job=${self.max_usd_per_job:.2f}"],

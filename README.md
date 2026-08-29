@@ -53,7 +53,14 @@ fleet usage
 Actors define who performs each stage and how they run. With `persistent: true`,
 every later stage using an actor resumes the same provider session. This lets a
 researcher pause while a judge reviews its work, then continue in its original
-context.
+context. Persistence is scoped to the whole workflow run, not to one pass of a
+cycle -- in a repeating cycle, a persistent actor's conversation carries across
+every iteration by default, not just within each one. Mark a stage
+`reset_session_after: true` to change that: once it succeeds, its actor's
+session is forgotten, so the next stage using that actor starts a genuinely
+fresh conversation, while every stage before it in the same pass is
+unaffected. Put it on the last stage in a cycle that uses that actor to get a
+shared conversation within each pass but a fresh one at the top of the next.
 
 Fleet releases a stage only after its dependencies finish. The actor receives
 that stage's prompt at release time, so later instructions remain undisclosed

@@ -42,6 +42,21 @@ def _token_grant(policy_cap: int | None, parent_share: float) -> int | None:
     return int(min(policy_cap, parent_share))
 
 
+def _usd_grant(policy_cap: float | None, parent_share: float) -> float | None:
+    """Combine a policy per-job dollar ceiling with a parent scope's headroom.
+
+    Same shape as `_token_grant`, kept separate because dollars stay float
+    (never rounded down to an int the way a token count is).
+    """
+    if policy_cap is None and parent_share == math.inf:
+        return None
+    if policy_cap is None:
+        return parent_share
+    if parent_share == math.inf:
+        return policy_cap
+    return min(policy_cap, parent_share)
+
+
 class SlotPool:
     """Fractional GPU allocator keyed by device UUID."""
 
@@ -535,7 +550,7 @@ class Scheduler:
 
         parent_scope = rec.budget_scope
         parent_node = self.budget.get(parent_scope)
-        grant_usd = min(
+        grant_usd = _usd_grant(
             self.policy.max_usd_per_job,
             parent_node.remaining_usd * 0.5 + rec.reserved_usd,
         )
@@ -552,7 +567,8 @@ class Scheduler:
         except BudgetExceeded:
             self.budget.open(
                 child_scope,
-                max_usd=min(grant_usd, parent_node.remaining_usd),
+                max_usd=(grant_usd if grant_usd is None
+                         else min(grant_usd, parent_node.remaining_usd)),
                 max_tokens=(grant_tokens if grant_tokens is None
                             else min(grant_tokens, parent_node.remaining_tokens)),
                 parent=parent_scope,
@@ -561,7 +577,9 @@ class Scheduler:
         rec.owns_scope = True
         node = self.budget.get(child_scope)
 
-        env["FLEET_BUDGET_USD"] = f"{node.remaining_usd:.4f}"
+        env["FLEET_BUDGET_USD"] = (
+            "unlimited" if node.remaining_usd == math.inf else f"{node.remaining_usd:.4f}"
+        )
         env["FLEET_BUDGET_TOKENS"] = (
             "unlimited" if node.remaining_tokens == math.inf else str(node.remaining_tokens)
         )

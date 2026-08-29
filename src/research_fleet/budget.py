@@ -341,7 +341,7 @@ def cost_menu(
 
 
 def render_cost_brief(
-    remaining_usd: float,
+    remaining_usd: int | float,
     remaining_tokens: int | float,
     *,
     models: Iterable[str] | None = None,
@@ -351,12 +351,13 @@ def render_cost_brief(
 
     An agent that can spawn sub-agents needs to know what they cost and what it
     has left, or it will either overspend or be uselessly conservative.
-    `remaining_tokens` is `math.inf` for an unlimited scope.
+    `remaining_usd`/`remaining_tokens` are `math.inf` for an unlimited scope.
     """
+    usd_text = "an unlimited budget" if remaining_usd == math.inf else f"${remaining_usd:,.2f}"
     tokens_text = "unlimited tokens" if remaining_tokens == math.inf else f"{remaining_tokens:,} tokens"
     lines = [
         "## Budget",
-        f"You have **${remaining_usd:,.2f}** and **{tokens_text}** remaining "
+        f"You have **{usd_text}** and **{tokens_text}** remaining "
         "for this task *including* any sub-agents you launch.",
         "",
         f"Estimated cost of one delegated sub-task ({process.replace('_', ' ')}):",
@@ -383,8 +384,8 @@ def render_cost_brief(
 @dataclass
 class BudgetNode:
     scope: str
-    max_usd: float
-    max_tokens: int | None       # None means no token ceiling on this scope.
+    max_usd: float | None         # None means no dollar ceiling on this scope.
+    max_tokens: int | None        # None means no token ceiling on this scope.
     parent: str | None = None
     reserved_usd: float = 0.0
     reserved_tokens: int = 0
@@ -403,6 +404,14 @@ class BudgetNode:
 
     @property
     def remaining_usd(self) -> float:
+        """`math.inf` when this scope has no dollar ceiling.
+
+        Short-circuits on `max_usd is None` rather than subtracting from it, so
+        a scope that is unlimited stays unlimited regardless of what its
+        (possibly stale) committed_usd bookkeeping holds.
+        """
+        if self.max_usd is None:
+            return math.inf
         return max(0.0, self.max_usd - self.committed_usd)
 
     @property
@@ -424,7 +433,7 @@ class BudgetNode:
             "max_usd": self.max_usd,
             "spent_usd": round(self.spent_usd, 6),
             "reserved_usd": round(self.reserved_usd, 6),
-            "remaining_usd": round(self.remaining_usd, 6),
+            "remaining_usd": None if self.max_usd is None else round(self.remaining_usd, 6),
             "max_tokens": self.max_tokens,
             "spent_tokens": self.spent_tokens,
             "reserved_tokens": self.reserved_tokens,
@@ -452,7 +461,7 @@ class BudgetTracker:
         self,
         scope: str,
         *,
-        max_usd: float,
+        max_usd: float | None,
         max_tokens: int | None,
         parent: str | None = None,
     ) -> BudgetNode:
@@ -466,14 +475,17 @@ class BudgetTracker:
                 # remaining balance -- itself unlimited only if the parent is -- so
                 # the node this returns always has a concrete, checkable ceiling
                 # except at the true root of an unlimited tree.
-                if max_usd > p.remaining_usd:
+                if max_usd is None:
+                    max_usd = None if p.max_usd is None else p.remaining_usd
+                elif max_usd > p.remaining_usd:
                     raise BudgetExceeded(f"{parent} -> {scope}", max_usd, p.remaining_usd, "USD")
                 if max_tokens is None:
                     max_tokens = None if p.max_tokens is None else p.remaining_tokens
                 elif max_tokens > p.remaining_tokens:
                     raise BudgetExceeded(f"{parent} -> {scope}", max_tokens, p.remaining_tokens, "tokens")
                 # The grant is held against the parent until the child closes.
-                p.reserved_usd += max_usd
+                if max_usd is not None:
+                    p.reserved_usd += max_usd
                 if max_tokens is not None:
                     p.reserved_tokens += max_tokens
                 p.children.append(scope)
@@ -489,7 +501,7 @@ class BudgetTracker:
     def reserve(self, scope: str, *, usd: float, tokens: int) -> None:
         with self._lock:
             node = self._require(scope)
-            if usd > node.remaining_usd:
+            if node.max_usd is not None and usd > node.remaining_usd:
                 raise BudgetExceeded(scope, usd, node.remaining_usd, "USD")
             if node.max_tokens is not None and tokens > node.remaining_tokens:
                 raise BudgetExceeded(scope, tokens, node.remaining_tokens, "tokens")
@@ -539,10 +551,12 @@ class BudgetTracker:
             # that. The child's real spend was charged separately by `commit`, so
             # what remains on the parent is the spend and nothing else.
             parent = self._require(node.parent)
-            parent.reserved_usd = max(0.0, parent.reserved_usd - node.max_usd)
-            # A `None` max_tokens here only happens when the parent is itself
-            # unlimited (see `open`), in which case nothing was added to its
-            # reserved_tokens to begin with -- there's nothing to give back.
+            # A `None` max_usd/max_tokens here only happens when the parent is
+            # itself unlimited (see `open`), in which case nothing was added to
+            # its reserved_usd/reserved_tokens to begin with -- there's nothing
+            # to give back.
+            if node.max_usd is not None:
+                parent.reserved_usd = max(0.0, parent.reserved_usd - node.max_usd)
             if node.max_tokens is not None:
                 parent.reserved_tokens = max(0, parent.reserved_tokens - node.max_tokens)
 

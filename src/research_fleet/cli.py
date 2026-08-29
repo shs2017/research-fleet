@@ -152,13 +152,26 @@ def _optional_seconds(value: Optional[int], param_hint: str) -> Optional[int]:
     return value or None
 
 
+def _optional_usd(value: Optional[float], param_hint: str) -> Optional[float]:
+    """Dollars for a CLI budget flag; `0` is the explicit spelling of unlimited."""
+    if value is None:
+        return None
+    if value < 0:
+        raise typer.BadParameter("must be 0 (unlimited) or positive", param_hint=param_hint)
+    return value or None
+
+
+def _fmt_usd(value: Optional[float]) -> str:
+    return "unlimited" if value is None else f"${value:.2f}"
+
+
 def _overrides(workspace=None, image=None, executor=None, max_usd=None) -> dict:
     """Map run flags onto config overrides."""
     out: dict = {"workspace": workspace, "image": image}
     if executor:
         out["executor"] = {"kind": executor}
     if max_usd is not None:
-        out["budget"] = {"max_usd": max_usd}
+        out["budget"] = {"max_usd": _optional_usd(max_usd, "--max-usd")}
     return out
 
 
@@ -238,7 +251,9 @@ def run(
     timeout: Optional[int] = typer.Option(
         3600, "--timeout", help="Per-agent wall clock, seconds. 0 means unlimited."
     ),
-    max_usd: Optional[float] = typer.Option(None, "--max-usd", help="Budget ceiling for the whole run."),
+    max_usd: Optional[float] = typer.Option(
+        None, "--max-usd", help="Budget ceiling for the whole run. 0 means unlimited."
+    ),
     executor: Optional[str] = typer.Option(
         None, "--executor", help="ship | nono | direct | dry-run", autocompletion=_EXECUTORS
     ),
@@ -274,7 +289,7 @@ def run(
         console.print(
             f"[bold]run {fleet.run_id}[/bold]  {agents} agent(s)  "
             f"est. ${est.est_cost_usd * agents:.2f} ({est.source})  "
-            f"budget ${fleet.config.budget.max_usd:.2f}"
+            f"budget {_fmt_usd(fleet.config.budget.max_usd)}"
         )
         if note:
             console.print(f"[dim]{note}[/dim]" if not note.startswith("[") else note)
@@ -298,7 +313,7 @@ def run(
 def workflow(
     file: Path = typer.Argument(..., help="Workflow YAML.", exists=True, dir_okay=False),
     workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
-    max_usd: Optional[float] = typer.Option(None, "--max-usd"),
+    max_usd: Optional[float] = typer.Option(None, "--max-usd", help="0 means unlimited."),
     executor: Optional[str] = typer.Option(
         None, "--executor", help="ship | nono | direct | dry-run", autocompletion=_EXECUTORS
     ),
@@ -483,7 +498,7 @@ def cost(
         )
     console.print(table)
     token_ceiling = "unlimited" if cfg.budget.max_tokens is None else f"{cfg.budget.max_tokens:,}"
-    console.print(f"[dim]Run budget ceiling: ${cfg.budget.max_usd:.2f} / {token_ceiling} tokens[/dim]")
+    console.print(f"[dim]Run budget ceiling: {_fmt_usd(cfg.budget.max_usd)} / {token_ceiling} tokens[/dim]")
 
 
 def _detach_and_return(config: Optional[str]) -> None:
