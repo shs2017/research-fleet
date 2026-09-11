@@ -37,6 +37,12 @@ CODEX_CREDIT_RATES = {
     "gpt-5.6": (125.0, 12.5, 750.0),
     "gpt-5.6-terra": (50.0, 5.0, 300.0),
     "gpt-5.6-luna": (5.0, 0.5, 30.0),
+    # A new generation (GPT-6), not a 5.6-family sibling -- confirmed via
+    # `codex`'s own model picker: "gpt-6-astra ... our most capable model for
+    # complex, demanding work", listed above gpt-5.6-sol in its menu. Priced
+    # as a new flagship tier above sol (1.6x sol's rate card) rather than
+    # between terra and sol; not an official rate, correct if published.
+    "gpt-6-astra": (200.0, 20.0, 1200.0),
 }
 
 
@@ -112,6 +118,12 @@ MODEL_COSTS: dict[str, ModelCost] = {
         ModelCost("gpt-5.6-terra", 2.00, 12.00, 1_050_000, 128_000,
                   long_context_threshold=272_000, long_input_mult=2.0, long_output_mult=1.5),
         ModelCost("gpt-5.6-luna", 0.20, 1.20, 1_050_000, 128_000,
+                  long_context_threshold=272_000, long_input_mult=2.0, long_output_mult=1.5),
+        # A new generation (GPT-6), not a 5.6-family sibling -- see the
+        # CODEX_CREDIT_RATES comment above. Priced as a new flagship tier
+        # above sol (1.6x sol's rate); context/long-context behavior kept
+        # consistent with the rest of the family pending a published spec.
+        ModelCost("gpt-6-astra", 8.00, 40.00, 1_050_000, 128_000,
                   long_context_threshold=272_000, long_input_mult=2.0, long_output_mult=1.5),
         ModelCost("gpt-5.4", 2.50, 15.00, 1_050_000, 128_000),
         ModelCost("gpt-5.4-mini", 0.75, 4.50, 400_000, 128_000),
