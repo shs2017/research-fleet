@@ -150,7 +150,16 @@ class DirectExecutor:
             wrapped += ["--allow", state, "--bypass-protection", state]
         for mount in spec.mounts:
             source = str(Path(mount.source).expanduser().resolve())
-            wrapped += ["--allow" if mount.mode == "rw" else "--read", source]
+            # --allow/--read require a directory; a mount whose source is a single
+            # file (e.g. one surviving entry of a `mount_exclude`-filtered stage
+            # directory, which mounts each top-level entry individually instead of
+            # the directory as a whole) needs nono's single-file counterpart.
+            is_file = Path(source).is_file()
+            if mount.mode == "rw":
+                flag = "--allow-file" if is_file else "--allow"
+            else:
+                flag = "--read-file" if is_file else "--read"
+            wrapped += [flag, source]
         # Native package builds need the system compiler headers and libraries.
         # This is read-only and does not expose writable host state.
         wrapped += ["--read", "/usr"]

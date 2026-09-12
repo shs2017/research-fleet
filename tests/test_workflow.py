@@ -1014,6 +1014,168 @@ def test_cycle_stops_on_failure_and_resume_starts_at_that_stage(tmp_path):
         resumed.close()
 
 
+def test_branch_from_starts_a_different_workflow_mid_cycle(tmp_path):
+    """A branch is not a resume: the target workflow can drop a stage from
+    the cycle entirely (mirroring an ablation that removes a memory-
+    maintenance step), no fingerprint match is required, and every actor
+    starts fresh rather than resuming whatever session was live at the
+    branch point -- since that session belongs to a conversation shaped by
+    the *other* workflow's stages, prompts and possibly a different model.
+    """
+    source = {
+        "name": "source", "gpus": 0, "max_iterations": 3,
+        "actors": {"researcher": {"persistent": True, "model": "claude-sonnet-5"}},
+        "graph": {
+            "a": {"actor": "researcher", "task": "a", "needs": ["c"], "gpus": 0},
+            "b": {"actor": "researcher", "task": "b", "needs": ["a"], "gpus": 0},
+            "c": {"actor": "researcher", "task": "c", "needs": ["b"], "gpus": 0},
+        },
+    }
+    first_exec = ScriptedExecutor()
+    first = _fleet(tmp_path, first_exec)
+    try:
+        with pytest.warns(UserWarning, match="No stop condition"):
+            first.run_workflow(source)
+        prior_run = first.run_id
+        # Ran to completion: all 3 iterations, "a", "b", "c" each pass.
+        assert first_exec.calls == ["a", "b", "c", "a-2", "b-2", "c-2", "a-3", "b-3", "c-3"]
+    finally:
+        first.close()
+
+    # A different workflow: drops "b" entirely (like an ablation removing a
+    # maintenance stage), so its own cycle is just a 2-node "a" -> "c" -> "a".
+    # Different stage graph, different fingerprint -- resume_from would
+    # reject this outright.
+    target = {
+        # max_iterations is an absolute ceiling, same as a plain resume: we
+        # branch mid-iteration-2, so 3 (not "1 more") leaves room to finish
+        # iteration 2 and run all of iteration 3.
+        "name": "target", "gpus": 0, "max_iterations": 3,
+        "actors": {"researcher": {"persistent": True, "model": "claude-sonnet-5"}},
+        "graph": {
+            "a": {"actor": "researcher", "task": "a", "needs": ["c"], "gpus": 0},
+            "c": {"actor": "researcher", "task": "c", "needs": ["a"], "gpus": 0},
+        },
+    }
+    branched_exec = ScriptedExecutor()
+    branched = _fleet(tmp_path, branched_exec)
+    try:
+        report = branched.run_workflow(target, branch_from=prior_run, branch_at="a-2")
+        assert branched.run_id != prior_run
+
+        # Everything through "a" of iteration 2 is inherited, not redone --
+        # the branch resumes right after it, under the target's own (shorter)
+        # cycle, so the very next stage is "c", not "b".
+        assert branched_exec.calls == ["c-2", "a-3", "c-3"]
+        assert [o.stage for o in report.outcomes] == ["a", "c"]
+
+        # The actor's session from the source run must NOT be resumed: the
+        # first call after a branch is always fresh, regardless of whether
+        # the target workflow even shares that actor's model.
+        assert branched_exec.sessions[0] is None
+
+        branched_events = branched.ledger.events(run_id=branched.run_id, types=["workflow.branched"])
+        assert len(branched_events) == 1
+        assert branched_events[0].payload["from_run"] == prior_run
+        assert branched_events[0].payload["at"] == "a-2"
+    finally:
+        branched.close()
+
+
+def test_branch_from_also_respects_mount_exclude(tmp_path):
+    """A branch sets `self._prior_run` unconditionally (the same attribute a
+    plain `--resume` sets), which is exactly what `_previous_run_mounts` keys
+    off of -- so the same leak fixed for `--resume` (the whole prior-run tree
+    landing in every stage regardless of `mount_exclude`) could just as easily
+    resurface here through a different code path. Confirm a stage's exclusion
+    holds for a stage newly submitted after a branch, via both mount channels:
+    the same-run `_stage_mounts` (fed by `self.results`, restored from the
+    branch checkpoint) and the cross-run `_previous_run_mounts` (fed by
+    `self._prior_run`, set unconditionally by branching too)."""
+    workflow = {
+        "name": "guarded-cycle", "max_iterations": 2,
+        "graph": {
+            "producer": {"task": "t", "needs": ["guarded"], "gpus": 0},
+            "guarded": {"task": "t", "needs": ["producer"], "gpus": 0,
+                        "mount_exclude": ["runs"]},
+        },
+    }
+
+    first_exec = MultiFileExecutor()
+    first = _fleet(tmp_path, first_exec)
+    try:
+        with pytest.warns(UserWarning, match="No stop condition"):
+            first.run_workflow(workflow)
+        prior_run = first.run_id
+        assert "producer-2" in first_exec.calls
+    finally:
+        first.close()
+
+    branched_exec = MultiFileExecutor()
+    branched = _fleet(tmp_path, branched_exec)
+    try:
+        target = {**workflow, "max_iterations": 3}
+        branched.run_workflow(target, branch_from=prior_run, branch_at="producer-2")
+        assert "guarded-2" in branched_exec.mounts
+
+        targets = {m.target for m in branched_exec.mounts["guarded-2"]}
+        assert "/previous-results" not in targets
+        assert not any(t.rsplit("/", 1)[-1] == "runs" for t in targets)
+        assert any(t.endswith("/knowledge.md") for t in targets), \
+            "the exclusion must not also remove the entry that should survive"
+
+        # The other side of the same bug: an unrestricted stage after a branch
+        # must still get full access -- branching must not accidentally start
+        # applying an exclusion where none was declared. Unrestricted mounts
+        # are whole-directory (e.g. /inputs/producer), so runs/ is a subpath
+        # of the mounted source, not part of the target string itself.
+        assert "producer-3" in branched_exec.mounts
+        producer_sources = [m.source for m in branched_exec.mounts["producer-3"]
+                             if m.target == "/inputs/producer"]
+        assert producer_sources, "producer-3 must see its /inputs/producer dependency"
+        assert (Path(producer_sources[0]) / "runs").is_dir(), \
+            "an unrestricted stage after a branch must still see runs/ in full"
+    finally:
+        branched.close()
+
+
+def test_branch_from_requires_branch_at(tmp_path):
+    fleet = _fleet(tmp_path, ScriptedExecutor())
+    try:
+        with pytest.raises(ValueError, match="branch_from requires branch_at"):
+            fleet.run_workflow({"stages": [{"name": "a", "task": "t", "gpus": 0}]},
+                                branch_from="run_whatever")
+    finally:
+        fleet.close()
+
+
+def test_branch_at_requires_branch_from(tmp_path):
+    fleet = _fleet(tmp_path, ScriptedExecutor())
+    try:
+        with pytest.raises(ValueError, match="branch_at requires branch_from"):
+            fleet.run_workflow({"stages": [{"name": "a", "task": "t", "gpus": 0}]},
+                                branch_at="a")
+    finally:
+        fleet.close()
+
+
+def test_branch_from_rejects_an_unknown_stage_label(tmp_path):
+    first = _fleet(tmp_path, ScriptedExecutor())
+    try:
+        first.run_workflow({"stages": [{"name": "a", "task": "t", "gpus": 0}]})
+        prior_run = first.run_id
+    finally:
+        first.close()
+
+    second = _fleet(tmp_path, ScriptedExecutor())
+    try:
+        with pytest.raises(ValueError, match="no succeeded job named"):
+            second.run_workflow({"stages": [{"name": "a", "task": "t", "gpus": 0}]},
+                                 branch_from=prior_run, branch_at="nope")
+    finally:
+        second.close()
+
+
 def test_a_self_dependency_repeats_one_node(tmp_path):
     stub = ScriptedExecutor({"tune": ["0.9", "0.4"]})
     fleet = _fleet(tmp_path, stub)
@@ -1244,6 +1406,144 @@ def test_a_stage_sees_every_completed_stage_by_name(tmp_path):
         assert {"/inputs/one", "/inputs/two"} <= targets
     finally:
         fleet.close()
+
+
+class MultiFileExecutor(ScriptedExecutor):
+    """Writes two top-level entries into `/results` (a file and a directory) and
+    records the mounts each job was given, for testing `mount_exclude`."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.mounts: dict[str, list] = {}
+
+    def run(self, spec, *, argv, env, placement, policy, on_line):
+        self.mounts[spec.name] = list(spec.mounts)
+        results = next((m.source for m in spec.mounts if m.target == "/results"), None)
+        if results is not None:
+            (Path(results) / "knowledge.md").write_text(f"written by {spec.name}")
+            runs_dir = Path(results) / "runs"
+            runs_dir.mkdir()
+            (runs_dir / "raw.md").write_text(f"raw archive from {spec.name}")
+        return super().run(spec, argv=argv, env=env, placement=placement,
+                           policy=policy, on_line=on_line)
+
+
+def test_mount_exclude_never_binds_the_excluded_entry(tmp_path):
+    """A stage two hops from a `runs/` tree it must never see can't be kept out of
+    it just by redirecting `needs` -- fleet's dependency visibility is transitive,
+    so the ancestor that wrote `runs/` stays visible regardless. `mount_exclude`
+    must therefore work at the bind-mount level: the excluded entry is never
+    materialized in the sandbox at all."""
+    stub = MultiFileExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({"stages": [
+            {"name": "producer", "task": "t", "gpus": 0},
+            {"name": "consumer", "task": "use it", "needs": ["producer"], "gpus": 0,
+             "mount_exclude": ["runs"]},
+        ]})
+        targets = {m.target: m for m in stub.mounts["consumer"]}
+        assert "/inputs/producer/knowledge.md" in targets
+        assert Path(targets["/inputs/producer/knowledge.md"].source).read_text() == \
+            "written by producer"
+        assert "/inputs/producer" not in targets
+        assert "/inputs/producer/runs" not in targets
+        assert not any(t.startswith("/inputs/producer/runs") for t in targets)
+    finally:
+        fleet.close()
+
+
+def test_mount_exclude_only_splits_ancestors_that_actually_have_it(tmp_path):
+    """Real production failure: a 10-iteration campaign hit `OSError: Argument
+    list too long` at iteration 4, because every transitively-visible ancestor
+    (most of which never wrote `runs/` in the first place -- step0, judge_*,
+    step1_* instances from every prior iteration) was being split into several
+    individual per-entry mounts instead of one whole-directory mount, purely
+    because *some* step.mount_exclude was set. Over a long cyclic campaign
+    where dozens of prior stages stay visible, that turns a handful of
+    directory-mount CLI args into hundreds of individual file-mount args. An
+    ancestor with nothing to exclude must stay a single whole-directory mount."""
+    class PlainExecutor(ScriptedExecutor):
+        """Writes exactly one file into /results -- no `runs/` entry to exclude."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.mounts: dict[str, list] = {}
+
+        def run(self, spec, *, argv, env, placement, policy, on_line):
+            self.mounts[spec.name] = list(spec.mounts)
+            results = next((m.source for m in spec.mounts if m.target == "/results"), None)
+            if results is not None:
+                (Path(results) / "plain.md").write_text(f"written by {spec.name}")
+            return super().run(spec, argv=argv, env=env, placement=placement,
+                               policy=policy, on_line=on_line)
+
+    stub = PlainExecutor()
+    fleet = _fleet(tmp_path, stub)
+    try:
+        fleet.run_workflow({"stages": [
+            {"name": "plain_ancestor", "task": "t", "gpus": 0},
+            {"name": "consumer", "task": "use it", "needs": ["plain_ancestor"], "gpus": 0,
+             "mount_exclude": ["runs"]},
+        ]})
+        targets = {m.target for m in stub.mounts["consumer"]}
+        assert "/inputs/plain_ancestor" in targets, \
+            "an ancestor with nothing to exclude must stay a single whole-directory mount"
+        assert not any(t.startswith("/inputs/plain_ancestor/") for t in targets), \
+            "it must not be needlessly split into per-entry mounts"
+    finally:
+        fleet.close()
+
+
+def test_resumed_run_mounts_also_respect_mount_exclude(tmp_path):
+    """`_previous_run_mounts` used to be called with no per-step view at all --
+    every stage in a `--resume`d run got the whole prior-run tree mounted
+    (`/previous-results`, `/previous/<stage>`) regardless of `mount_exclude`.
+    That made the exclusion a guarantee only until the first crash-and-resume.
+    Confirm a stage's exclusion still holds for a stage newly submitted after
+    a resume, not just for same-run dependency mounts."""
+    class FailBlockerOnce(MultiFileExecutor):
+        def __init__(self, fail: bool):
+            super().__init__()
+            self.fail = fail
+
+        def run(self, spec, **kwargs):
+            result = super().run(spec, **kwargs)
+            if self.fail and spec.name == "blocker":
+                result.state = JobState.FAILED
+                result.exit_code = 1
+            return result
+
+    workflow = {
+        "name": "resumable-guarded",
+        "graph": {
+            "producer": {"task": "t", "gpus": 0},
+            "blocker": {"task": "t", "needs": ["producer"], "gpus": 0},
+            "guarded": {"task": "t", "needs": ["blocker"], "gpus": 0,
+                        "mount_exclude": ["runs"]},
+        },
+    }
+
+    first_exec = FailBlockerOnce(True)
+    first = _fleet(tmp_path, first_exec)
+    try:
+        first.run_workflow(workflow)
+        prior_run = first.run_id
+        assert first_exec.calls == ["producer", "blocker"]
+    finally:
+        first.close()
+
+    resumed_exec = FailBlockerOnce(False)
+    resumed = _fleet(tmp_path, resumed_exec)
+    try:
+        resumed.run_workflow(workflow, resume_from=prior_run)
+        assert "guarded" in resumed_exec.mounts
+        targets = {m.target for m in resumed_exec.mounts["guarded"]}
+        assert "/previous-results" not in targets
+        assert not any(t.startswith("/previous/") and t.rsplit("/", 1)[-1] == "runs"
+                       for t in targets)
+    finally:
+        resumed.close()
 
 
 def test_unrelated_graph_branches_cannot_see_each_others_files_or_outputs(tmp_path):

@@ -101,6 +101,38 @@ def test_nono_maps_workspace_and_mount_permissions(tmp_path):
     ]
 
 
+def test_nono_uses_single_file_flags_for_a_file_mount(tmp_path):
+    """A `mount_exclude`-filtered stage directory mounts each surviving top-level
+    entry individually rather than the whole directory -- and a stage's own
+    results directory always has plain files alongside subdirectories (fleet's
+    own output.md/result.json/stream.log sidecars). --read/--allow require a
+    directory; nono rejects a file with those, so a file-sourced mount needs
+    --read-file/--allow-file instead."""
+    nono = tmp_path / "nono"
+    nono.write_text("#!/bin/sh\n")
+    nono.chmod(0o755)
+    workspace = tmp_path / "worktree"
+    ro_file = tmp_path / "data" / "output.md"
+    ro_file.parent.mkdir(parents=True)
+    ro_file.write_text("hello")
+    rw_file = tmp_path / "results" / "state.json"
+    rw_file.parent.mkdir(parents=True)
+    rw_file.write_text("{}")
+    executor = DirectExecutor(str(workspace), nono_binary=str(nono))
+    spec = JobSpec(command=["true"], mounts=[
+        Mount(source=str(ro_file), target="/inputs/producer/output.md", mode="ro"),
+        Mount(source=str(rw_file), target="/results/state.json", mode="rw"),
+    ])
+
+    command = executor._nono_command(["true"], spec, str(workspace))
+
+    assert command[command.index("--read-file") + 1] == str(ro_file.resolve())
+    assert command[command.index("--allow-file") + 1] == str(rw_file.resolve())
+    assert str(ro_file.resolve()) not in [
+        command[i + 1] for i, v in enumerate(command[:-1]) if v == "--read"
+    ]
+
+
 def test_nono_never_exposes_unlisted_host_paths_or_tmp(tmp_path):
     nono = tmp_path / "nono"
     nono.write_text("#!/bin/sh\n")

@@ -768,3 +768,46 @@ def test_whole_gpu_jobs_serialise_on_one_device():
     pool = SlotPool(["GPU-a"])
     assert pool.acquire(1.0, timeout=0.5) is not None
     assert pool.acquire(1.0, timeout=0.2) is None
+
+
+def test_workflow_plan_max_iterations_override_changes_the_printed_cycle_cap(tmp_path):
+    """`--max-iterations` (added for the E2 reflection/connection study driver
+    in the sibling improved-hypothesis-hunting project, which needs a
+    different cycle ceiling per branched hop without a dedicated YAML per
+    ceiling) must actually reach Workflow.max_iterations, not just get
+    silently accepted. `--plan` never touches storage/executors, so this
+    needs no fleet config or root -- it loads the YAML, applies the CLI
+    overrides, and prints."""
+    from typer.testing import CliRunner
+
+    from research_fleet import cli
+
+    workflow_path = tmp_path / "tiny_cycle.yaml"
+    workflow_path.write_text(
+        "name: tiny-cycle\n"
+        "max_iterations: 3\n"
+        "stages:\n"
+        "  - name: seed\n"
+        "    kind: command\n"
+        "    command: [\"true\"]\n"
+        "  - name: a\n"
+        "    kind: command\n"
+        "    needs: [seed, b]\n"
+        "    command: [\"true\"]\n"
+        "  - name: b\n"
+        "    kind: command\n"
+        "    needs: [a]\n"
+        "    command: [\"true\"]\n",
+        encoding="utf-8",
+    )
+
+    default_result = CliRunner().invoke(cli.app, ["workflow", str(workflow_path), "--plan"])
+    assert default_result.exit_code == 0, default_result.output
+    assert "max 3x" in default_result.output
+
+    overridden_result = CliRunner().invoke(
+        cli.app, ["workflow", str(workflow_path), "--plan", "--max-iterations", "7"]
+    )
+    assert overridden_result.exit_code == 0, overridden_result.output
+    assert "max 7x" in overridden_result.output
+    assert "max 3x" not in overridden_result.output

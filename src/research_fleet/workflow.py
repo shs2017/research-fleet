@@ -84,6 +84,21 @@ class Step(BaseModel):
     )
     isolate: bool | None = None
     needs: list[str] = Field(default_factory=list)
+    mount_exclude: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Top-level entry names to omit when mounting any ancestor's results "
+            "directory at /inputs/<ancestor>/ for this stage. Fleet's dependency "
+            "visibility is transitive -- a stage sees every ancestor's ancestor's "
+            "output too -- so a stage two or more hops from a directory it should "
+            "never read (e.g. a raw-archive `runs/` tree copied forward alongside "
+            "`knowledge/` at every hop) cannot be kept from seeing it just by "
+            "redirecting `needs`. This excludes it at the bind-mount level instead: "
+            "the named entries are never mounted into this stage's sandbox at all, "
+            "under any ancestor, so no prompt-level instruction is load-bearing for "
+            "keeping them out."
+        ),
+    )
     actor: str | None = Field(
         None,
         description="Named workflow actor whose provider conversation runs this agent step.",
@@ -516,7 +531,7 @@ class WorkflowRunner:
     """
 
     def __init__(self, fleet, workflow: Workflow, *, predicates: dict[str, Predicate] | None = None,
-                 prior_run: str | None = None, resume: bool = False):
+                 prior_run: str | None = None, resume: bool = False, branch_at: str | None = None):
         self.fleet = fleet
         self.workflow = workflow
         self.predicates = predicates or {}
@@ -545,7 +560,11 @@ class WorkflowRunner:
         self._fingerprint = hashlib.sha256(json.dumps(
             without_limits(fingerprint_payload), sort_keys=True, separators=(",", ":")
         ).encode()).hexdigest()
-        if prior_run:
+        if branch_at:
+            if not prior_run:
+                raise ValueError("branch_at requires prior_run (the run to branch from)")
+            self._restore_branch(prior_run, branch_at)
+        elif prior_run:
             self._restore(prior_run, resume=resume)
 
     def _restore(self, prior_run: str, *, resume: bool) -> None:
@@ -591,6 +610,114 @@ class WorkflowRunner:
              "completed": sorted(self._completed)},
             run_id=self.fleet.run_id,
         )
+
+    def _restore_branch(self, prior_run: str, branch_at: str) -> None:
+        """Branch a run off an arbitrary historical checkpoint of `prior_run`,
+        addressed by the stage label as it already appears in that run's own
+        job history and results directory (bare name for iteration 1, e.g.
+        "step2a"; "step2a-6" for iteration 6 -- the same labels `fleet jobs
+        <run_id>` and the results directory both use).
+
+        Unlike `_restore`, this never requires a fingerprint match: the whole
+        point of branching is to continue under a *different* workflow
+        definition (a different ablation) than the one that produced
+        `prior_run`. It finds the checkpoint written immediately after the
+        named job succeeded and restores exactly that snapshot -- every
+        result recorded up to and including that job, and the cyclic
+        component's progress counter, so `run()` resumes right after it
+        without redoing or skipping any stage.
+
+        Every actor's session is deliberately left blank (not carried
+        forward), regardless of whether the target workflow even changes
+        actor models: resuming a provider conversation started under a
+        workflow this run no longer matches is not safe to assume, and
+        starting each actor fresh after a branch matches this project's own
+        experimental convention for a branched continuation.
+        """
+        jobs = self.fleet.ledger.jobs(run_id=prior_run)
+        target = next(
+            (j for j in jobs if j.get("name") == branch_at and j.get("state") == "succeeded"),
+            None,
+        )
+        if target is None:
+            raise ValueError(
+                f"run {prior_run!r} has no succeeded job named {branch_at!r} -- "
+                f"check `fleet jobs {prior_run}` for the exact stage label "
+                f"(bare name for iteration 1, name-<iteration> otherwise)"
+            )
+        succeeded_events = self.fleet.ledger.events(
+            run_id=prior_run, types=["job.succeeded"], limit=100000
+        )
+        branch_event = next(
+            (e for e in succeeded_events if e.job_id == target["job_id"]), None
+        )
+        if branch_event is None:
+            raise ValueError(
+                f"could not find the completion event for job {target['job_id']!r} "
+                f"(named {branch_at!r}) in run {prior_run!r}"
+            )
+        checkpoints = self.fleet.ledger.events(
+            run_id=prior_run, types=["workflow.checkpoint"], limit=100000
+        )
+        after = [e for e in checkpoints if e.seq >= branch_event.seq]
+        if not after:
+            raise ValueError(
+                f"run {prior_run!r} recorded {branch_at!r} succeeding but has no "
+                f"checkpoint written afterward -- nothing to branch from"
+            )
+        state = min(after, key=lambda e: e.seq).payload
+
+        self.results = {
+            name: JobResult.model_validate(value)
+            for name, value in state.get("results", {}).items()
+        }
+        self._completed = set(state.get("completed", []))
+        self._worktree_tip = state.get("worktree_tip")
+        self._worktree_tip_run = state.get("worktree_tip_run") or prior_run
+        self._cycle_progress = self._cycle_progress_after(
+            branch_at, dict(state.get("cycle_progress", {}))
+        )
+        self._actor_sessions = {}
+        self._actors_started = set()
+        self.fleet.ledger.append(
+            "workflow.branched",
+            {"from_run": prior_run, "at": branch_at, "completed": sorted(self._completed),
+             "cycle_progress": dict(self._cycle_progress)},
+            run_id=self.fleet.run_id,
+        )
+
+    _BRANCH_LABEL_RE = re.compile(r"^(.*)-(\d+)$")
+
+    def _cycle_progress_after(
+        self, branch_at: str, source_progress: dict[str, dict[str, int]]
+    ) -> dict[str, dict[str, int]]:
+        """Compute a fresh, correctly-keyed `cycle_progress` entry for *this*
+        workflow's own cycle directly from `branch_at`'s stage name and
+        iteration, rather than carrying the source run's raw progress dict
+        forward. `cycle_progress` is keyed by the cycle's exact ordered
+        stage-name list (`_cycle_key`) and its "next" field is a plain index
+        into that same list -- both meaningless once copied onto a
+        differently-shaped cycle, which is exactly what any ablation that
+        adds, removes, or reorders a ring stage produces. Re-deriving the
+        key and index from this workflow's own cycle membership sidesteps
+        that mismatch entirely.
+        """
+        match = self._BRANCH_LABEL_RE.match(branch_at)
+        base_name, iteration = (match.group(1), int(match.group(2))) if match else (branch_at, 1)
+
+        was_cyclic = any(source_progress.values())
+        owning = next((group for group in self.workflow.cycles() if base_name in group), None)
+        if owning is None:
+            if was_cyclic:
+                raise ValueError(
+                    f"{branch_at!r} isn't part of any cycle in this workflow, but the "
+                    f"source run was mid-cycle at that point -- this target can't resume "
+                    f"a cyclic component {base_name!r} doesn't belong to"
+                )
+            return {}
+        return {
+            self._cycle_key(owning): {"iteration": iteration, "next": owning.index(base_name) + 1}
+        }
 
     def _checkpoint(self, completed: set[str], outcomes: dict[str, StageOutcome]) -> None:
         self.fleet.ledger.append(
@@ -738,17 +865,35 @@ class WorkflowRunner:
         cannot rewrite the evidence it is reviewing.
         """
         visible = self._visible_result_names(step)
+        exclude = set(step.mount_exclude)
         mounts = []
         for name, result in self.results.items():
             # Each result carries the directory it actually wrote to, which is what
             # makes a restored result from an earlier run resolve correctly here.
             if name in visible and result.results_dir and Path(result.results_dir).is_dir():
-                mounts.append(
-                    Mount(source=result.results_dir, target=f"/inputs/{name}", mode="ro")
-                )
+                src_dir = Path(result.results_dir)
+                # Only split a directory into per-entry mounts when it actually has an
+                # excluded name to drop -- most ancestors (e.g. every step0/step1_*/judge_*
+                # instance) never wrote `runs/` in the first place, so mounting them whole
+                # is both correct and, over a long cyclic campaign where every prior
+                # iteration's stages stay transitively visible, the difference between a
+                # handful of directory mounts and enough individual file mounts to blow
+                # past the OS argument-length limit (a real production failure: a 10-
+                # iteration run hit `OSError: Argument list too long` at iteration 4).
+                if exclude and any((src_dir / name_).exists() for name_ in exclude):
+                    for entry in sorted(src_dir.iterdir()):
+                        if entry.name in exclude:
+                            continue
+                        mounts.append(
+                            Mount(source=str(entry), target=f"/inputs/{name}/{entry.name}", mode="ro")
+                        )
+                else:
+                    mounts.append(
+                        Mount(source=result.results_dir, target=f"/inputs/{name}", mode="ro")
+                    )
         return mounts
 
-    def _previous_run_mounts(self) -> list[Mount]:
+    def _previous_run_mounts(self, step: Step) -> list[Mount]:
         """The run this one builds on, read-only: whole at `/previous-results`, and
         stage by stage at `/previous/<stage>`.
 
@@ -756,6 +901,18 @@ class WorkflowRunner:
         A researcher starting a second attempt wants last time's `findings.md` *and* the
         judge's `review.md`, and it should not have to open `job_4319620b5f63/` to find
         out which one that is.
+
+        Unlike `_stage_mounts`, this used to be called once per submission with no
+        per-step view at all -- every stage in a `--resume`d run got the same whole
+        prior-run tree, `step.mount_exclude` or not. That made `mount_exclude` a
+        guarantee only until the first crash-and-resume: `/previous/finalize_iteration/runs`
+        (or the bulk `/previous-results` tree) would still land in a stage that
+        excludes `runs` from its own `needs`-based mounts. Per-stage mounts are now
+        filtered exactly like `_stage_mounts`; the bulk `/previous-results` view is
+        dropped entirely for a step with any exclusion, since filtering an arbitrary
+        depth of nested stage directories the way the per-stage loop below does for
+        their own top level isn't worth the complexity for what's primarily a
+        debugging convenience.
         """
         if not self._prior_run:
             return []
@@ -763,9 +920,23 @@ class WorkflowRunner:
         if prior_dir is None:
             return []
 
-        mounts = [Mount(source=str(prior_dir), target="/previous-results", mode="ro")]
+        exclude = set(step.mount_exclude)
+        mounts = []
+        if not exclude:
+            mounts.append(Mount(source=str(prior_dir), target="/previous-results", mode="ro"))
         for stage, path in runlayout.stage_dirs(prior_dir, self._prior_job_names()).items():
-            mounts.append(Mount(source=str(path), target=f"/previous/{stage}", mode="ro"))
+            # Same reasoning as _stage_mounts: only split a directory that actually has
+            # something to exclude, so a long-running campaign's many prior stages don't
+            # each explode into several individual mounts for no reason.
+            if exclude and path.is_dir() and any((path / name_).exists() for name_ in exclude):
+                for entry in sorted(path.iterdir()):
+                    if entry.name in exclude:
+                        continue
+                    mounts.append(
+                        Mount(source=str(entry), target=f"/previous/{stage}/{entry.name}", mode="ro")
+                    )
+            else:
+                mounts.append(Mount(source=str(path), target=f"/previous/{stage}", mode="ro"))
         return mounts
 
     def _prior_job_names(self) -> dict[str, str]:
@@ -812,7 +983,7 @@ class WorkflowRunner:
         base_run = self._worktree_tip_run if chainable else None
 
         records = []
-        inherited_mounts = self._stage_mounts(step) + self._previous_run_mounts()
+        inherited_mounts = self._stage_mounts(step) + self._previous_run_mounts(step)
         for index, item in enumerate(items):
             item_ctx = {**ctx, "item": item, "index": index}
             name = label if len(items) == 1 else f"{label}-{index}"

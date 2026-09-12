@@ -364,11 +364,22 @@ class Fleet:
         predicates: dict[str, Any] | None = None,
         resume_from: str | None = None,
         base_run: str | None = None,
+        branch_from: str | None = None,
+        branch_at: str | None = None,
     ) -> "WorkflowReport":
         """Run a multi-step pipeline defined in YAML, a dict, or Python.
 
         `predicates` maps a loop name to a callable taking the results so far, for
         stopping conditions that declarative YAML cannot express.
+
+        `branch_from` + `branch_at` start a new run under *this* workflow
+        (which may be a different ablation entirely) from an arbitrary
+        historical checkpoint of another run, addressed by the stage label
+        that must have just succeeded there (e.g. "step2a" for iteration 1,
+        "step2a-6" for iteration 6). Unlike `resume_from`, no fingerprint
+        match is required -- that's the point of branching. Every actor
+        starts its next call as a fresh conversation after a branch; see
+        `WorkflowRunner._restore_branch` for the full rationale.
         """
         from .workflow import Workflow, WorkflowRunner
 
@@ -383,21 +394,27 @@ class Fleet:
              "parameters": workflow.parameters},
             run_id=self.run_id,
         )
-        if resume_from and base_run:
-            raise ValueError("use either resume_from or base_run, not both")
+        if sum(bool(x) for x in (resume_from, base_run, branch_from)) > 1:
+            raise ValueError("use only one of resume_from, base_run, or branch_from")
+        if branch_at and not branch_from:
+            raise ValueError("branch_at requires branch_from")
+        if branch_from and not branch_at:
+            raise ValueError("branch_from requires branch_at (the stage label to branch after)")
 
         # Name the attempt directory after the workflow, and put a continuation back
         # into the attempt it continues. `base_run` re-executes every stage, so it is a
-        # new attempt that merely knows what it was built on.
+        # new attempt that merely knows what it was built on. `branch_from` is the same:
+        # a new attempt, in its own results directory, that knows what it branched from.
         self.scheduler.run_name = workflow.name
-        self.scheduler.based_on = base_run
+        self.scheduler.based_on = base_run or branch_from
         if resume_from and not self.scheduler.continue_run(resume_from):
             self.scheduler.based_on = resume_from
 
         runner = WorkflowRunner(
             self, workflow, predicates=predicates,
-            prior_run=resume_from or base_run,
+            prior_run=resume_from or base_run or branch_from,
             resume=resume_from is not None,
+            branch_at=branch_at,
         )
         deadline_timer = None
         if workflow.max_duration_s:

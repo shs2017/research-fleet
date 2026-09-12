@@ -327,6 +327,13 @@ def workflow(
         help="Maximum whole-workflow runtime in seconds. 0 means unlimited "
              "(still bounded by max_iterations).",
     ),
+    max_iterations: Optional[int] = typer.Option(
+        None, "--max-iterations",
+        help="Override the workflow's root max_iterations (a cycle's absolute repeat "
+             "ceiling) without editing the YAML. Has no effect on a cycle where a member "
+             "step sets its own max_iterations (e.g. a five_iterations-style ablation) -- "
+             "that per-step cap always wins over the root value.",
+    ),
     stage_timeout: Optional[int] = typer.Option(
         None, "--stage-timeout",
         help="Ceiling on every stage's own timeout, seconds. 0 means unlimited, "
@@ -342,6 +349,18 @@ def workflow(
     base_run: Optional[str] = typer.Option(
         None, "--from-run", help="Reuse a run's outputs/files but execute all stages again.",
         autocompletion=_complete_runs,
+    ),
+    branch_from: Optional[str] = typer.Option(
+        None, "--branch-from",
+        help="Start this run from a stage in another run's history (see --branch-at), "
+             "even under a different ablation. No fingerprint match required.",
+        autocompletion=_complete_runs,
+    ),
+    branch_at: Optional[str] = typer.Option(
+        None, "--branch-at",
+        help="Stage label to branch after, as shown by `fleet jobs <run_id>` or the "
+             "results directory (bare name for iteration 1, name-<iteration> otherwise, "
+             "e.g. step2a-6). Required with --branch-from.",
     ),
     parameter: list[str] = typer.Option(
         [], "--set", help="Set a workflow parameter (key=value); repeat for ablations/seeds."
@@ -367,6 +386,8 @@ def workflow(
                 stage.effort = effort
     if max_duration is not None:
         wf.max_duration_s = _optional_seconds(max_duration, "--max-duration")
+    if max_iterations is not None:
+        wf.max_iterations = max_iterations
     if stage_timeout is not None:
         wf.timeout_s = _optional_seconds(stage_timeout, "--stage-timeout")
     for assignment in parameter:
@@ -432,7 +453,10 @@ def workflow(
         _cancel_on_interrupt(fleet)
         console.print(f"[bold]run {fleet.run_id}[/bold]  workflow {wf.name}")
         try:
-            report = fleet.run_workflow(wf, resume_from=resume_from, base_run=base_run)
+            report = fleet.run_workflow(
+                wf, resume_from=resume_from, base_run=base_run,
+                branch_from=branch_from, branch_at=branch_at,
+            )
         except CredentialsUnavailable as exc:
             _credentials_error(exc)
         console.print()
